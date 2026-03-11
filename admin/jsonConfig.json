@@ -1,0 +1,73 @@
+{
+    "i18n": true,
+    "type": "panel",
+    "items": {
+        "email": {
+            "type": "text",
+            "label": "email",
+            "hint": "mammotion account email",
+            "newLine": true,
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
+        },
+        "password": {
+            "type": "password",
+            "label": "password",
+            "newLine": true,
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
+        },
+        "deviceUuid": {
+            "type": "text",
+            "label": "deviceUuid",
+            "hint": "leave default unless you want to mimic your own device id",
+            "newLine": true,
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
+        },
+        "legacyPollIntervalSec": {
+            "type": "number",
+            "label": "Legacy Poll Intervall (s)",
+            "hint": "Nur bei Legacy/Aliyun Telemetrie aktiv. Bereich 10-300 Sekunden.",
+            "newLine": true,
+            "min": 10,
+            "max": 300,
+            "step": 1,
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
+        },
+        "legacyTelemetryTransport": {
+            "type": "select",
+            "label": "Legacy Telemetrie",
+            "hint": "MQTT Push folgt spaeter; aktuell nutzt der Adapter Polling.",
+            "newLine": true,
+            "options": [
+                {
+                    "value": "poll",
+                    "label": "Polling (stabil)"
+                },
+                {
+                    "value": "mqtt",
+                    "label": "MQTT Push (experimental)"
+                }
+            ],
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
+        }
+    }
+}

@@ -1,0 +1,100 @@
+{
+    "common": {
+        "name": "mammotion",
+        "version": "0.0.2",
+        "news": {
+            "0.0.2": {
+                "en": "Improved telemetry sync and auto-apply for task/route/non-work settings",
+                "de": "Telemetrie-Sync verbessert und Auto-Apply fuer Task/Route/Non-Work Settings hinzugefuegt",
+                "ru": "Улучшена синхронизация телеметрии и добавлено авто-применение для task/route/non-work",
+                "pt": "Sincronizacao de telemetria melhorada e aplicacao automatica para task/route/non-work",
+                "nl": "Verbeterde telemetrie-sync en auto-toepassen voor task/route/non-work",
+                "fr": "Synchronisation de telemetrie amelioree et application auto pour task/route/non-work",
+                "it": "Sincronizzazione telemetria migliorata e applicazione automatica per task/route/non-work",
+                "es": "Sincronizacion de telemetria mejorada y auto-aplicacion para task/route/non-work",
+                "pl": "Ulepszona synchronizacja telemetrii i automatyczne stosowanie dla task/route/non-work",
+                "uk": "Покращено синхронізацію телеметрії та додано авто-застосування для task/route/non-work",
+                "zh-cn": "改进了遥测同步，并为 task/route/non-work 增加了自动应用"
+            },
+            "0.0.1": {
+                "en": "initial release",
+                "de": "Erstveröffentlichung",
+                "ru": "Начальная версия",
+                "pt": "lançamento inicial",
+                "nl": "Eerste uitgave",
+                "fr": "Première version",
+                "it": "Versione iniziale",
+                "es": "Versión inicial",
+                "pl": "Pierwsze wydanie",
+                "uk": "Початкова версія",
+                "zh-cn": "首次出版"
+            }
+        },
+        "titleLang": {
+            "en": "Mammotion Luba",
+            "de": "Mammotion Luba",
+            "ru": "Маммоция Люба",
+            "pt": "Mammotion Luba",
+            "nl": "Mammotie Luba",
+            "fr": "Mammotion Luba",
+            "it": "Mammotion Luba",
+            "es": "Mamoción Luba",
+            "pl": "Mammotion Luba",
+            "uk": "Мамоція Люба",
+            "zh-cn": "玛莫特·卢巴"
+        },
+        "desc": {
+            "en": "Control Mammotion Luba mower via cloud/MQTT",
+            "de": "Steuern Sie den Mammotion Luba Mäher über Cloud/MQTT",
+            "ru": "Управляйте газонокосилкой Mammotion Luba через облако/MQTT",
+            "pt": "Controle o cortador Mammotion Luba via nuvem/MQTT",
+            "nl": "Bedien de Mammotion Luba-maaier via cloud/MQTT",
+            "fr": "Contrôlez la tondeuse Mammotion Luba via cloud/MQTT",
+            "it": "Controlla il tosaerba Mammotion Luba tramite cloud/MQTT",
+            "es": "Controle el cortacésped Mammotion Luba a través de la nube/MQTT",
+            "pl": "Steruj kosiarką Mammotion Luba poprzez chmurę/MQTT",
+            "uk": "Керуйте косаркою Mammotion Luba через хмару/MQTT",
+            "zh-cn": "通过云/MQTT 控制 Mammotion Luba 割草机"
+        },
+        "authors": ["DNAngel <stolly82@web.de>"],
+        "keywords": ["mammotion", "luba", "mower", "mqtt", "cloud", "ble"],
+        "licenseInformation": {
+            "type": "free",
+            "license": "MIT"
+        },
+        "platform": "Javascript/Node.js",
+        "icon": "mammotion.png",
+        "enabled": true,
+        "extIcon": "https://raw.githubusercontent.com/DNAngelX/ioBroker.mammotion/main/admin/mammotion.png",
+        "readme": "https://github.com/DNAngelX/ioBroker.mammotion/blob/main/README.md",
+        "loglevel": "info",
+        "tier": 3,
+        "mode": "daemon",
+        "type": "garden",
+        "compact": true,
+        "connectionType": "cloud",
+        "dataSource": "push",
+        "adminUI": {
+            "config": "json"
+        },
+        "dependencies": [
+            {
+                "js-controller": ">=6.0.11"
+            }
+        ],
+        "globalDependencies": [
+            {
+                "admin": ">=7.0.23"
+            }
+        ]
+    },
+    "native": {
+        "email": "",
+        "password": "",
+        "deviceUuid": "A9D0F177-F701-4212-8676-EDF9B354AE48",
+        "legacyPollIntervalSec": 30,
+        "legacyTelemetryTransport": "poll"
+    },
+    "objects": [],
+    "instanceObjects": []
+}
