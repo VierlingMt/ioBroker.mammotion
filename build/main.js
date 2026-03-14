@@ -142,6 +142,7 @@ class Mammotion extends utils.Adapter {
   authFailureSince = 0;
   reconnectTimer = null;
   legacyPollTimer = null;
+  legacyLastPollAt = 0;
   taskSettingsAutoApplyTimers = /* @__PURE__ */ new Map();
   routeAutoApplyTimers = /* @__PURE__ */ new Map();
   nonWorkAutoApplyTimers = /* @__PURE__ */ new Map();
@@ -1245,6 +1246,12 @@ class Mammotion extends utils.Adapter {
     }, 6e4);
   }
   async reconnectIfAllowed() {
+    const pollWatchdogMs = 10 * 60 * 1e3;
+    if (this.legacyPollingEnabled && this.cloudConnected && this.legacyLastPollAt > 0 && !this.legacyPollInFlight && !this.legacyPollTimer && Date.now() - this.legacyLastPollAt > pollWatchdogMs) {
+      this.log.warn("Polling-Watchdog: Kein Poll seit >10min \u2013 starte Polling neu.");
+      this.scheduleLegacyPolling(0);
+      return;
+    }
     if (this.cloudConnected || !this.authFailureSince) {
       return;
     }
@@ -1440,14 +1447,23 @@ class Mammotion extends utils.Adapter {
       return;
     }
     this.legacyPollInFlight = true;
+    this.legacyLastPollAt = Date.now();
     try {
       this.legacyHasActiveDevice = await this.pollLegacyTelemetry();
     } catch (err) {
-      this.log.debug(`Legacy-Polling-Zyklus fehlgeschlagen: ${this.extractAxiosError(err)}`);
+      this.log.warn(`Legacy-Polling-Zyklus fehlgeschlagen: ${this.extractAxiosError(err)}`);
     } finally {
       this.legacyPollInFlight = false;
-      if (this.legacyPollingEnabled && this.deviceContexts.size) {
-        this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
+      if (this.legacyPollingEnabled) {
+        if (this.deviceContexts.size) {
+          this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
+        } else {
+          this.log.warn("Legacy-Polling: Keine Ger\xE4te im Cache \u2013 erzwinge Neuverbindung.");
+          this.cloudConnected = false;
+          if (!this.authFailureSince) {
+            this.authFailureSince = Date.now() - 15 * 60 * 1e3 - 1;
+          }
+        }
       }
     }
   }

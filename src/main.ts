@@ -125,6 +125,7 @@ class Mammotion extends utils.Adapter {
     private authFailureSince = 0;
     private reconnectTimer: NodeJS.Timeout | null = null;
     private legacyPollTimer: NodeJS.Timeout | null = null;
+    private legacyLastPollAt = 0;
     private taskSettingsAutoApplyTimers = new Map<string, NodeJS.Timeout>();
     private routeAutoApplyTimers = new Map<string, NodeJS.Timeout>();
     private nonWorkAutoApplyTimers = new Map<string, NodeJS.Timeout>();
@@ -1426,6 +1427,21 @@ class Mammotion extends utils.Adapter {
     }
 
     private async reconnectIfAllowed(): Promise<void> {
+        // Watchdog: Polling läuft, aber seit >10min kein Poll → Neustart erzwingen
+        const pollWatchdogMs = 10 * 60 * 1000;
+        if (
+            this.legacyPollingEnabled &&
+            this.cloudConnected &&
+            this.legacyLastPollAt > 0 &&
+            !this.legacyPollInFlight &&
+            !this.legacyPollTimer &&
+            Date.now() - this.legacyLastPollAt > pollWatchdogMs
+        ) {
+            this.log.warn('Polling-Watchdog: Kein Poll seit >10min – starte Polling neu.');
+            this.scheduleLegacyPolling(0);
+            return;
+        }
+
         if (this.cloudConnected || !this.authFailureSince) {
             return;
         }
@@ -1646,14 +1662,24 @@ class Mammotion extends utils.Adapter {
         }
 
         this.legacyPollInFlight = true;
+        this.legacyLastPollAt = Date.now();
         try {
             this.legacyHasActiveDevice = await this.pollLegacyTelemetry();
         } catch (err) {
-            this.log.debug(`Legacy-Polling-Zyklus fehlgeschlagen: ${this.extractAxiosError(err)}`);
+            this.log.warn(`Legacy-Polling-Zyklus fehlgeschlagen: ${this.extractAxiosError(err)}`);
         } finally {
             this.legacyPollInFlight = false;
-            if (this.legacyPollingEnabled && this.deviceContexts.size) {
-                this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
+            if (this.legacyPollingEnabled) {
+                if (this.deviceContexts.size) {
+                    this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
+                } else {
+                    this.log.warn('Legacy-Polling: Keine Geräte im Cache – erzwinge Neuverbindung.');
+                    this.cloudConnected = false;
+                    if (!this.authFailureSince) {
+                        // Cooldown sofort überspringen damit reconnectIfAllowed() beim nächsten Tick greift
+                        this.authFailureSince = Date.now() - 15 * 60 * 1000 - 1;
+                    }
+                }
             }
         }
     }
