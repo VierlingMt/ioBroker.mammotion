@@ -1,116 +1,129 @@
 {
-    "common": {
-        "name": "mammotion",
-        "version": "0.0.4",
-        "news": {
-            "0.0.2": {
-                "en": "Improved telemetry sync and auto-apply for task/route/non-work settings",
-                "de": "Telemetrie-Sync verbessert und Auto-Apply fuer Task/Route/Non-Work Settings hinzugefuegt",
-                "ru": "Улучшена синхронизация телеметрии и добавлено авто-применение для task/route/non-work",
-                "pt": "Sincronizacao de telemetria melhorada e aplicacao automatica para task/route/non-work",
-                "nl": "Verbeterde telemetrie-sync en auto-toepassen voor task/route/non-work",
-                "fr": "Synchronisation de telemetrie amelioree et application auto pour task/route/non-work",
-                "it": "Sincronizzazione telemetria migliorata e applicazione automatica per task/route/non-work",
-                "es": "Sincronizacion de telemetria mejorada y auto-aplicacion para task/route/non-work",
-                "pl": "Ulepszona synchronizacja telemetrii i automatyczne stosowanie dla task/route/non-work",
-                "uk": "Покращено синхронізацію телеметрії та додано авто-застосування для task/route/non-work",
-                "zh-cn": "改进了遥测同步，并为 task/route/non-work 增加了自动应用"
-            },
-            "0.0.4": {
-                "en": "Control flow is stable (start/pause/stop/zones, payload flow, order by zone position). Telemetry is still being improved (MQTT decoding/RTK fields).",
-                "de": "Steuerung ist stabil (Start/Pause/Stop/Zonen, Payload-Flow, Reihenfolge per Zonen-Position). Telemetrie wird noch verbessert (MQTT-Decoding/RTK-Felder).",
-                "ru": "Управление стабильно (start/pause/stop/зоны, payload flow, порядок по позиции зоны). Телеметрия еще дорабатывается (MQTT decoding/RTK поля).",
-                "pt": "Fluxo de controle estável (start/pause/stop/zonas, payload flow, ordem por posição da zona). Telemetria ainda em melhoria (decodificação MQTT/campos RTK).",
-                "nl": "Besturingsflow is stabiel (start/pause/stop/zones, payload-flow, volgorde via zonepositie). Telemetrie wordt nog verbeterd (MQTT-decoding/RTK-velden).",
-                "fr": "Le flux de commande est stable (start/pause/stop/zones, payload flow, ordre par position de zone). La télémétrie est encore en cours d'amélioration (décodage MQTT/champs RTK).",
-                "it": "Flusso di controllo stabile (start/pause/stop/zone, payload flow, ordine per posizione zona). Telemetria ancora in miglioramento (decodifica MQTT/campi RTK).",
-                "es": "Flujo de control estable (start/pause/stop/zonas, payload flow, orden por posición de zona). La telemetría aún se está mejorando (decodificación MQTT/campos RTK).",
-                "pl": "Przepływ sterowania jest stabilny (start/pause/stop/strefy, payload flow, kolejność wg pozycji strefy). Telemetria jest jeszcze ulepszana (dekodowanie MQTT/pola RTK).",
-                "uk": "Керування стабільне (start/pause/stop/зони, payload flow, порядок за позицією зони). Телеметрію ще покращуємо (декодування MQTT/RTK поля).",
-                "zh-cn": "控制流程已稳定（start/pause/stop/分区、payload 流程、按分区位置排序）。遥测仍在改进中（MQTT 解码/RTK 字段）。"
-            }
-        },
-        "titleLang": {
-            "en": "Mammotion Luba",
-            "de": "Mammotion Luba",
-            "ru": "Маммоция Люба",
-            "pt": "Mammotion Luba",
-            "nl": "Mammotie Luba",
-            "fr": "Mammotion Luba",
-            "it": "Mammotion Luba",
-            "es": "Mamoción Luba",
-            "pl": "Mammotion Luba",
-            "uk": "Мамоція Люба",
-            "zh-cn": "玛莫特·卢巴"
-        },
-        "desc": {
-            "en": "Control Mammotion Luba mower via cloud/MQTT",
-            "de": "Steuern Sie den Mammotion Luba Mäher über Cloud/MQTT",
-            "ru": "Управляйте газонокосилкой Mammotion Luba через облако/MQTT",
-            "pt": "Controle o cortador Mammotion Luba via nuvem/MQTT",
-            "nl": "Bedien de Mammotion Luba-maaier via cloud/MQTT",
-            "fr": "Contrôlez la tondeuse Mammotion Luba via cloud/MQTT",
-            "it": "Controlla il tosaerba Mammotion Luba tramite cloud/MQTT",
-            "es": "Controle el cortacésped Mammotion Luba a través de la nube/MQTT",
-            "pl": "Steruj kosiarką Mammotion Luba poprzez chmurę/MQTT",
-            "uk": "Керуйте косаркою Mammotion Luba через хмару/MQTT",
-            "zh-cn": "通过云/MQTT 控制 Mammotion Luba 割草机"
-        },
-        "authors": [
-            "DNAngel <stolly82@web.de>"
-        ],
-        "keywords": [
-            "mammotion",
-            "luba",
-            "mower",
-            "mqtt",
-            "cloud",
-            "ble"
-        ],
-        "licenseInformation": {
-            "type": "free",
-            "license": "MIT"
-        },
-        "platform": "Javascript/Node.js",
-        "icon": "mammotion.png",
-        "enabled": true,
-        "extIcon": "https://raw.githubusercontent.com/DNAngelX/ioBroker.mammotion/main/admin/mammotion.png",
-        "readme": "https://github.com/DNAngelX/ioBroker.mammotion/blob/main/README.md",
-        "loglevel": "info",
-        "tier": 3,
-        "mode": "daemon",
-        "type": "garden",
-        "compact": true,
-        "connectionType": "cloud",
-        "dataSource": "push",
-        "adminUI": {
-            "config": "json"
-        },
-        "dependencies": [
-            {
-                "js-controller": ">=6.0.11"
-            }
-        ],
-        "globalDependencies": [
-            {
-                "admin": ">=7.6.20"
-            }
-        ]
+  "common": {
+    "name": "mammotion",
+    "version": "0.0.5",
+    "news": {
+      "0.0.5": {
+        "en": "Improved Yuka compatibility: model-aware limits (e.g. Yuka Mini lane width), route reserved-byte mapping aligned, and receiver selection adjusted for route commands.",
+        "de": "Yuka-Kompatibilitaet verbessert: modellabhaengige Limits (z. B. Yuka Mini Bahnbreite), Route-Reserved-Bytes angepasst und Receiver-Auswahl fuer Route-Befehle korrigiert.",
+        "ru": "Улучшена совместимость с Yuka: лимиты по модели (например, ширина прохода Yuka Mini), согласована карта reserved-байтов маршрута и скорректирован выбор receiver для команд маршрута.",
+        "pt": "Compatibilidade com Yuka melhorada: limites por modelo (ex.: largura de faixa no Yuka Mini), mapeamento de bytes reservados de rota alinhado e seleção de receiver ajustada para comandos de rota.",
+        "nl": "Yuka-compatibiliteit verbeterd: modelafhankelijke limieten (bijv. baanbreedte Yuka Mini), route-reserved-byte mapping uitgelijnd en receiverselectie aangepast voor routecommando's.",
+        "fr": "Compatibilite Yuka amelioree : limites selon le modele (ex. largeur de bande Yuka Mini), mappage des octets reserves de route aligne et selection du receiver ajustee pour les commandes de route.",
+        "it": "Compatibilita Yuka migliorata: limiti per modello (es. larghezza corsia Yuka Mini), mapping dei byte reserved della route allineato e selezione receiver corretta per i comandi route.",
+        "es": "Compatibilidad con Yuka mejorada: limites por modelo (p. ej. ancho de pasada en Yuka Mini), mapeo de bytes reservados de ruta alineado y seleccion de receiver ajustada para comandos de ruta.",
+        "pl": "Poprawiono kompatybilnosc z Yuka: limity zalezne od modelu (np. szerokosc pasa Yuka Mini), dopasowano mapowanie bajtow reserved trasy i poprawiono wybor receiver dla komend trasy.",
+        "uk": "Покращено сумісність з Yuka: ліміти за моделлю (наприклад, ширина проходу Yuka Mini), узгоджено мапінг reserved-байтів маршруту та виправлено вибір receiver для команд маршруту.",
+        "zh-cn": "改进了 Yuka 兼容性：按机型应用限制（如 Yuka Mini 割草道宽度）、对齐了路线 reserved 字节映射，并修正了路线命令的接收端选择。"
+      },
+      "0.0.2": {
+        "en": "Improved telemetry sync and auto-apply for task/route/non-work settings",
+        "de": "Telemetrie-Sync verbessert und Auto-Apply fuer Task/Route/Non-Work Settings hinzugefuegt",
+        "ru": "Улучшена синхронизация телеметрии и добавлено авто-применение для task/route/non-work",
+        "pt": "Sincronizacao de telemetria melhorada e aplicacao automatica para task/route/non-work",
+        "nl": "Verbeterde telemetrie-sync en auto-toepassen voor task/route/non-work",
+        "fr": "Synchronisation de telemetrie amelioree et application auto pour task/route/non-work",
+        "it": "Sincronizzazione telemetria migliorata e applicazione automatica per task/route/non-work",
+        "es": "Sincronizacion de telemetria mejorada y auto-aplicacion para task/route/non-work",
+        "pl": "Ulepszona synchronizacja telemetrii i automatyczne stosowanie dla task/route/non-work",
+        "uk": "Покращено синхронізацію телеметрії та додано авто-застосування для task/route/non-work",
+        "zh-cn": "改进了遥测同步，并为 task/route/non-work 增加了自动应用"
+      },
+      "0.0.4": {
+        "en": "Control flow is stable (start/pause/stop/zones, payload flow, order by zone position). Telemetry is still being improved (MQTT decoding/RTK fields).",
+        "de": "Steuerung ist stabil (Start/Pause/Stop/Zonen, Payload-Flow, Reihenfolge per Zonen-Position). Telemetrie wird noch verbessert (MQTT-Decoding/RTK-Felder).",
+        "ru": "Управление стабильно (start/pause/stop/зоны, payload flow, порядок по позиции зоны). Телеметрия еще дорабатывается (MQTT decoding/RTK поля).",
+        "pt": "Fluxo de controle estável (start/pause/stop/zonas, payload flow, ordem por posição da zona). Telemetria ainda em melhoria (decodificação MQTT/campos RTK).",
+        "nl": "Besturingsflow is stabiel (start/pause/stop/zones, payload-flow, volgorde via zonepositie). Telemetrie wordt nog verbeterd (MQTT-decoding/RTK-velden).",
+        "fr": "Le flux de commande est stable (start/pause/stop/zones, payload flow, ordre par position de zone). La télémétrie est encore en cours d'amélioration (décodage MQTT/champs RTK).",
+        "it": "Flusso di controllo stabile (start/pause/stop/zone, payload flow, ordine per posizione zona). Telemetria ancora in miglioramento (decodifica MQTT/campi RTK).",
+        "es": "Flujo de control estable (start/pause/stop/zonas, payload flow, orden por posición de zona). La telemetría aún se está mejorando (decodificación MQTT/campos RTK).",
+        "pl": "Przepływ sterowania jest stabilny (start/pause/stop/strefy, payload flow, kolejność wg pozycji strefy). Telemetria jest jeszcze ulepszana (dekodowanie MQTT/pola RTK).",
+        "uk": "Керування стабільне (start/pause/stop/зони, payload flow, порядок за позицією зони). Телеметрію ще покращуємо (декодування MQTT/RTK поля).",
+        "zh-cn": "控制流程已稳定（start/pause/stop/分区、payload 流程、按分区位置排序）。遥测仍在改进中（MQTT 解码/RTK 字段）。"
+      }
     },
-    "protectedNative": [
-        "password"
-    ],
-    "encryptedNative": [
-        "password"
-    ],
-    "native": {
-        "email": "",
-        "password": "",
-        "deviceUuid": "A9D0F177-F701-4212-8676-EDF9B354AE48",
-        "legacyPollIntervalSec": 30,
-        "legacyTelemetryTransport": "poll",
-        "storeDebugPayloads": false
+    "titleLang": {
+      "en": "Mammotion Luba",
+      "de": "Mammotion Luba",
+      "ru": "Маммоция Люба",
+      "pt": "Mammotion Luba",
+      "nl": "Mammotie Luba",
+      "fr": "Mammotion Luba",
+      "it": "Mammotion Luba",
+      "es": "Mamoción Luba",
+      "pl": "Mammotion Luba",
+      "uk": "Мамоція Люба",
+      "zh-cn": "玛莫特·卢巴"
     },
-    "objects": [],
-    "instanceObjects": []
+    "desc": {
+      "en": "Control Mammotion Luba mower via cloud/MQTT",
+      "de": "Steuern Sie den Mammotion Luba Mäher über Cloud/MQTT",
+      "ru": "Управляйте газонокосилкой Mammotion Luba через облако/MQTT",
+      "pt": "Controle o cortador Mammotion Luba via nuvem/MQTT",
+      "nl": "Bedien de Mammotion Luba-maaier via cloud/MQTT",
+      "fr": "Contrôlez la tondeuse Mammotion Luba via cloud/MQTT",
+      "it": "Controlla il tosaerba Mammotion Luba tramite cloud/MQTT",
+      "es": "Controle el cortacésped Mammotion Luba a través de la nube/MQTT",
+      "pl": "Steruj kosiarką Mammotion Luba poprzez chmurę/MQTT",
+      "uk": "Керуйте косаркою Mammotion Luba через хмару/MQTT",
+      "zh-cn": "通过云/MQTT 控制 Mammotion Luba 割草机"
+    },
+    "authors": [
+      "DNAngel <stolly82@web.de>"
+    ],
+    "keywords": [
+      "mammotion",
+      "luba",
+      "mower",
+      "mqtt",
+      "cloud",
+      "ble"
+    ],
+    "licenseInformation": {
+      "type": "free",
+      "license": "MIT"
+    },
+    "platform": "Javascript/Node.js",
+    "icon": "mammotion.png",
+    "enabled": true,
+    "extIcon": "https://raw.githubusercontent.com/DNAngelX/ioBroker.mammotion/main/admin/mammotion.png",
+    "readme": "https://github.com/DNAngelX/ioBroker.mammotion/blob/main/README.md",
+    "loglevel": "info",
+    "tier": 3,
+    "mode": "daemon",
+    "type": "garden",
+    "compact": true,
+    "connectionType": "cloud",
+    "dataSource": "push",
+    "adminUI": {
+      "config": "json"
+    },
+    "dependencies": [
+      {
+        "js-controller": ">=6.0.11"
+      }
+    ],
+    "globalDependencies": [
+      {
+        "admin": ">=7.6.20"
+      }
+    ]
+  },
+  "protectedNative": [
+    "password"
+  ],
+  "encryptedNative": [
+    "password"
+  ],
+  "native": {
+    "email": "",
+    "password": "",
+    "deviceUuid": "A9D0F177-F701-4212-8676-EDF9B354AE48",
+    "legacyPollIntervalSec": 30,
+    "legacyTelemetryTransport": "poll",
+    "storeDebugPayloads": false
+  },
+  "objects": [],
+  "instanceObjects": []
 }

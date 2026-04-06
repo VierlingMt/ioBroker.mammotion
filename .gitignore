@@ -18,3 +18,7 @@ admin/i18n/*/flat.txt
 # Local development artifacts
 docs/
 test/*.xapk
+test/Partner Platform.html
+test/Partner Platform_files/
+test/*.zip
+test/*

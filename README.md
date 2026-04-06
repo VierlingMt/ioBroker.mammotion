@@ -186,13 +186,13 @@ setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
     areaHashes: ["12345678901234"],
 
     // Mowing settings
-    cutHeightMm: 65,        // Blade height in mm (30–70, 5 mm step)
-    mowSpeedMs: 0.35,       // Mowing speed in m/s (0.1–1.2)
+    cutHeightMm: 65,        // Blade height in mm (model-dependent)
+    mowSpeedMs: 0.35,       // Mowing speed in m/s (model-dependent)
 
     // Route settings
     jobMode: 4,             // Job mode (default: 4)
     channelMode: 0,         // Channel mode: 0=default, 1=spiral, 2=zigzag, 3=custom
-    channelWidthCm: 25,     // Lane width in cm (20–35)
+    channelWidthCm: 25,     // Lane width in cm (model-dependent)
     towardDeg: 0,           // Mowing direction in degrees (-180–180)
     borderMode: 1,          // Border mode: 0=off, 1=on
     mowingLaps: 1,          // Border laps (0–4)
@@ -213,10 +213,16 @@ setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
 - Telemetry is currently under active improvement. Some values can stay stale depending on cloud push behavior and MQTT topic coverage.
 - `telemetry.lastUpdate` only means a telemetry packet was processed. If values do not change, the cloud may be returning unchanged data.
 - Mammotion cloud sessions can invalidate each other (mobile app vs adapter). Using a shared device account (Option B above) avoids this entirely.
-- Command limits follow app defaults: cut height 30–70 mm (5 mm step), route width 20–35 cm, mowing laps 0–4, obstacle laps 0–3.
+- Command limits follow model defaults (example: Luba 20–35 cm route width, Yuka 15–30 cm, Yuka Mini 8–12 cm).
 - Shared devices use Aliyun polling (no MQTT). This is normal and fully functional.
 
 ## Changelog
+
+### 0.0.5
+- Improved: Yuka compatibility for route execution (`startZones`/`startAllZones`/single zone)
+- Changed: model-aware limits for command states (including Yuka/Yuka Mini spacing ranges)
+- Changed: route reserved-byte mapping aligned with PyMammotion behavior
+- Changed: NAV receiver selection adjusted for route commands
 
 ### 0.0.3 (upcoming)
 - Fixed: polling silently stops when device cache becomes empty (watchdog added)
@@ -233,6 +239,8 @@ setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
 - Changed: payload can also trigger task-control actions (`start/pause/resume/stop/dock/cancel...`)
 - Changed: clean UI profile (advanced/internal states marked as expert)
 - Changed: app-like limits enforced for cut height, route width, mowing laps and obstacle laps
+- Changed: model-aware command limits (Yuka/Yuka Mini spacing + speed ranges)
+- Changed: route reserved bytes and NAV receiver selection aligned to PyMammotion behavior (improves Yuka compatibility)
 - Changed: zone execution order via `zones.<name>.position` for `startZones` and `startAllZones`
 - Known issue: telemetry coverage is not complete yet (MQTT decoding/RTK fields still in progress)
 

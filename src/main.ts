@@ -110,6 +110,7 @@ const ROUTE_BORDER_MODE_NAMES: Record<number, string> = {
     0: 'NONE',
     1: 'BORDER_FIRST',
 };
+const LUBA_PRO_PRODUCT_KEYS = new Set<string>(['a1mb8v6tnAa', 'a1pHsTqyoPR']);
 const CUT_HEIGHT_MIN_MM = 30;
 const CUT_HEIGHT_MAX_MM = 70;
 const CUT_HEIGHT_STEP_MM = 5;
@@ -117,6 +118,10 @@ const ROUTE_CHANNEL_WIDTH_MIN_CM = 20;
 const ROUTE_CHANNEL_WIDTH_MAX_CM = 35;
 const ROUTE_MOWING_LAPS_MAX = 4;
 const ROUTE_OBSTACLE_LAPS_MAX = 3;
+const YUKA_ROUTE_CHANNEL_WIDTH_MIN_CM = 15;
+const YUKA_ROUTE_CHANNEL_WIDTH_MAX_CM = 30;
+const YUKA_MINI_ROUTE_CHANNEL_WIDTH_MIN_CM = 8;
+const YUKA_MINI_ROUTE_CHANNEL_WIDTH_MAX_CM = 12;
 const ACTIVE_DEVICE_STATES = new Set<number>([13, 14, 19, 20, 31, 32, 34, 35, 36, 37, 38]);
 const IDLE_DEVICE_STATES = new Set<number>([0, 1, 2, 8, 10, 11, 12, 15, 16, 17, 22, 23, 39]);
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1000;
@@ -409,14 +414,14 @@ class Mammotion extends utils.Adapter {
         }
 
         if (settingName === 'bladeHeightMm') {
-            const normalizedCutHeightMm = this.normalizeCutHeightMm(numericValue);
+            const normalizedCutHeightMm = this.normalizeCutHeightMm(numericValue, this.deviceContexts.get(deviceKey));
             void this.setStateChangedAsync(localId, normalizedCutHeightMm, true);
             this.scheduleAutoApplyTaskSettings(deviceKey);
             return;
         }
 
         if (settingName === 'routeChannelWidthCm') {
-            const normalizedRouteWidth = Math.min(ROUTE_CHANNEL_WIDTH_MAX_CM, Math.max(ROUTE_CHANNEL_WIDTH_MIN_CM, Math.trunc(numericValue)));
+            const normalizedRouteWidth = this.normalizeRouteChannelWidthCm(numericValue, this.deviceContexts.get(deviceKey));
             void this.setStateChangedAsync(localId, normalizedRouteWidth, true);
             this.scheduleAutoApplyRoute(deviceKey);
             return;
@@ -693,7 +698,7 @@ class Mammotion extends utils.Adapter {
                     mode,
                     label: `route-${mode}`,
                     step: 'route-command',
-                    routeReceiver: 1,
+                    routeReceiver: this.getReceiverDevice(ctx),
                     startReceiver: this.getReceiverDevice(ctx),
                 }),
             );
@@ -816,8 +821,10 @@ class Mammotion extends utils.Adapter {
             throw new Error('Mähgeschwindigkeit ist ungültig.');
         }
 
-        const clampedCutHeight = this.normalizeCutHeightMm(cutHeightMm);
-        const clampedMowSpeed = Math.min(1, Math.max(0.1, mowSpeedMsRaw));
+        const context = this.deviceContexts.get(deviceKey);
+        const limits = this.getDeviceCommandLimits(context);
+        const clampedCutHeight = this.normalizeCutHeightMm(cutHeightMm, context);
+        const clampedMowSpeed = Math.min(limits.mowSpeed.max, Math.max(limits.mowSpeed.min, mowSpeedMsRaw));
         return {
             cutHeightMm: clampedCutHeight,
             mowSpeedMs: Number(clampedMowSpeed.toFixed(2)),
@@ -855,6 +862,8 @@ class Mammotion extends utils.Adapter {
         const routeIsDump = await this.readBooleanCommandState(deviceKey, 'routeIsDump', true);
         const routeIsEdge = await this.readBooleanCommandState(deviceKey, 'routeIsEdge', false);
         const areaHashes = this.parseAreaHashes(routeAreaIds);
+        const context = this.deviceContexts.get(deviceKey);
+        const limits = this.getDeviceCommandLimits(context);
 
         if (!areaHashes.length) {
             throw new Error('Bitte mindestens eine Area-Hash-ID in commands.routeAreaIds eintragen.');
@@ -862,14 +871,14 @@ class Mammotion extends utils.Adapter {
 
         return {
             areaHashes,
-            cutHeightMm: this.normalizeCutHeightMm(cutHeightMm),
-            mowSpeedMs: Number(Math.min(1.2, Math.max(0.1, mowSpeedMs)).toFixed(2)),
+            cutHeightMm: this.normalizeCutHeightMm(cutHeightMm, context),
+            mowSpeedMs: Number(Math.min(limits.mowSpeed.max, Math.max(limits.mowSpeed.min, mowSpeedMs)).toFixed(2)),
             jobMode: Math.min(10, Math.max(0, Math.trunc(routeJobMode))),
             jobVersion: Math.max(1, Math.trunc(routeJobVersion)),
             jobId: Math.max(1, Math.trunc(routeJobId) || Date.now()),
             ultraWave: Math.min(20, Math.max(0, Math.trunc(routeUltraWave))),
             channelMode: Math.min(3, Math.max(0, Math.trunc(routeChannelMode))),
-            channelWidthCm: Math.min(ROUTE_CHANNEL_WIDTH_MAX_CM, Math.max(ROUTE_CHANNEL_WIDTH_MIN_CM, Math.trunc(routeChannelWidthCm))),
+            channelWidthCm: this.normalizeRouteChannelWidthCm(routeChannelWidthCm, context),
             towardDeg: Math.min(180, Math.max(-180, Math.trunc(routeTowardDeg))),
             towardIncludedAngleDeg: Math.min(180, Math.max(-180, Math.trunc(routeTowardIncludedAngleDeg))),
             towardMode: Math.min(2, Math.max(0, Math.trunc(routeTowardMode))),
@@ -908,10 +917,11 @@ class Mammotion extends utils.Adapter {
         const powerOn = await this.readBooleanCommandState(deviceKey, 'bladePowerOn', true);
         const heightMm = await this.readNumericCommandState(deviceKey, 'bladeHeightMm', 60);
         const maxSpeedMs = await this.readNumericCommandState(deviceKey, 'bladeMaxSpeedMs', 1.2);
+        const context = this.deviceContexts.get(deviceKey);
 
         return {
             powerOn,
-            heightMm: this.normalizeCutHeightMm(heightMm),
+            heightMm: this.normalizeCutHeightMm(heightMm, context),
             maxSpeedMs: Number(Math.min(1.5, Math.max(0.1, maxSpeedMs)).toFixed(2)),
         };
     }
@@ -1184,6 +1194,9 @@ class Mammotion extends utils.Adapter {
                 productKey: record?.productKey || '',
                 recordDeviceName: record?.deviceName || '',
                 status: device?.status,
+                deviceType: this.pickNumber(device?.deviceType),
+                series: device?.series || '',
+                productSeries: device?.productSeries || '',
             };
             this.deviceContexts.set(key, context);
 
@@ -1221,6 +1234,7 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`${channelId}.recordDeviceName`, context.recordDeviceName, true);
             await this.setStateChangedAsync(`${channelId}.raw`, JSON.stringify({ device, record }), true);
             await this.setStateChangedAsync(`${channelId}.telemetry.connected`, (context.status ?? 0) === 1, true);
+            await this.applyDeviceCommandLimits(channelId, context);
             const location = device?.locationVo?.location;
             if (Array.isArray(location) && location.length >= 2) {
                 await this.setStateChangedAsync(`${channelId}.telemetry.longitude`, Number(location[0]) || 0, true);
@@ -2818,7 +2832,7 @@ class Mammotion extends utils.Adapter {
         const lubaMessage = this.buildLubaMessage({
             msgType: 240,
             // The Android app sends NavReqCoverPath to DEV_MAINCTL.
-            receiverDevice: 1,
+            receiverDevice: this.getReceiverDevice(context),
             subtype: Number.isNaN(subtype) ? 0 : subtype,
             subMessageField: 11,
             subMessagePayload: navPayload,
@@ -2871,45 +2885,151 @@ class Mammotion extends utils.Adapter {
         const bytes = Buffer.alloc(8);
         bytes[0] = this.clampByte(settings.borderMode);
         bytes[1] = this.clampByte(settings.obstacleLaps);
-        bytes[2] = 1;
+        bytes[2] = 0;
         bytes[3] = this.clampByte(settings.startProgress);
-
-        const typeKey = `${context.deviceName} ${context.productKey}`.toLowerCase();
-        const isLuba1 = typeKey.includes('luba 1');
-        const isLubaPro = typeKey.includes('luba pro');
-        const isYukaLike = typeKey.includes('yuka');
+        bytes[5] = 0;
+        const isLuba1 = this.isLuba1Device(context);
+        const isLubaPro = this.isLubaProDevice(context);
+        const isYuka = this.isYukaDevice(context);
+        const isYukaMini = this.isYukaMiniDevice(context);
+        const isYukaMl = this.isYukaMlDevice(context);
         if (!isLuba1) {
             bytes[4] = 0;
-            bytes[5] = 0;
-            if (isYukaLike) {
+            if (isYuka && !isYukaMini && !isYukaMl) {
                 bytes[5] = this.clampByte(this.getYukaConfig(settings, context.deviceName));
             } else if (isLubaPro) {
-                bytes[5] = 10;
+                bytes[5] = 8;
             }
-            bytes[6] = this.clampByte(settings.collectGrassFrequency);
+            bytes[6] = this.clampByte(settings.isDump ? settings.collectGrassFrequency : 10);
+        } else {
+            bytes[4] = this.clampByte(settings.towardMode);
         }
         return bytes.toString('utf8');
     }
 
     private getYukaConfig(settings: RouteSettings, _deviceName: string): number {
-        if (settings.isMow || settings.isDump || settings.isEdge) {
-            return 0;
-        }
-        return 10;
+        if (settings.isMow && settings.isDump && settings.isEdge) return 14;
+        if (settings.isMow && settings.isDump && !settings.isEdge) return 12;
+        if (settings.isMow && !settings.isDump && settings.isEdge) return 10;
+        if (settings.isMow && !settings.isDump && !settings.isEdge) return 8;
+        if (!settings.isMow && settings.isDump && settings.isEdge) return 6;
+        if (!settings.isMow && settings.isDump && !settings.isEdge) return 4;
+        if (!settings.isMow && !settings.isDump && settings.isEdge) return 2;
+        return 0;
     }
 
     private clampByte(value: number): number {
         return Math.max(0, Math.min(255, Math.trunc(value)));
     }
 
-    private normalizeCutHeightMm(value: number): number {
-        return this.clampToStep(value, CUT_HEIGHT_MIN_MM, CUT_HEIGHT_MAX_MM, CUT_HEIGHT_STEP_MM);
+    private normalizeCutHeightMm(value: number, context?: DeviceContext): number {
+        const limits = this.getDeviceCommandLimits(context);
+        return this.clampToStep(value, limits.cutHeight.min, limits.cutHeight.max, limits.cutHeight.step);
+    }
+
+    private normalizeRouteChannelWidthCm(value: number, context?: DeviceContext): number {
+        const limits = this.getDeviceCommandLimits(context);
+        return this.clampToStep(value, limits.routeWidth.min, limits.routeWidth.max, limits.routeWidth.step);
     }
 
     private clampToStep(value: number, min: number, max: number, step: number): number {
         const clamped = Math.min(max, Math.max(min, Number.isFinite(value) ? value : min));
         const normalized = Math.round((clamped - min) / step) * step + min;
         return Math.min(max, Math.max(min, normalized));
+    }
+
+    private getDeviceCommandLimits(context?: DeviceContext): DeviceCommandLimits {
+        const hint = `${context?.deviceName || ''} ${context?.series || ''} ${context?.productSeries || ''}`.toLowerCase();
+        const isLubaMini = hint.includes('luba mini');
+        const isHighCutVariant = /(mini|vision).*[0-9]h\b|\bmini.*\bh\b/.test(hint);
+
+        let limits: DeviceCommandLimits = {
+            cutHeight: { min: CUT_HEIGHT_MIN_MM, max: CUT_HEIGHT_MAX_MM, step: CUT_HEIGHT_STEP_MM },
+            routeWidth: { min: ROUTE_CHANNEL_WIDTH_MIN_CM, max: ROUTE_CHANNEL_WIDTH_MAX_CM, step: 1 },
+            mowSpeed: { min: 0.2, max: 1, step: 0.01 },
+        };
+
+        if (this.isYukaDevice(context)) {
+            limits = {
+                cutHeight: { min: 55, max: 55, step: 1 },
+                routeWidth: { min: YUKA_ROUTE_CHANNEL_WIDTH_MIN_CM, max: YUKA_ROUTE_CHANNEL_WIDTH_MAX_CM, step: 1 },
+                mowSpeed: { min: 0.2, max: 0.6, step: 0.01 },
+            };
+        }
+
+        if (this.isYukaMiniDevice(context) || this.isYukaMlDevice(context)) {
+            limits = {
+                cutHeight: isHighCutVariant ? { min: 50, max: 90, step: 5 } : { min: 20, max: 60, step: 5 },
+                routeWidth: { min: YUKA_MINI_ROUTE_CHANNEL_WIDTH_MIN_CM, max: YUKA_MINI_ROUTE_CHANNEL_WIDTH_MAX_CM, step: 1 },
+                mowSpeed: { min: 0.2, max: 0.6, step: 0.01 },
+            };
+        }
+
+        if (isLubaMini && isHighCutVariant) {
+            limits.cutHeight = { min: 55, max: 100, step: 5 };
+        }
+
+        return limits;
+    }
+
+    private getDeviceTypeCode(context?: DeviceContext): number | null {
+        return this.pickNumber(context?.deviceType);
+    }
+
+    private isYukaDevice(context?: DeviceContext): boolean {
+        if (!context) {
+            return false;
+        }
+        const type = this.getDeviceTypeCode(context);
+        if (type !== null && [3, 4, 5, 8, 14, 16, 21].includes(type)) {
+            return true;
+        }
+        const hint = `${context.deviceName} ${context.series || ''} ${context.productSeries || ''}`.toLowerCase();
+        return hint.includes('yuka');
+    }
+
+    private isYukaMiniDevice(context?: DeviceContext): boolean {
+        if (!context) {
+            return false;
+        }
+        const type = this.getDeviceTypeCode(context);
+        if (type !== null && [4, 5].includes(type)) {
+            return true;
+        }
+        const hint = `${context.deviceName} ${context.series || ''} ${context.productSeries || ''}`.toLowerCase();
+        return this.isYukaDevice(context) && hint.includes('mini');
+    }
+
+    private isYukaMlDevice(context?: DeviceContext): boolean {
+        if (!context) {
+            return false;
+        }
+        const type = this.getDeviceTypeCode(context);
+        if (type === 16) {
+            return true;
+        }
+        const hint = `${context.deviceName} ${context.series || ''} ${context.productSeries || ''}`.toLowerCase();
+        return hint.includes('yuka ml');
+    }
+
+    private isLuba1Device(context?: DeviceContext): boolean {
+        if (!context) {
+            return false;
+        }
+        const type = this.getDeviceTypeCode(context);
+        if (type === 1) {
+            return true;
+        }
+        const hint = `${context.deviceName} ${context.series || ''} ${context.productSeries || ''}`.toLowerCase();
+        return hint.includes('luba 1');
+    }
+
+    private isLubaProDevice(context?: DeviceContext): boolean {
+        if (!context) {
+            return false;
+        }
+        const hint = `${context.deviceName} ${context.series || ''} ${context.productSeries || ''}`.toLowerCase();
+        return hint.includes('luba pro') || LUBA_PRO_PRODUCT_KEYS.has(context.productKey);
     }
 
     private routeCommandToSubCmd(mode: RouteCommandMode): number {
@@ -2965,8 +3085,7 @@ class Mammotion extends utils.Adapter {
     }
 
     private getReceiverDevice(context: DeviceContext): number {
-        const lowerType = `${context.deviceName} ${context.productKey}`.toLowerCase();
-        if (lowerType.includes('luba 2') || lowerType.includes('yuka') || lowerType.includes('x3')) {
+        if (this.isLubaProDevice(context)) {
             return 17; // DEV_NAVIGATION
         }
         return 1; // DEV_MAINCTL
@@ -3660,16 +3779,18 @@ class Mammotion extends utils.Adapter {
         const routeIsMow = await this.readBooleanCommandState(deviceKey, 'routeIsMow', true);
         const routeIsDump = await this.readBooleanCommandState(deviceKey, 'routeIsDump', true);
         const routeIsEdge = await this.readBooleanCommandState(deviceKey, 'routeIsEdge', false);
+        const context = this.deviceContexts.get(deviceKey);
+        const limits = this.getDeviceCommandLimits(context);
 
         return {
-            cutHeightMm: this.normalizeCutHeightMm(cutHeightMm),
-            mowSpeedMs: Number(Math.min(1.2, Math.max(0.1, mowSpeedMs)).toFixed(2)),
+            cutHeightMm: this.normalizeCutHeightMm(cutHeightMm, context),
+            mowSpeedMs: Number(Math.min(limits.mowSpeed.max, Math.max(limits.mowSpeed.min, mowSpeedMs)).toFixed(2)),
             jobMode: Math.min(10, Math.max(0, Math.trunc(routeJobMode))),
             jobVersion: Math.max(1, Math.trunc(routeJobVersion)),
             jobId: Math.max(1, Math.trunc(routeJobId) || Date.now()),
             ultraWave: Math.min(20, Math.max(0, Math.trunc(routeUltraWave))),
             channelMode: Math.min(3, Math.max(0, Math.trunc(routeChannelMode))),
-            channelWidthCm: Math.min(ROUTE_CHANNEL_WIDTH_MAX_CM, Math.max(ROUTE_CHANNEL_WIDTH_MIN_CM, Math.trunc(routeChannelWidthCm))),
+            channelWidthCm: this.normalizeRouteChannelWidthCm(routeChannelWidthCm, context),
             towardDeg: Math.min(180, Math.max(-180, Math.trunc(routeTowardDeg))),
             towardIncludedAngleDeg: Math.min(180, Math.max(-180, Math.trunc(routeTowardIncludedAngleDeg))),
             towardMode: Math.min(2, Math.max(0, Math.trunc(routeTowardMode))),
@@ -3818,7 +3939,7 @@ class Mammotion extends utils.Adapter {
             mode: 'generate',
             step: 'route-generate',
             label,
-            routeReceiver: 1,
+            routeReceiver: this.getReceiverDevice(context),
             startReceiver: this.getReceiverDevice(context),
             start: true,
         });
@@ -3897,7 +4018,7 @@ class Mammotion extends utils.Adapter {
                     mode: executeStart ? 'generate' : routeMode,
                     step: executeStart ? 'route-generate' : 'route-command',
                     label: payload.label ?? payload.action ?? (executeStart ? 'payload-startRoute' : `payload-${routeMode}`),
-                    routeReceiver: 1,
+                    routeReceiver: this.getReceiverDevice(ctx),
                     startReceiver: this.getReceiverDevice(ctx),
                     start: executeStart,
                 }),
@@ -3949,21 +4070,20 @@ class Mammotion extends utils.Adapter {
             throw new Error('payload: "areaHashes" fehlt oder ist leer.');
         }
 
+        const context = this.deviceContexts.get(deviceKey);
+        const limits = this.getDeviceCommandLimits(context);
         const cutHeightRaw = payload.cutHeightMm ?? payload.targetCutHeightMm ?? payload.bladeHeightMm ?? base.cutHeightMm;
         const mowSpeedRaw = payload.mowSpeedMs ?? payload.targetMowSpeedMs ?? base.mowSpeedMs;
         return {
             areaHashes,
-            cutHeightMm: this.normalizeCutHeightMm(cutHeightRaw),
-            mowSpeedMs: Number(Math.min(1.2, Math.max(0.1, mowSpeedRaw)).toFixed(2)),
+            cutHeightMm: this.normalizeCutHeightMm(cutHeightRaw, context),
+            mowSpeedMs: Number(Math.min(limits.mowSpeed.max, Math.max(limits.mowSpeed.min, mowSpeedRaw)).toFixed(2)),
             jobMode: Math.min(10, Math.max(0, Math.trunc(payload.jobMode ?? payload.routeJobMode ?? base.jobMode))),
             jobVersion: Math.max(1, Math.trunc(payload.jobVersion ?? payload.routeJobVersion ?? base.jobVersion)),
             jobId: Math.max(1, Math.trunc(payload.jobId ?? payload.routeJobId ?? base.jobId) || Date.now()),
             ultraWave: Math.min(20, Math.max(0, Math.trunc(payload.ultraWave ?? payload.routeUltraWave ?? base.ultraWave))),
             channelMode: Math.min(3, Math.max(0, Math.trunc(payload.channelMode ?? payload.routeChannelMode ?? base.channelMode))),
-            channelWidthCm: Math.min(
-                ROUTE_CHANNEL_WIDTH_MAX_CM,
-                Math.max(ROUTE_CHANNEL_WIDTH_MIN_CM, Math.trunc(payload.channelWidthCm ?? payload.routeChannelWidthCm ?? base.channelWidthCm)),
-            ),
+            channelWidthCm: this.normalizeRouteChannelWidthCm(payload.channelWidthCm ?? payload.routeChannelWidthCm ?? base.channelWidthCm, context),
             towardDeg: Math.min(180, Math.max(-180, Math.trunc(payload.towardDeg ?? payload.routeTowardDeg ?? base.towardDeg))),
             towardIncludedAngleDeg: Math.min(
                 180,
@@ -4498,16 +4618,15 @@ class Mammotion extends utils.Adapter {
         }
 
         await this.removeLegacyState(`${channelId}.commands.targetCutHeightMm`);
+        const deviceKey = channelId.replace(/^devices\./, '');
+        const context = this.deviceContexts.get(deviceKey);
         const bladeHeightState = await this.getStateAsync(`${channelId}.commands.bladeHeightMm`);
-        const normalizedBladeHeight = this.normalizeCutHeightMm(Number(bladeHeightState?.val));
+        const normalizedBladeHeight = this.normalizeCutHeightMm(Number(bladeHeightState?.val), context);
         if (Number.isFinite(normalizedBladeHeight)) {
             await this.setStateChangedAsync(`${channelId}.commands.bladeHeightMm`, normalizedBladeHeight, true);
         }
         const routeWidthState = await this.getStateAsync(`${channelId}.commands.routeChannelWidthCm`);
-        const normalizedRouteWidth = Math.min(
-            ROUTE_CHANNEL_WIDTH_MAX_CM,
-            Math.max(ROUTE_CHANNEL_WIDTH_MIN_CM, Math.trunc(Number(routeWidthState?.val))),
-        );
+        const normalizedRouteWidth = this.normalizeRouteChannelWidthCm(Number(routeWidthState?.val), context);
         if (Number.isFinite(normalizedRouteWidth)) {
             await this.setStateChangedAsync(`${channelId}.commands.routeChannelWidthCm`, normalizedRouteWidth, true);
         }
@@ -4528,6 +4647,51 @@ class Mammotion extends utils.Adapter {
         );
         if (Number.isFinite(normalizedObstacleLaps)) {
             await this.setStateChangedAsync(`${channelId}.commands.routeObstacleLaps`, normalizedObstacleLaps, true);
+        }
+    }
+
+    private async applyDeviceCommandLimits(channelId: string, context: DeviceContext): Promise<void> {
+        const limits = this.getDeviceCommandLimits(context);
+        await this.extendObjectAsync(`${channelId}.commands.targetMowSpeedMs`, {
+            common: {
+                min: limits.mowSpeed.min,
+                max: limits.mowSpeed.max,
+                step: limits.mowSpeed.step,
+            },
+        });
+        await this.extendObjectAsync(`${channelId}.commands.bladeHeightMm`, {
+            common: {
+                min: limits.cutHeight.min,
+                max: limits.cutHeight.max,
+                step: limits.cutHeight.step,
+            },
+        });
+        await this.extendObjectAsync(`${channelId}.commands.routeChannelWidthCm`, {
+            common: {
+                min: limits.routeWidth.min,
+                max: limits.routeWidth.max,
+                step: limits.routeWidth.step,
+            },
+        });
+
+        const speedState = await this.getStateAsync(`${channelId}.commands.targetMowSpeedMs`);
+        const normalizedSpeed = Number(
+            Math.min(limits.mowSpeed.max, Math.max(limits.mowSpeed.min, Number(speedState?.val ?? 0.3))).toFixed(2),
+        );
+        if (Number.isFinite(normalizedSpeed)) {
+            await this.setStateChangedAsync(`${channelId}.commands.targetMowSpeedMs`, normalizedSpeed, true);
+        }
+
+        const bladeState = await this.getStateAsync(`${channelId}.commands.bladeHeightMm`);
+        const normalizedBlade = this.normalizeCutHeightMm(Number(bladeState?.val), context);
+        if (Number.isFinite(normalizedBlade)) {
+            await this.setStateChangedAsync(`${channelId}.commands.bladeHeightMm`, normalizedBlade, true);
+        }
+
+        const widthState = await this.getStateAsync(`${channelId}.commands.routeChannelWidthCm`);
+        const normalizedWidth = this.normalizeRouteChannelWidthCm(Number(widthState?.val), context);
+        if (Number.isFinite(normalizedWidth)) {
+            await this.setStateChangedAsync(`${channelId}.commands.routeChannelWidthCm`, normalizedWidth, true);
         }
     }
 
@@ -5037,6 +5201,15 @@ interface DeviceContext {
     productKey: string;
     recordDeviceName: string;
     status?: number;
+    deviceType?: number | null;
+    series?: string;
+    productSeries?: string;
+}
+
+interface DeviceCommandLimits {
+    cutHeight: { min: number; max: number; step: number };
+    routeWidth: { min: number; max: number; step: number };
+    mowSpeed: { min: number; max: number; step: number };
 }
 
 interface LegacyApiResponse<TData> {
