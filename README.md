@@ -221,6 +221,13 @@ setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
 
 ## Changelog
 
+### 0.0.7
+- Fixed: zone discovery race condition by adding a per-device discovery lock (prevents parallel classification runs)
+- Fixed: unknown hash reclassification handling to reduce temporary zone drops during MQTT flapping
+- Fixed: fallback zone naming now creates unique and gap-free Area IDs (no duplicate like `Area_2_2`, no missing `Area_4`)
+- Changed: adapter log messages are now consistently in English
+- New: standard GitHub QA workflows (`test-and-release`, `dependabot`, `automerge-dependabot`)
+
 ### 0.0.6
 - New: Product-key sync from PyMammotion (`npm run sync:product-keys`) and optional weekly GitHub workflow PR automation
 - New: `devices.<id>.productKeyGroup` state for transparent model classification

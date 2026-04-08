@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion",
-    "version": "0.0.6",
+    "version": "0.0.7",
     "news": {
+      "0.0.7": {
+        "en": "Stabilized zone discovery and zone object creation: per-device discovery lock prevents parallel runs, retries for unknown hash classifications were improved, and fallback zone naming now guarantees unique and gap-free Area IDs.",
+        "de": "Zonen-Erkennung und Zonen-Objektanlage stabilisiert: Ein Discovery-Lock pro Geraet verhindert parallele Laeufe, Retries fuer unbekannte Hash-Klassifizierungen wurden verbessert und das Fallback-Namensschema erzeugt eindeutige sowie lueckenfreie Area-IDs.",
+        "ru": "Стабилизированы обнаружение зон и создание объектов зон: блокировка discovery на устройство предотвращает параллельные запуски, улучшены повторные попытки для неизвестной классификации hash, а резервное именование зон теперь гарантирует уникальные и непрерывные Area ID.",
+        "pt": "Estabilizada a descoberta de zonas e a criacao de objetos de zona: bloqueio de descoberta por dispositivo evita execucoes paralelas, retries para classificacoes de hash desconhecidas foram melhorados e a nomeacao fallback agora garante IDs de Area unicos e sem lacunas.",
+        "nl": "Zone-detectie en aanmaak van zone-objecten gestabiliseerd: een discovery-lock per apparaat voorkomt parallelle runs, retries voor onbekende hash-classificaties zijn verbeterd en fallback zone-namen zorgen nu voor unieke en aaneengesloten Area-ID's.",
+        "fr": "Stabilisation de la decouverte des zones et de la creation des objets de zone : un verrou de decouverte par appareil evite les executions paralleles, les retries pour les classifications de hash inconnues ont ete ameliores et le nommage de secours garantit des IDs Area uniques et sans trous.",
+        "it": "Stabilizzati rilevamento zone e creazione oggetti zona: un lock di discovery per dispositivo evita esecuzioni parallele, migliorati i retry per classificazioni hash sconosciute e la denominazione fallback ora garantisce ID Area univoci e senza buchi.",
+        "es": "Se estabilizo el descubrimiento de zonas y la creacion de objetos de zona: un bloqueo de descubrimiento por dispositivo evita ejecuciones paralelas, se mejoraron los reintentos para clasificaciones hash desconocidas y el nombrado de respaldo ahora garantiza IDs de Area unicos y sin huecos.",
+        "pl": "Ustabilizowano wykrywanie stref i tworzenie obiektow stref: blokada discovery per urzadzenie zapobiega rownoleglym przebiegom, ulepszono ponowne proby dla nieznanej klasyfikacji hash, a fallback nazewnictwa stref gwarantuje unikalne i ciagle identyfikatory Area.",
+        "uk": "Стабілізовано виявлення зон і створення об'єктів зон: lock discovery на пристрій запобігає паралельним запускам, покращено повторні спроби для невідомої класифікації hash, а fallback-іменування зон тепер гарантує унікальні та безперервні Area ID.",
+        "zh-cn": "稳定了分区发现与分区对象创建：按设备加 discovery 锁以避免并发运行，改进了未知 hash 分类的重试逻辑，并且回退分区命名现在保证 Area ID 唯一且无缺口。"
+      },
       "0.0.6": {
         "en": "Added product-key sync from PyMammotion (manual script + optional GitHub workflow), improved product-key based model detection (including Yuka Mini), and exposed devices.<id>.productKeyGroup.",
         "de": "Produkt-Key-Sync aus PyMammotion hinzugefuegt (manuelles Script + optionaler GitHub-Workflow), produkt-key-basierte Modell-Erkennung verbessert (inkl. Yuka Mini) und devices.<id>.productKeyGroup bereitgestellt.",

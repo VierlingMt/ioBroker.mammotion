@@ -131,6 +131,7 @@ const YUKA_MINI_ROUTE_CHANNEL_WIDTH_MAX_CM = 12;
 const ACTIVE_DEVICE_STATES = new Set<number>([13, 14, 19, 20, 31, 32, 34, 35, 36, 37, 38]);
 const IDLE_DEVICE_STATES = new Set<number>([0, 1, 2, 8, 10, 11, 12, 15, 16, 17, 22, 23, 39]);
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1000;
+const AREA_NAME_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000];
 
 class Mammotion extends utils.Adapter {
     private mqttClient: any = null;
@@ -162,7 +163,12 @@ class Mammotion extends utils.Adapter {
     private aliyunMqttClient: any = null;
     private aliyunMqttCreds: AliyunMqttCreds | null = null;
     private subscribedDeviceTopics = new Set<string>();
-    private lastRequestedHashSet = '';
+    private lastRequestedHashSetByDevice = new Map<string, string>();
+    private pendingAreaNamesByDevice = new Map<string, Map<string, string>>();
+    private classifiedAreaHashesByDevice = new Map<string, Set<string>>();
+    private zoneDiscoveryInFlight = new Set<string>();
+    private areaNameRetryTimers = new Map<string, NodeJS.Timeout>();
+    private areaNameRetryAttempts = new Map<string, number>();
     /** Accumulator for multi-frame NavGetHashListAck messages, keyed by deviceKey. */
     private hashFrameAccumulator = new Map<string, { totalFrame: number; frames: Map<number, bigint[]> }>();
     /** Promise resolvers waiting for a specific field-33 response, keyed by "deviceKey:hash". */
@@ -184,7 +190,7 @@ class Mammotion extends utils.Adapter {
         this.startReconnectTimer();
 
         if (!this.config.email || !this.config.password) {
-            this.log.warn('Bitte Email und Passwort der Mammotion-App in den Adapter-Einstellungen eintragen.');
+            this.log.warn('Please enter the Mammotion app email and password in the adapter settings.');
             return;
         }
 
@@ -199,15 +205,15 @@ class Mammotion extends utils.Adapter {
             await this.requestAreaNamesForAllDevices();
 
             this.log.info(
-                `Initialisierung erfolgreich: ${this.deviceContexts.size} Gerät(e), Telemetrie über ${
-                    this.mqttClient ? 'MQTT' : this.legacySession ? 'Aliyun Polling' : 'keinen aktiven Kanal'
+                `Initialization successful: ${this.deviceContexts.size} device(s), telemetry via ${
+                    this.mqttClient ? 'MQTT' : this.legacySession ? 'Aliyun Polling' : 'no active channel'
                 }.`,
             );
         } catch (err) {
             const msg = this.extractAxiosError(err);
             this.markAuthFailure(msg);
             await this.setStateChangedAsync('info.lastError', msg, true);
-            this.log.error(`Mammotion Initialisierung fehlgeschlagen: ${msg}`);
+            this.log.error(`Mammotion initialization failed: ${msg}`);
         }
     }
 
@@ -233,6 +239,12 @@ class Mammotion extends utils.Adapter {
             this.clearAutoApplyTimers(this.routeAutoApplyTimers);
             this.clearAutoApplyTimers(this.nonWorkAutoApplyTimers);
             this.clearAutoApplyTimers(this.startSettingsEnforceTimers);
+            this.clearAutoApplyTimers(this.areaNameRetryTimers);
+            this.areaNameRetryAttempts.clear();
+            this.lastRequestedHashSetByDevice.clear();
+            this.pendingAreaNamesByDevice.clear();
+            this.classifiedAreaHashesByDevice.clear();
+            this.zoneDiscoveryInFlight.clear();
             this.stopLegacyPolling();
             this.syncConnectionStates();
             callback();
@@ -415,7 +427,7 @@ class Mammotion extends utils.Adapter {
 
         const numericValue = Number(rawValue);
         if (!Number.isFinite(numericValue)) {
-            void this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Ungültiger Wert für ${settingName}.`, true);
+            void this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Invalid value for ${settingName}.`, true);
             return;
         }
 
@@ -578,21 +590,21 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, Date.now(), true);
             this.log.info(
-                `Start-Reapply (${trigger}) für ${ctx.deviceName || ctx.iotId}: Höhe ${cutHeightMm} mm, Speed ${mowSpeedMs} m/s.`,
+                `Start-Reapply (${trigger}) for ${ctx.deviceName || ctx.iotId}: height ${cutHeightMm} mm, Speed ${mowSpeedMs} m/s.`,
             );
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
-            this.log.warn(`Start-Reapply (${trigger}) fehlgeschlagen für ${ctx.deviceName || ctx.iotId}: ${msg}`);
+            this.log.warn(`Start-Reapply (${trigger}) failed for ${ctx.deviceName || ctx.iotId}: ${msg}`);
         }
     }
 
     private async handleDeviceCommand(deviceKey: string, command: DeviceCommand, localId: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            const msg = `Unbekanntes Gerät für Command ${command}: ${deviceKey}`;
+            const msg = `Unknown device for Command ${command}: ${deviceKey}`;
             this.log.warn(msg);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
@@ -623,7 +635,7 @@ class Mammotion extends utils.Adapter {
             if (command === 'start') {
                 this.scheduleStartSettingsEnforce(deviceKey);
             }
-            this.log.info(`Command ${command} für ${ctx.deviceName || ctx.iotId} erfolgreich.`);
+            this.log.info(`Command ${command} for ${ctx.deviceName || ctx.iotId} succeeded.`);
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
         } catch (err) {
@@ -632,7 +644,7 @@ class Mammotion extends utils.Adapter {
                 this.markAuthFailure(msg);
             }
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
-            this.log.error(`Command ${command} für ${ctx.deviceName || ctx.iotId} fehlgeschlagen: ${msg}`);
+            this.log.error(`Command ${command} for ${ctx.deviceName || ctx.iotId} failed: ${msg}`);
         } finally {
             await this.setStateChangedAsync(localId, false, true);
         }
@@ -647,7 +659,7 @@ class Mammotion extends utils.Adapter {
 
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            const msg = `Unbekanntes Gerät für Task-Settings: ${deviceKey}`;
+            const msg = `Unknown device for Task settings: ${deviceKey}`;
             this.log.warn(msg);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
@@ -663,7 +675,7 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, now, true);
             this.log.info(
-                `Task-Settings für ${ctx.deviceName || ctx.iotId} erfolgreich: Schnitthöhe ${cutHeightMm} mm, Geschwindigkeit ${mowSpeedMs} m/s.`,
+                `Task settings for ${ctx.deviceName || ctx.iotId} succeeded: cut height ${cutHeightMm} mm, speed ${mowSpeedMs} m/s.`,
             );
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
@@ -673,7 +685,7 @@ class Mammotion extends utils.Adapter {
                 this.markAuthFailure(msg);
             }
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
-            this.log.error(`Task-Settings für ${ctx.deviceName || ctx.iotId} fehlgeschlagen: ${msg}`);
+            this.log.error(`Task settings for ${ctx.deviceName || ctx.iotId} failed: ${msg}`);
         } finally {
             await this.setStateChangedAsync(localId, false, true);
         }
@@ -688,7 +700,7 @@ class Mammotion extends utils.Adapter {
 
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            const msg = `Unbekanntes Gerät für Route-Command ${mode}: ${deviceKey}`;
+            const msg = `Unknown device for Route-Command ${mode}: ${deviceKey}`;
             this.log.warn(msg);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
@@ -716,7 +728,7 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastResult`, result, true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, now, true);
-            this.log.info(`Route-Command ${mode} für ${ctx.deviceName || ctx.iotId} erfolgreich.`);
+            this.log.info(`Route-Command ${mode} for ${ctx.deviceName || ctx.iotId} succeeded.`);
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
         } catch (err) {
@@ -725,7 +737,7 @@ class Mammotion extends utils.Adapter {
                 this.markAuthFailure(msg);
             }
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
-            this.log.error(`Route-Command ${mode} für ${ctx.deviceName || ctx.iotId} fehlgeschlagen: ${msg}`);
+            this.log.error(`Route-Command ${mode} for ${ctx.deviceName || ctx.iotId} failed: ${msg}`);
         } finally {
             await this.setStateChangedAsync(localId, false, true);
         }
@@ -740,7 +752,7 @@ class Mammotion extends utils.Adapter {
 
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            const msg = `Unbekanntes Gerät für Non-Work-Hours: ${deviceKey}`;
+            const msg = `Unknown device for Non-Work-Hours: ${deviceKey}`;
             this.log.warn(msg);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
@@ -758,7 +770,7 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, now, true);
             this.log.info(
-                `Non-Work-Hours für ${ctx.deviceName || ctx.iotId} gesetzt: ${nonWorkHours.startTime}-${nonWorkHours.endTime}.`,
+                `Non-Work-Hours for ${ctx.deviceName || ctx.iotId} set: ${nonWorkHours.startTime}-${nonWorkHours.endTime}.`,
             );
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
@@ -768,7 +780,7 @@ class Mammotion extends utils.Adapter {
                 this.markAuthFailure(msg);
             }
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
-            this.log.error(`Non-Work-Hours für ${ctx.deviceName || ctx.iotId} fehlgeschlagen: ${msg}`);
+            this.log.error(`Non-Work-Hours for ${ctx.deviceName || ctx.iotId} failed: ${msg}`);
         } finally {
             await this.setStateChangedAsync(localId, false, true);
         }
@@ -777,7 +789,7 @@ class Mammotion extends utils.Adapter {
     private async handleBladeControlCommand(deviceKey: string, localId: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            const msg = `Unbekanntes Gerät für Blade-Control: ${deviceKey}`;
+            const msg = `Unknown device for Blade control: ${deviceKey}`;
             this.log.warn(msg);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
@@ -795,9 +807,9 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, now, true);
             this.log.info(
-                `Blade-Control für ${ctx.deviceName || ctx.iotId} erfolgreich: ${
-                    bladeControl.powerOn ? 'EIN' : 'AUS'
-                }, Höhe ${bladeControl.heightMm} mm.`,
+                `Blade control for ${ctx.deviceName || ctx.iotId} succeeded: ${
+                    bladeControl.powerOn ? 'ON' : 'OFF'
+                }, height ${bladeControl.heightMm} mm.`,
             );
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
@@ -807,7 +819,7 @@ class Mammotion extends utils.Adapter {
                 this.markAuthFailure(msg);
             }
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
-            this.log.error(`Blade-Control für ${ctx.deviceName || ctx.iotId} fehlgeschlagen: ${msg}`);
+            this.log.error(`Blade control for ${ctx.deviceName || ctx.iotId} failed: ${msg}`);
         } finally {
             await this.setStateChangedAsync(localId, false, true);
         }
@@ -821,10 +833,10 @@ class Mammotion extends utils.Adapter {
         const mowSpeedMsRaw = Number(mowSpeedState?.val);
 
         if (!Number.isFinite(cutHeightMm)) {
-            throw new Error('Schnitthöhe ist ungültig.');
+            throw new Error('Cut height is invalid.');
         }
         if (!Number.isFinite(mowSpeedMsRaw)) {
-            throw new Error('Mähgeschwindigkeit ist ungültig.');
+            throw new Error('Mowing speed is invalid.');
         }
 
         const context = this.deviceContexts.get(deviceKey);
@@ -872,7 +884,7 @@ class Mammotion extends utils.Adapter {
         const limits = this.getDeviceCommandLimits(context);
 
         if (!areaHashes.length) {
-            throw new Error('Bitte mindestens eine Area-Hash-ID in commands.routeAreaIds eintragen.');
+            throw new Error('Please set at least one area hash ID in commands.routeAreaIds.');
         }
 
         return {
@@ -906,10 +918,10 @@ class Mammotion extends utils.Adapter {
         const subCmd = await this.readNumericCommandState(deviceKey, 'nonWorkSubCmd', 0);
 
         if (!this.isValidHourMinute(startTime)) {
-            throw new Error(`Ungültige Startzeit: ${startTime} (Format HH:MM).`);
+            throw new Error(`Invalid start time: ${startTime} (Format HH:MM).`);
         }
         if (!this.isValidHourMinute(endTime)) {
-            throw new Error(`Ungültige Endzeit: ${endTime} (Format HH:MM).`);
+            throw new Error(`Invalid end time: ${endTime} (Format HH:MM).`);
         }
 
         return {
@@ -972,7 +984,7 @@ class Mammotion extends utils.Adapter {
             .map(v => {
                 const parsed = v.startsWith('0x') || v.startsWith('0X') ? BigInt(v) : BigInt(v.replace(/_/g, ''));
                 if (parsed <= 0n) {
-                    throw new Error(`Ungültiger Area-Hash: ${v}`);
+                    throw new Error(`Invalid area hash: ${v}`);
                 }
                 return parsed;
             });
@@ -991,7 +1003,7 @@ class Mammotion extends utils.Adapter {
             const hasActiveDevice = await this.pollLegacyTelemetry();
             this.legacyHasActiveDevice = hasActiveDevice;
         } catch (err) {
-            this.log.debug(`Sofortige Telemetrie-Aktualisierung fehlgeschlagen: ${this.extractAxiosError(err)}`);
+            this.log.debug(`Immediate telemetry refresh failed: ${this.extractAxiosError(err)}`);
         } finally {
             if (this.legacyPollTimer) {
                 this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
@@ -1008,7 +1020,7 @@ class Mammotion extends utils.Adapter {
             );
         } catch (err) {
             this.log.debug(
-                `IOT-Sync für ${context.deviceName || context.iotId} fehlgeschlagen: ${this.extractAxiosError(err)}`,
+                `IoT sync for ${context.deviceName || context.iotId} failed: ${this.extractAxiosError(err)}`,
             );
         }
     }
@@ -1141,7 +1153,7 @@ class Mammotion extends utils.Adapter {
         return [];
     }
 
-    private async fetchMqttCredentials(session: AuthSession): Promise<MqttConnection> {
+    private async fetchMqttCredentias(session: AuthSession): Promise<MqttConnection> {
         const response = await axios.post<MammotionApiResponse<MqttConnection>>(
             `${session.iotDomain}/v1/mqtt/auth/jwt`,
             {},
@@ -1165,6 +1177,9 @@ class Mammotion extends utils.Adapter {
         this.deviceContexts.clear();
         this.mqttTopicMap.clear();
         this.subscribedDeviceTopics.clear();
+        this.lastRequestedHashSetByDevice.clear();
+        this.pendingAreaNamesByDevice.clear();
+        this.classifiedAreaHashesByDevice.clear();
 
         const devicesByIotId = new Map<string, MammotionDevice>();
         const recordsByIotId = new Map<string, DeviceRecord>();
@@ -1274,7 +1289,7 @@ class Mammotion extends utils.Adapter {
         this.mqttClient = client;
 
         client.on('connect', () => {
-            this.log.info('MQTT verbunden.');
+            this.log.info('MQTT connected.');
             this.setJwtMqttConnected(true);
             this.setCloudConnected(true);
             this.authFailureSince = 0;
@@ -1299,12 +1314,18 @@ class Mammotion extends utils.Adapter {
             for (const topic of topics) {
                 client.subscribe(topic, (err: Error | null) => {
                     if (err) {
-                        this.log.warn(`MQTT subscribe fehlgeschlagen (${topic}): ${err.message}`);
+                        this.log.warn(`MQTT subscribe failed (${topic}): ${err.message}`);
                     } else if (isDeviceTopic(topic)) {
-                        this.log.debug(`[MQTT] Physisches Device-Topic erreichbar: ${topic}`);
+                        this.log.debug(`[MQTT] Physical device topic reachable: ${topic}`);
                     }
                 });
             }
+
+            // Area-name responses are async over MQTT. If previous requests happened while
+            // MQTT was down/flapping, retry only for devices without known areas.
+            void this.requestAreaNamesForMissingDevices().catch(err => {
+                this.log.debug(`Area-name re-request after JWT MQTT connect failed: ${this.extractAxiosError(err)}`);
+            });
         });
 
         client.on('message', (topic: string, payload: Buffer) => {
@@ -1312,7 +1333,7 @@ class Mammotion extends utils.Adapter {
         });
 
         client.on('error', (err: Error) => {
-            this.log.warn(`MQTT Fehler: ${err.message}`);
+            this.log.warn(`MQTT error: ${err.message}`);
             void this.setStateChangedAsync('info.lastError', `MQTT: ${err.message}`, true);
             void this.ensureAliyunMqttRunning('jwt-error');
         });
@@ -1341,7 +1362,7 @@ class Mammotion extends utils.Adapter {
         const isProtoTopic = topicParts[1] === 'sys' && topicParts[2] === 'proto';
         const productKey = isProtoTopic ? topicParts[3] : topicParts[2];
         const recordDeviceName = isProtoTopic ? topicParts[4] : topicParts[3];
-        // down_raw topics also carry raw binary protobuf
+        // down_raw topics aso carry raw binary protobuf
         const isRawProto = isProtoTopic || topic.includes('/down_raw');
 
         const payloadText = payload.toString('utf8');
@@ -1369,12 +1390,12 @@ class Mammotion extends utils.Adapter {
 
         const deviceKey = this.resolveDeviceKey(productKey, recordDeviceName, payloadIotId);
         if (!deviceKey) {
-            this.log.debug(`[MQTT] Kein deviceKey für pk=${productKey} dn=${recordDeviceName} iotId=${payloadIotId}`);
+            this.log.debug(`[MQTT] No deviceKey for pk=${productKey} dn=${recordDeviceName} iotId=${payloadIotId}`);
             return;
         }
 
         const ctx = this.deviceContexts.get(deviceKey);
-        // Only update topic-map with real device productKey/deviceName (not AEP/proto credentials)
+        // Only update topic-map with real device productKey/deviceName (not AEP/proto credentias)
         if (ctx && !ctx.productKey && productKey && recordDeviceName && !isProtoTopic) {
             ctx.productKey = productKey;
             ctx.recordDeviceName = recordDeviceName;
@@ -1406,7 +1427,7 @@ class Mammotion extends utils.Adapter {
         // Handle raw binary protobuf topics (down_raw, /sys/proto/...)
         if (isRawProto && !payloadData) {
             const rawBase64 = payload.toString('base64');
-            this.log.debug(`[MQTT] Raw-Proto-Payload (len=${payload.length}), versuche LubaMsg-Decode`);
+            this.log.debug(`[MQTT] Raw-Proto-Payload (len=${payload.length}), trying LubaMsg decode`);
             if (this.shouldStoreDebugPayloads()) {
                 await this.setStateChangedAsync(`${channelId}.telemetry.lastProtoContent`, rawBase64, true);
             }
@@ -1414,16 +1435,15 @@ class Mammotion extends utils.Adapter {
             void this.parseMctlSysProto(deviceKey, rawBase64);
             const areas = this.tryParseAreaHashNames(rawBase64);
             if (areas && areas.length > 0) {
-                this.log.info(`[MQTT] Zone-Namen empfangen (raw): ${areas.map(a => a.name).join(', ')}`);
-                await this.updateZoneStates(deviceKey, areas);
-            } else {
-                const hashIds = this.tryParseNavGetHashListAck(rawBase64, deviceKey);
-                if (hashIds && hashIds.length > 0 && ctx) {
-                    this.log.debug(`[MQTT] NavGetHashListAck (raw): ${hashIds.length} Hashes, frage Namen ab`);
-                    await this.requestAreaNamesForHashes(ctx, hashIds);
-                } else {
-                    this.log.debug(`[MQTT] Raw-Proto: keine Zone-Namen / kein HashListAck`);
-                }
+                this.rememberAreaNames(deviceKey, areas);
+                this.log.debug(`[MQTT] Zone names received (raw): ${areas.length} entries cached`);
+            }
+            const hashIds = this.tryParseNavGetHashListAck(rawBase64, deviceKey);
+            if (hashIds && hashIds.length > 0 && ctx) {
+                this.log.debug(`[MQTT] NavGetHashListAck (raw): ${hashIds.length} Hashes, requesting names`);
+                await this.requestAreaNamesForHashes(ctx, hashIds);
+            } else if (!areas || areas.length === 0) {
+                this.log.debug(`[MQTT] Raw proto: no zone names / no HashListAck`);
             }
             return;
         }
@@ -1458,7 +1478,7 @@ class Mammotion extends utils.Adapter {
                     for (const dt of deviceTopics) {
                         mqttClient.subscribe(dt, { qos: 1 }, (err: Error | null) => {
                             if (err) {
-                                this.log.debug(`[MQTT] Device-Topic-Subscribe fehlgeschlagen (${dt}): ${err.message}`);
+                                this.log.debug(`[MQTT] Device topic subscribe failed (${dt}): ${err.message}`);
                             } else {
                                 this.log.info(`[MQTT] Device-Topic subscribed: ${dt}`);
                             }
@@ -1593,19 +1613,18 @@ class Mammotion extends utils.Adapter {
 
             const areas = this.tryParseAreaHashNames(protoContent);
             if (areas && areas.length > 0) {
-                this.log.info(`[MQTT] Zone-Namen empfangen: ${areas.map(a => a.name).join(', ')}`);
-                await this.updateZoneStates(deviceKey, areas);
-            } else {
-                const hashIds = this.tryParseNavGetHashListAck(protoContent, deviceKey);
-                if (hashIds && hashIds.length > 0 && ctx) {
-                    this.log.debug(`[MQTT] NavGetHashListAck: ${hashIds.length} Hashes, frage Namen ab`);
-                    await this.requestAreaNamesForHashes(ctx, hashIds);
-                } else {
-                    this.log.debug(`[MQTT] protoContent enthält keine Zone-Namen / kein HashListAck`);
-                }
+                this.rememberAreaNames(deviceKey, areas);
+                this.log.debug(`[MQTT] Zone names received: ${areas.length} entries cached`);
+            }
+            const hashIds = this.tryParseNavGetHashListAck(protoContent, deviceKey);
+            if (hashIds && hashIds.length > 0 && ctx) {
+                this.log.debug(`[MQTT] NavGetHashListAck: ${hashIds.length} Hashes, requesting names`);
+                await this.requestAreaNamesForHashes(ctx, hashIds);
+            } else if (!areas || areas.length === 0) {
+                this.log.debug(`[MQTT] protoContent contains no zone names / no HashListAck`);
             }
         } else {
-            this.log.debug(`[MQTT] Kein protoContent gefunden. params.value=${(JSON.stringify(params?.value) ?? '(none)').substring(0, 200)}`);
+            this.log.debug(`[MQTT] No protoContent found. params.value=${(JSON.stringify(params?.value) ?? '(none)').substring(0, 200)}`);
         }
     }
 
@@ -1663,7 +1682,7 @@ class Mammotion extends utils.Adapter {
             }
         }
 
-        this.log.warn(`Modern command path liefert Invalid device für ${context.deviceName || context.iotId}, versuche Aliyun-Fallback.`);
+        this.log.warn(`Modern command path returned Invalid device for ${context.deviceName || context.iotId}, trying Aliyun fallback.`);
         return this.invokeTaskControlCommandLegacy(session, context, content);
     }
 
@@ -1678,7 +1697,7 @@ class Mammotion extends utils.Adapter {
                 throw err;
             }
 
-            this.log.warn(`Command ${command} erster Versuch fehlgeschlagen (${msg}), neuer Login + Retry.`);
+            this.log.warn(`Command ${command} first attempt failed (${msg}), new login + retry.`);
             await this.hydrateContextFromTelemetry(context.key);
             await this.refreshSessionAndDeviceCache();
             const refreshedContext = this.deviceContexts.get(context.key) || context;
@@ -1702,7 +1721,7 @@ class Mammotion extends utils.Adapter {
                 throw err;
             }
 
-            this.log.warn(`Task-Settings erster Versuch fehlgeschlagen (${msg}), neuer Login + Retry.`);
+            this.log.warn(`Task settings first attempt failed (${msg}), new login + retry.`);
             await this.hydrateContextFromTelemetry(context.key);
             await this.refreshSessionAndDeviceCache();
             const refreshedContext = this.deviceContexts.get(context.key) || context;
@@ -1743,7 +1762,7 @@ class Mammotion extends utils.Adapter {
                 throw err;
             }
 
-            this.log.warn(`Command ${commandLabel} erster Versuch fehlgeschlagen (${msg}), neuer Login + Retry.`);
+            this.log.warn(`Command ${commandLabel} first attempt failed (${msg}), new login + retry.`);
             await this.hydrateContextFromTelemetry(context.key);
             await this.refreshSessionAndDeviceCache();
             const refreshedContext = this.deviceContexts.get(context.key) || context;
@@ -1761,14 +1780,14 @@ class Mammotion extends utils.Adapter {
         try {
             devices = await this.fetchDeviceList(session);
         } catch (err) {
-            this.log.debug(`Modern device list nicht verfügbar: ${this.extractAxiosError(err)}`);
+            this.log.debug(`Modern device list unavailable: ${this.extractAxiosError(err)}`);
         }
 
         let modernRecords: DeviceRecord[] = [];
         try {
             modernRecords = await this.fetchDeviceRecords(session);
         } catch (err) {
-            this.log.debug(`Modern device records nicht verfügbar: ${this.extractAxiosError(err)}`);
+            this.log.debug(`Modern device records unavailable: ${this.extractAxiosError(err)}`);
         }
 
         // Legacy bindings always fetched – shared devices (owned: 0) only appear here
@@ -1782,21 +1801,21 @@ class Mammotion extends utils.Adapter {
         ];
 
         if (!records.length) {
-            this.log.warn('Keine Geräte gefunden (weder modern noch legacy). Shared-Gerät vorhanden?');
+            this.log.warn('No devices found (neither modern nor legacy). Is a shared device configured?');
         }
 
         await this.syncDevices(devices, records);
         await this.setStateChangedAsync('info.deviceCount', this.deviceContexts.size, true);
 
         // Try JWT MQTT for ALL records (modern or legacy/shared).
-        // With owner credentials this grants ACL to physical device topics (thing/event/+/post)
+        // With owner credentias this grants ACL to physical device topics (thing/event/+/post)
         // which carries both proactive telemetry AND command responses like NavGetCommDataAck.
         if (records.length && (!this.mqttClient || !this.mqttClient.connected)) {
             try {
-                const mqttAuth = await this.fetchMqttCredentials(session);
+                const mqttAuth = await this.fetchMqttCredentias(session);
                 await this.connectMqtt(mqttAuth, records);
             } catch (err) {
-                this.log.debug(`JWT-MQTT-Credentials nicht verfügbar (${this.extractAxiosError(err)}), AEP-Fallback bleibt aktiv.`);
+                this.log.debug(`JWT MQTT credentias unavailable (${this.extractAxiosError(err)}), AEP fallback remains active.`);
                 if (this.mqttClient) {
                     this.mqttClient.removeAllListeners();
                     this.mqttClient.end(true);
@@ -1881,7 +1900,7 @@ class Mammotion extends utils.Adapter {
     }
 
     private async reconnectIfAllowed(): Promise<void> {
-        // Watchdog: Polling läuft, aber seit >10min kein Poll → Neustart erzwingen
+        // Watchdog: polling appears stalled (>10min without poll) -> force reconnect
         const pollWatchdogMs = 10 * 60 * 1000;
         if (
             this.legacyPollingEnabled &&
@@ -1891,7 +1910,7 @@ class Mammotion extends utils.Adapter {
             !this.legacyPollTimer &&
             Date.now() - this.legacyLastPollAt > pollWatchdogMs
         ) {
-            this.log.warn('Polling-Watchdog: Kein Poll seit >10min – starte Polling neu.');
+            this.log.warn('Polling watchdog: no poll for >10 minutes - restarting polling.');
             this.scheduleLegacyPolling(0);
             return;
         }
@@ -1906,14 +1925,14 @@ class Mammotion extends utils.Adapter {
         }
 
         try {
-            this.log.info('Auth-Cooldown vorbei, versuche Reconnect.');
+            this.log.info('Auth cooldown elapsed, attempting reconnect.');
             await this.refreshSessionAndDeviceCache();
             await this.requestIotSyncForAllDevices();
             this.setCloudConnected(true);
             this.authFailureSince = 0;
         } catch (err) {
             const msg = this.extractAxiosError(err);
-            this.log.warn(`Automatischer Reconnect fehlgeschlagen: ${msg}`);
+            this.log.warn(`Automatic reconnect failed: ${msg}`);
             this.markAuthFailure(msg);
         }
     }
@@ -1933,7 +1952,7 @@ class Mammotion extends utils.Adapter {
                     owned: this.pickNumber(binding.owned) ?? undefined,
                 }));
         } catch (err) {
-            this.log.warn(`Legacy-Bindings konnten nicht geladen werden: ${this.extractAxiosError(err)}`);
+            this.log.warn(`Legacy bindings could not be loaded: ${this.extractAxiosError(err)}`);
             return [];
         }
     }
@@ -1999,7 +2018,7 @@ class Mammotion extends utils.Adapter {
 
     private async createLegacySession(session: AuthSession): Promise<LegacySession> {
         if (!session.authorizationCode) {
-            throw new Error('Legacy-Login nicht möglich: authorization_code fehlt');
+            throw new Error('Legacy login not possible: authorization_code missing');
         }
 
         const countryCode = session.countryCode || this.extractAreaCodeFromToken(session.accessToken) || 'DE';
@@ -2014,7 +2033,7 @@ class Mammotion extends utils.Adapter {
             },
         );
         if (regionResponse.code !== 200 || !regionResponse.data?.apiGatewayEndpoint || !regionResponse.data?.oaApiGatewayEndpoint) {
-            throw new Error(this.extractLegacyApiMessage(regionResponse, 'Legacy region lookup fehlgeschlagen'));
+            throw new Error(this.extractLegacyApiMessage(regionResponse, 'Legacy region lookup failed'));
         }
 
         const connect = await this.callLegacyOpenAccountConnect();
@@ -2028,7 +2047,7 @@ class Mammotion extends utils.Adapter {
         );
         const sid = loginByOauth?.data?.data?.loginSuccessResult?.sid;
         if (!sid) {
-            throw new Error('Legacy-Login fehlgeschlagen: sid fehlt');
+            throw new Error('Legacy login failed: sid missing');
         }
 
         const sessionResponse = await this.callLegacyApi<LegacySessionData>(
@@ -2044,7 +2063,7 @@ class Mammotion extends utils.Adapter {
             },
         );
         if (sessionResponse.code !== 200 || !sessionResponse.data?.iotToken) {
-            throw new Error(this.extractLegacyApiMessage(sessionResponse, 'Legacy Session konnte nicht erstellt werden'));
+            throw new Error(this.extractLegacyApiMessage(sessionResponse, 'Legacy session could not be created'));
         }
 
         const apiGatewayEndpoint = regionResponse.data.apiGatewayEndpoint || '';
@@ -2079,7 +2098,7 @@ class Mammotion extends utils.Adapter {
         );
 
         if (response.code !== 200) {
-            throw new Error(this.extractLegacyApiMessage(response, 'Legacy device list fehlgeschlagen'));
+            throw new Error(this.extractLegacyApiMessage(response, 'Legacy device list failed'));
         }
         return Array.isArray(response.data?.data) ? response.data.data : [];
     }
@@ -2124,7 +2143,7 @@ class Mammotion extends utils.Adapter {
             this.log.debug(`Aliyun MQTT ensure ok (${reason}).`);
         } catch (err) {
             const msg = this.extractAxiosError(err);
-            this.log.warn(`Aliyun MQTT ensure fehlgeschlagen (${reason}): ${msg}`);
+            this.log.warn(`Aliyun MQTT ensure failed (${reason}): ${msg}`);
             await this.setStateChangedAsync('info.lastError', `Aliyun MQTT ensure (${reason}): ${msg}`, true);
         } finally {
             this.aliyunEnsureInFlight = false;
@@ -2154,17 +2173,17 @@ class Mammotion extends utils.Adapter {
         try {
             this.legacyHasActiveDevice = await this.pollLegacyTelemetry();
         } catch (err) {
-            this.log.warn(`Legacy-Polling-Zyklus fehlgeschlagen: ${this.extractAxiosError(err)}`);
+            this.log.warn(`Legacy polling cycle failed: ${this.extractAxiosError(err)}`);
         } finally {
             this.legacyPollInFlight = false;
             if (this.legacyPollingEnabled) {
                 if (this.deviceContexts.size) {
                     this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
                 } else {
-                    this.log.warn('Legacy-Polling: Keine Geräte im Cache – erzwinge Neuverbindung.');
+                    this.log.warn('Legacy polling: no devices in cache - forcing reconnect.');
                     this.setCloudConnected(false);
                     if (!this.authFailureSince) {
-                        // Cooldown sofort überspringen damit reconnectIfAllowed() beim nächsten Tick greift
+                        // Skip cooldown immediately so reconnectIfAllowed() can trigger on the next tick
                         this.authFailureSince = Date.now() - 15 * 60 * 1000 - 1;
                     }
                 }
@@ -2265,7 +2284,7 @@ class Mammotion extends utils.Adapter {
                 if (this.isAuthError(err, msg)) {
                     this.markAuthFailure(msg);
                 }
-                this.log.debug(`Legacy-Telemetrie (properties) für ${ctx.deviceName || ctx.iotId} fehlgeschlagen: ${msg}`);
+                this.log.debug(`Legacy telemetry (properties) failed for ${ctx.deviceName || ctx.iotId}: ${msg}`);
             }
 
             try {
@@ -2278,7 +2297,7 @@ class Mammotion extends utils.Adapter {
                 if (this.isAuthError(err, msg)) {
                     this.markAuthFailure(msg);
                 }
-                this.log.debug(`Legacy-Telemetrie (status) für ${ctx.deviceName || ctx.iotId} fehlgeschlagen: ${msg}`);
+                this.log.debug(`Legacy telemetry (status) failed for ${ctx.deviceName || ctx.iotId}: ${msg}`);
             }
 
             const [deviceState, connected] = await Promise.all([
@@ -2304,9 +2323,9 @@ class Mammotion extends utils.Adapter {
                 legacy.iotToken,
             );
             if (response.code !== 200) {
-                throw new Error(this.extractLegacyApiMessage(response, `Legacy properties Fehler für ${iotId}`));
+                throw new Error(this.extractLegacyApiMessage(response, `Legacy properties error for ${iotId}`));
             }
-            this.log.debug(`[PROPS] Property keys für ${iotId}: ${Object.keys(response.data || {}).join(', ')}`);
+            this.log.debug(`[PROPS] Property keys for ${iotId}: ${Object.keys(response.data || {}).join(', ')}`);
             return response.data || null;
         };
 
@@ -2343,7 +2362,7 @@ class Mammotion extends utils.Adapter {
                 legacy.iotToken,
             );
             if (response.code !== 200) {
-                throw new Error(this.extractLegacyApiMessage(response, `Legacy status Fehler für ${iotId}`));
+                throw new Error(this.extractLegacyApiMessage(response, `Legacy status error for ${iotId}`));
             }
             if (!response.data) {
                 return null;
@@ -2580,7 +2599,7 @@ class Mammotion extends utils.Adapter {
         const vid = data?.data?.vid || data?.vid || '';
         const deviceId = data?.data?.data?.device?.data?.deviceId || '';
         if (!vid || !deviceId) {
-            throw new Error('Legacy connect fehlgeschlagen: vid/deviceId fehlen');
+            throw new Error('Legacy connect failed: vid/deviceId missing');
         }
 
         return {
@@ -3143,7 +3162,12 @@ class Mammotion extends utils.Adapter {
 
     // ─── Zone / area name support ────────────────────────────────────────────────
 
-    private buildAreaNameListContent(session: AuthSession, context: DeviceContext, subCmd = 0): string {
+    private buildAreaNameListContent(
+        session: AuthSession,
+        context: DeviceContext,
+        subCmd = 0,
+        receiverDeviceOverride?: number,
+    ): string {
         // NavGetHashList (todev_gethash): requests the device to send its complete zone hash list.
         // sub_cmd=0: all hashes → device responds with NavGetHashListAck (field 31).
         // sub_cmd=3: area hash names → device may respond with AppGetAllAreaHashName (field 61).
@@ -3156,7 +3180,7 @@ class Mammotion extends utils.Adapter {
         const subtype = Number.parseInt(session.userAccount, 10);
         const lubaMessage = this.buildLubaMessage({
             msgType: 240,
-            receiverDevice: this.getReceiverDevice(context),
+            receiverDevice: receiverDeviceOverride ?? this.getReceiverDevice(context),
             subtype: Number.isNaN(subtype) ? 0 : subtype,
             subMessageField: 11,
             subMessagePayload: navPayload,
@@ -3165,32 +3189,48 @@ class Mammotion extends utils.Adapter {
     }
 
     private async sendAreaNameListRequest(context: DeviceContext): Promise<void> {
+        const primaryReceiver = this.getReceiverDevice(context);
+        const receivers = new Set<number>([primaryReceiver]);
+        // Some Yuka firmware revisions answer NavGetHashList only on receiver 17.
+        if (this.isYukaDevice(context)) {
+            receivers.add(17);
+            receivers.add(1);
+        }
+
         // First try sub_cmd=3 (AppGetAllAreaHashName / field 61) – gives area hashes + names directly.
-        // Then also send sub_cmd=0 to keep triggering the proactive NavGetHashListAck (field 31) flow.
-        this.log.debug(`[AREA-REQ] Sende sub_cmd=3 (AppGetAllAreaHashName) für ${context.deviceName || context.iotId}`);
-        const result3 = await this.executeEncodedContentCommand(context, 'area-name-list-v3', (_session, ctx) =>
-            this.buildAreaNameListContent(_session, ctx, 3),
-        );
-        this.log.debug(`[AREA-REQ] sub_cmd=3 Response (len=${result3?.length ?? 0}): ${result3?.substring(0, 100)}`);
-        if (result3 && result3 !== 'ok' && result3.length > 20) {
-            const areas = this.tryParseAreaHashNames(result3);
-            if (areas && areas.length > 0) {
-                this.log.info(`[AREA-REQ] Zonen via sub_cmd=3 synchron empfangen: ${areas.map(a => a.name).join(', ')}`);
-                await this.updateZoneStates(context.key, areas);
-                return; // done, no need for sub_cmd=0 flow
+        for (const receiver of receivers) {
+            this.log.debug(
+                `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`,
+            );
+            const result3 = await this.executeEncodedContentCommand(context, 'area-name-list-v3', (_session, ctx) =>
+                this.buildAreaNameListContent(_session, ctx, 3, receiver),
+            );
+            this.log.debug(
+                `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${result3?.length ?? 0}): ${result3?.substring(0, 100)}`,
+            );
+            if (result3 && result3 !== 'ok' && result3.length > 20) {
+                const areas = this.tryParseAreaHashNames(result3);
+                if (areas && areas.length > 0) {
+                    this.rememberAreaNames(context.key, areas);
+                    this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
+                }
             }
         }
 
         // sub_cmd=0: device responds with NavGetHashListAck (field 31) → triggers field-32 classification
-        const result0 = await this.executeEncodedContentCommand(context, 'area-name-list', (_session, ctx) =>
-            this.buildAreaNameListContent(_session, ctx, 0),
-        );
-        this.log.debug(`[AREA-REQ] sub_cmd=0 Response (len=${result0?.length ?? 0}): ${result0?.substring(0, 100)}`);
-        if (result0 && result0 !== 'ok' && result0.length > 20) {
-            const areas = this.tryParseAreaHashNames(result0);
-            if (areas && areas.length > 0) {
-                this.log.info(`[AREA-REQ] Zone-Namen synchron empfangen: ${areas.map(a => a.name).join(', ')}`);
-                await this.updateZoneStates(context.key, areas);
+        for (const receiver of receivers) {
+            const result0 = await this.executeEncodedContentCommand(context, 'area-name-list', (_session, ctx) =>
+                this.buildAreaNameListContent(_session, ctx, 0, receiver),
+            );
+            this.log.debug(
+                `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${result0?.length ?? 0}): ${result0?.substring(0, 100)}`,
+            );
+            if (result0 && result0 !== 'ok' && result0.length > 20) {
+                const areas = this.tryParseAreaHashNames(result0);
+                if (areas && areas.length > 0) {
+                    this.rememberAreaNames(context.key, areas);
+                    this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
+                }
             }
         }
     }
@@ -3219,26 +3259,171 @@ class Mammotion extends utils.Adapter {
     }
 
     private async requestAreaNamesForHashes(context: DeviceContext, hashIds: bigint[]): Promise<void> {
-        const hashSetKey = hashIds.map(String).join(',');
-        if (this.lastRequestedHashSet === hashSetKey) return;
-        this.lastRequestedHashSet = hashSetKey;
+        if (this.zoneDiscoveryInFlight.has(context.key)) {
+            this.log.debug(`[ZONE] Discovery already running for ${context.deviceName || context.iotId}, skipping duplicate trigger.`);
+            return;
+        }
+        this.zoneDiscoveryInFlight.add(context.key);
+        try {
+            const hashSetKey = hashIds.map(String).join(',');
+            const prevHashSet = this.lastRequestedHashSetByDevice.get(context.key);
+            if (prevHashSet === hashSetKey && (await this.hasKnownAreas(context.key))) {
+                return;
+            }
+            this.lastRequestedHashSetByDevice.set(context.key, hashSetKey);
 
-        this.log.debug(`[ZONE] ${hashIds.length} Hashes empfangen, klassifiziere sequenziell via field-32/33`);
+            this.log.debug(`[ZONE] ${hashIds.length} hashes received, classifying sequentially via field-32/33`);
 
-        // Classify each hash one at a time. The device has a rate limit and only processes
-        // one field-32 request at a time, so we wait for each field-33 response before sending the next.
-        const areaHashes: bigint[] = [];
-        for (const hash of hashIds) {
-            const type = await this.classifyHashType(context, hash);
-            this.log.debug(`[ZONE] hash=${hash} → type=${type}`);
-            if (type === 0) areaHashes.push(hash); // PathType.AREA = 0
+            // Classify each hash one at a time. The device has a rate limit and only processes
+            // one field-32 request at a time, so we wait for each field-33 response before sending the next.
+            const areaHashes: bigint[] = [];
+            let unknownHashes: bigint[] = [];
+            const typeHistogram = new Map<number, number>();
+            for (const hash of hashIds) {
+                const type = await this.classifyHashType(context, hash);
+                this.log.debug(`[ZONE] hash=${hash} → type=${type}`);
+                typeHistogram.set(type, (typeHistogram.get(type) ?? 0) + 1);
+                if (type === 0) areaHashes.push(hash); // PathType.AREA = 0
+                if (type < 0) unknownHashes.push(hash);
+            }
+
+            // MQTT may flap for a few seconds; retry unknown hashes once before finalizing.
+            if (unknownHashes.length > 0) {
+                this.log.debug(`[ZONE] Retrying ${unknownHashes.length} unknown hash classifications once.`);
+                const retryUnknown: bigint[] = [];
+                for (const hash of unknownHashes) {
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    const retryType = await this.classifyHashType(context, hash);
+                    this.log.debug(`[ZONE] retry hash=${hash} → type=${retryType}`);
+                    typeHistogram.set(retryType, (typeHistogram.get(retryType) ?? 0) + 1);
+                    if (retryType === 0 && !areaHashes.some(existing => existing === hash)) {
+                        areaHashes.push(hash);
+                        continue;
+                    }
+                    if (retryType < 0) {
+                        retryUnknown.push(hash);
+                    }
+                }
+                unknownHashes = retryUnknown;
+            }
+
+            const histogramText = [...typeHistogram.entries()]
+                .sort((a, b) => a[0] - b[0])
+                .map(([type, count]) => `${type}:${count}`)
+                .join(', ');
+            this.log.info(
+                `[ZONE] ${areaHashes.length} mowing zones (type=0) detected out of ${hashIds.length} hashes (types: ${histogramText})`,
+            );
+
+            const existingAreas = await this.getKnownAreas(context.key);
+            let finalAreaHashes = areaHashes;
+
+            // If classification timed out for some hashes, do not drop already known zones.
+            if (unknownHashes.length > 0 && existingAreas.length > 0) {
+                const merged = new Map<string, bigint>();
+                for (const area of existingAreas) {
+                    merged.set(area.hash.toString(), area.hash);
+                }
+                for (const hash of areaHashes) {
+                    merged.set(hash.toString(), hash);
+                }
+                finalAreaHashes = [...merged.values()];
+                this.log.warn(
+                    `[ZONE] Partial classification (${unknownHashes.length} timeout/unknown). Keeping ${existingAreas.length} existing zones; merged result has ${finalAreaHashes.length} zones.`,
+                );
+            }
+
+            if (!finalAreaHashes.length) {
+                this.log.warn(
+                    `[ZONE] No mowing zones (type=0) detected - skipping zone update to avoid creating paths/NoGo as zones.`,
+                );
+                return;
+            }
+            this.classifiedAreaHashesByDevice.set(context.key, new Set(finalAreaHashes.map(h => h.toString())));
+            const names = this.pendingAreaNamesByDevice.get(context.key);
+            const existingNames = new Map(existingAreas.map(area => [area.hash.toString(), area.name]));
+            const areas = this.buildAreaListWithUniqueNames(finalAreaHashes, names, existingNames);
+            await this.updateZoneStates(context.key, areas);
+        } finally {
+            this.zoneDiscoveryInFlight.delete(context.key);
+        }
+    }
+
+    private buildAreaListWithUniqueNames(
+        hashes: bigint[],
+        pendingNames: Map<string, string> | undefined,
+        existingNames: Map<string, string>,
+    ): Array<{ name: string; hash: bigint }> {
+        const hasRealNames = !!pendingNames && pendingNames.size > 0;
+        const taken = new Set<string>();
+        const areas: Array<{ name: string; hash: bigint }> = [];
+        let nextFallbackIndex = 1;
+
+        const nextFallbackName = (): string => {
+            while (true) {
+                const candidate = `Area ${nextFallbackIndex++}`;
+                const candidateId = this.sanitizeObjectId(candidate);
+                if (!taken.has(candidateId)) {
+                    return candidate;
+                }
+            }
+        };
+
+        for (const hash of hashes) {
+            const key = hash.toString();
+            let name = hasRealNames ? (pendingNames?.get(key) || existingNames.get(key) || '').trim() : '';
+            if (!name) {
+                name = nextFallbackName();
+            }
+
+            let sanitized = this.sanitizeObjectId(name);
+            if (!sanitized) {
+                name = nextFallbackName();
+                sanitized = this.sanitizeObjectId(name);
+            }
+
+            if (taken.has(sanitized)) {
+                // Avoid odd names like "Area 2 2" when duplicate fallback names occur.
+                // Reassign to the next free "Area N" label instead.
+                name = nextFallbackName();
+                sanitized = this.sanitizeObjectId(name);
+            }
+
+            taken.add(sanitized);
+            areas.push({ name, hash });
         }
 
-        this.log.info(`[ZONE] ${areaHashes.length} Mähzonen (type=0) von ${hashIds.length} Hashes erkannt`);
-        const areas = areaHashes.length > 0
-            ? areaHashes.map((h, i) => ({ name: `Area ${i + 1}`, hash: h }))
-            : hashIds.map((h, i) => ({ name: `Area ${i + 1}`, hash: h })); // fallback: use all
-        await this.updateZoneStates(context.key, areas);
+        return areas;
+    }
+
+    private async getKnownAreas(deviceKey: string): Promise<Array<{ name: string; hash: bigint }>> {
+        const areasJsonState = await this.getStateAsync(`devices.${deviceKey}.telemetry.areasJson`);
+        const raw = areasJsonState?.val;
+        if (typeof raw !== 'string' || !raw.trim()) {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(raw) as Array<{ name?: unknown; hash?: unknown }>;
+            if (!Array.isArray(parsed)) {
+                return [];
+            }
+            const result: Array<{ name: string; hash: bigint }> = [];
+            for (const entry of parsed) {
+                const name = typeof entry?.name === 'string' && entry.name.trim() ? entry.name.trim() : '';
+                const hashRaw = entry?.hash;
+                if (!name || (typeof hashRaw !== 'string' && typeof hashRaw !== 'number' && typeof hashRaw !== 'bigint')) {
+                    continue;
+                }
+                try {
+                    result.push({ name, hash: BigInt(`${hashRaw}`) });
+                } catch {
+                    // ignore malformed hash entries
+                }
+            }
+            return result;
+        } catch {
+            return [];
+        }
     }
 
     /**
@@ -3258,7 +3443,7 @@ class Mammotion extends utils.Adapter {
                 resolve(type);
             });
 
-            // Send field-32 request; also check sync HTTP response immediately
+            // Send field-32 request; aso check sync HTTP response immediately
             void this.executeEncodedContentCommand(context, 'get-comm-data', (_s, ctx) =>
                 this.buildNavGetCommDataContent(_s, ctx, hash),
             ).then(result => {
@@ -3327,11 +3512,9 @@ class Mammotion extends utils.Adapter {
     private resolveCommDataAck(deviceKey: string, protoBase64: string): void {
         try {
             const buf = Buffer.from(protoBase64, 'base64');
-            const lubaFields = this.decodeProtoFields(buf);
-            for (const navBuf of lubaFields.get(11) ?? []) {
-                if (!(navBuf instanceof Buffer)) continue;
-                const navFields = this.decodeProtoFields(navBuf);
-                for (const ackBuf of navFields.get(33) ?? []) {
+            const fieldMaps = this.collectProtoFieldMapsFromBuffer(buf);
+            for (const fields of fieldMaps) {
+                for (const ackBuf of fields.get(33) ?? []) {
                     if (!(ackBuf instanceof Buffer)) continue;
                     const ackFields = this.decodeProtoFields(ackBuf);
                     // Proto3: type=0 (PathType.AREA) is default and NOT encoded on the wire.
@@ -3357,8 +3540,26 @@ class Mammotion extends utils.Adapter {
         for (const ctx of this.deviceContexts.values()) {
             try {
                 await this.sendAreaNameListRequest(ctx);
+                this.startAreaNameRetry(ctx.key);
             } catch (err) {
-                this.log.debug(`Area-Name-Anfrage fehlgeschlagen für ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
+                this.log.debug(`Area-name request failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
+            }
+        }
+    }
+
+    private async requestAreaNamesForMissingDevices(): Promise<void> {
+        for (const ctx of this.deviceContexts.values()) {
+            if (await this.hasKnownAreas(ctx.key)) {
+                this.clearAreaNameRetry(ctx.key);
+                continue;
+            }
+            try {
+                await this.sendAreaNameListRequest(ctx);
+                this.startAreaNameRetry(ctx.key);
+            } catch (err) {
+                this.log.debug(
+                    `Area-Name-Re-Request (missing) failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`,
+                );
             }
         }
     }
@@ -3386,7 +3587,7 @@ class Mammotion extends utils.Adapter {
         );
 
         if (response.code !== 200 || !response.data?.deviceSecret) {
-            throw new Error(this.extractLegacyApiMessage(response, 'AEP handle fehlgeschlagen'));
+            throw new Error(this.extractLegacyApiMessage(response, 'AEP handle failed'));
         }
 
         return {
@@ -3420,7 +3621,7 @@ class Mammotion extends utils.Adapter {
         // Use plain TCP to avoid Aliyun root-CA issues in Node.js
         const brokerHost = `${creds.aepProductKey}.iot-as-mqtt.${creds.regionId}.aliyuncs.com`;
         const brokerUrl = `mqtt://${brokerHost}:1883`;
-        this.log.debug(`[ALIYUN-MQTT] Verbinde mit ${brokerHost}:1883 als ${creds.aepDeviceName}&${creds.aepProductKey}`);
+        this.log.debug(`[ALIYUN-MQTT] Connecting to ${brokerHost}:1883 as ${creds.aepDeviceName}&${creds.aepProductKey}`);
 
         const client = mqtt.connect(brokerUrl, {
             clientId: `${clientIdBase}|securemode=2,signmethod=hmacsha1|`,
@@ -3434,7 +3635,7 @@ class Mammotion extends utils.Adapter {
         this.aliyunMqttClient = client;
 
         client.on('connect', () => {
-            this.log.info('Aliyun IoT MQTT verbunden (Legacy/Shared).');
+            this.log.info('Aliyun IoT MQTT connected (Legacy/Shared).');
             this.setAliyunMqttConnected(true);
             this.setCloudConnected(true);
             this.authFailureSince = 0;
@@ -3467,7 +3668,7 @@ class Mammotion extends utils.Adapter {
             for (const topic of aepTopics) {
                 client.subscribe(topic, { qos: 1 }, (err: Error | null) => {
                     if (err) {
-                        this.log.warn(`Aliyun MQTT subscribe fehlgeschlagen (${topic}): ${err.message}`);
+                        this.log.warn(`Aliyun MQTT subscribe failed (${topic}): ${err.message}`);
                     } else {
                         this.log.debug(`[ALIYUN-MQTT] Subscribed: ${topic}`);
                     }
@@ -3476,8 +3677,8 @@ class Mammotion extends utils.Adapter {
 
             // Re-request area names now that MQTT is connected and can receive the async response
             setTimeout(() => {
-                void this.requestAreaNamesForAllDevices().catch(err => {
-                    this.log.debug(`Area-Name-Re-Request nach MQTT-Connect fehlgeschlagen: ${this.extractAxiosError(err)}`);
+                void this.requestAreaNamesForMissingDevices().catch(err => {
+                    this.log.debug(`Area-name re-request after MQTT connect failed: ${this.extractAxiosError(err)}`);
                 });
             }, 2_000);
         });
@@ -3487,7 +3688,7 @@ class Mammotion extends utils.Adapter {
         });
 
         client.on('error', (err: Error) => {
-            this.log.warn(`Aliyun IoT MQTT Fehler: ${err.message}`);
+            this.log.warn(`Aliyun IoT MQTT error: ${err.message}`);
             void this.setStateChangedAsync('info.lastError', `Aliyun MQTT: ${err.message}`, true);
         });
 
@@ -3505,19 +3706,20 @@ class Mammotion extends utils.Adapter {
     private async handleRequestAreaNames(deviceKey: string, localId: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unbekanntes Gerät: ${deviceKey}`, true);
+            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unknown device: ${deviceKey}`, true);
             await this.setStateChangedAsync(localId, false, true);
             return;
         }
         try {
             await this.sendAreaNameListRequest(ctx);
+            this.startAreaNameRetry(deviceKey);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.info(`Area-Name-Liste angefordert für ${ctx.deviceName || ctx.iotId}.`);
+            this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.warn(`Area-Name-Anfrage fehlgeschlagen für ${ctx.deviceName}: ${msg}`);
+            this.log.warn(`Area-name request failed for ${ctx.deviceName}: ${msg}`);
         }
     }
 
@@ -3574,47 +3776,66 @@ class Mammotion extends utils.Adapter {
         return result;
     }
 
+    private collectProtoFieldMapsFromBuffer(buf: Buffer, maxDepth = 6): Array<Map<number, Array<Buffer | bigint>>> {
+        const maps: Array<Map<number, Array<Buffer | bigint>>> = [];
+        const walk = (current: Buffer, depth: number): void => {
+            if (depth > maxDepth || current.length === 0) {
+                return;
+            }
+            const fields = this.decodeProtoFields(current);
+            if (!fields.size) {
+                return;
+            }
+            maps.push(fields);
+            if (depth === maxDepth) {
+                return;
+            }
+            for (const values of fields.values()) {
+                for (const value of values) {
+                    if (value instanceof Buffer && value.length > 1 && value.length <= 16_384) {
+                        walk(value, depth + 1);
+                    }
+                }
+            }
+        };
+        walk(buf, 0);
+        return maps;
+    }
+
     private tryParseAreaHashNames(protoBase64: string): Array<{ name: string; hash: bigint }> | null {
         try {
             const buf = Buffer.from(protoBase64, 'base64');
-            const lubaFields = this.decodeProtoFields(buf);
+            const fieldMaps = this.collectProtoFieldMapsFromBuffer(buf);
+            const areas = new Map<string, { name: string; hash: bigint }>();
 
-            this.log.debug(`[PROTO] LubaMsg fields: ${[...lubaFields.keys()].join(',')}`);
-
-            // LubaMsg field 11 = MctlNav
-            const navBufs = lubaFields.get(11);
-            if (!navBufs) return null;
-
-            this.log.debug(`[PROTO] MctlNav found (${navBufs.length} entry/entries)`);
-
-            const areas: Array<{ name: string; hash: bigint }> = [];
-            for (const navBuf of navBufs) {
-                if (!(navBuf instanceof Buffer)) continue;
-                const navFields = this.decodeProtoFields(navBuf);
-                this.log.debug(`[PROTO] MctlNav inner fields: ${[...navFields.keys()].join(',')}`);
-
+            for (const fields of fieldMaps) {
                 // MctlNav field 61 = toapp_all_hash_name (AppGetAllAreaHashName)
-                // AppGetAllAreaHashName: deviceId(1,string), hashnames(2, repeated area_hash_name)
-                // area_hash_name: hash(1, fixed64), name(2, string)
-                for (const areaListBuf of navFields.get(61) ?? []) {
-                    if (!(areaListBuf instanceof Buffer)) continue;
+                for (const areaListBuf of fields.get(61) ?? []) {
+                    if (!(areaListBuf instanceof Buffer)) {
+                        continue;
+                    }
                     const areaListFields = this.decodeProtoFields(areaListBuf);
                     for (const hashNameBuf of areaListFields.get(2) ?? []) {
-                        if (!(hashNameBuf instanceof Buffer)) continue;
+                        if (!(hashNameBuf instanceof Buffer)) {
+                            continue;
+                        }
                         const f = this.decodeProtoFields(hashNameBuf);
                         const hash = f.get(1)?.[0];
                         const nameBuf = f.get(2)?.[0];
                         if (hash !== undefined && !(hash instanceof Buffer) && nameBuf instanceof Buffer) {
                             const name = nameBuf.toString('utf8').trim();
-                            if (name) areas.push({ name, hash: hash as bigint });
+                            if (name) {
+                                areas.set(`${hash}:${name}`, { name, hash: hash as bigint });
+                            }
                         }
                     }
                 }
 
                 // MctlNav field 33 = toapp_get_commondata_ack (NavGetCommDataAck)
-                // NavGetCommDataAck: Hash(6,fixed64), nameTime(15, NavGetNameTime{name(1,string)})
-                for (const ackBuf of navFields.get(33) ?? []) {
-                    if (!(ackBuf instanceof Buffer)) continue;
+                for (const ackBuf of fields.get(33) ?? []) {
+                    if (!(ackBuf instanceof Buffer)) {
+                        continue;
+                    }
                     const ackFields = this.decodeProtoFields(ackBuf);
                     const hash = ackFields.get(6)?.[0];
                     const nameTimeBuf = ackFields.get(15)?.[0];
@@ -3623,12 +3844,14 @@ class Mammotion extends utils.Adapter {
                         const nameBuf = nameTimeFields.get(1)?.[0];
                         if (nameBuf instanceof Buffer) {
                             const name = nameBuf.toString('utf8').trim();
-                            if (name) areas.push({ name, hash: hash as bigint });
+                            if (name) {
+                                areas.set(`${hash}:${name}`, { name, hash: hash as bigint });
+                            }
                         }
                     }
                 }
             }
-            return areas.length ? areas : null;
+            return areas.size ? [...areas.values()] : null;
         } catch {
             return null;
         }
@@ -3637,16 +3860,11 @@ class Mammotion extends utils.Adapter {
     private tryParseNavGetHashListAck(protoBase64: string, deviceKey: string): bigint[] | null {
         try {
             const buf = Buffer.from(protoBase64, 'base64');
-            const lubaFields = this.decodeProtoFields(buf);
-            const navBufs = lubaFields.get(11);
-            if (!navBufs) return null;
-            for (const navBuf of navBufs) {
-                if (!(navBuf instanceof Buffer)) continue;
-                const navFields = this.decodeProtoFields(navBuf);
-                this.log.debug(`[PROTO] HashListAck check – MctlNav inner fields: ${[...navFields.keys()].join(',')}`);
+            const fieldMaps = this.collectProtoFieldMapsFromBuffer(buf);
+            for (const fields of fieldMaps) {
                 // MctlNav field 31 = toapp_gethash_ack (NavGetHashListAck)
                 // NavGetHashListAck.dataCouple (field 13) = packed repeated int64 hash values
-                for (const ackBuf of navFields.get(31) ?? []) {
+                for (const ackBuf of fields.get(31) ?? []) {
                     if (!(ackBuf instanceof Buffer)) continue;
                     const ackFields = this.decodeProtoFields(ackBuf);
                     // sub_cmd=0 → mowing areas, sub_cmd=1 → obstacles, sub_cmd=2 → paths, etc.
@@ -3675,7 +3893,7 @@ class Mammotion extends utils.Adapter {
                     // hash_len tells us how many of the data_couple entries are actual mowing zones.
                     // The remaining entries are paths/obstacles mixed into the same message.
                     const zoneHashes = hashLen > 0 && hashes.length > hashLen ? hashes.slice(0, hashLen) : hashes;
-                    this.log.debug(`[ZONE] ${hashes.length} Hashes empfangen (hashLen=${hashLen})`);
+                    this.log.debug(`[ZONE] ${hashes.length} hashes received (hashLen=${hashLen})`);
                     if (zoneHashes.length === 0) continue;
 
                     // If device sends only one frame, return immediately
@@ -3707,6 +3925,7 @@ class Mammotion extends utils.Adapter {
 
     private async updateZoneStates(deviceKey: string, areas: Array<{ name: string; hash: bigint }>): Promise<void> {
         const channelId = `devices.${deviceKey}`;
+        this.clearAreaNameRetry(deviceKey);
 
         const areasJson = JSON.stringify(areas.map(a => ({ name: a.name, hash: a.hash.toString() })));
         await this.setStateChangedAsync(`${channelId}.telemetry.areasJson`, areasJson, true);
@@ -3724,9 +3943,9 @@ class Mammotion extends utils.Adapter {
             const zoneChannel = `${channelId}.zones.${sanitizedName}`;
 
             await this.extendObjectAsync(zoneChannel, { type: 'channel', common: { name: area.name }, native: {} });
-            await this.setObjectNotExistsAsync(`${zoneChannel}.enabled`, this.createWritableBooleanState(`Zone "${area.name}" active`, false));
+            await this.setObjectNotExistsAsync(`${zoneChannel}.enabled`, this.createWritableBooleanState(`zone "${area.name}" active`, false));
             await this.setObjectAsync(`${zoneChannel}.start`, this.createCommandState(`Start zone "${area.name}"`));
-            await this.setObjectNotExistsAsync(`${zoneChannel}.hash`, this.createReadonlyState(`Zone "${area.name}" hash`, 'string', 'text'));
+            await this.setObjectNotExistsAsync(`${zoneChannel}.hash`, this.createReadonlyState(`zone "${area.name}" hash`, 'string', 'text'));
             await this.setObjectNotExistsAsync(
                 `${zoneChannel}.position`,
                 this.createWritableNumberState('Execution order', 'level', defaultPositionBySanitizedName.get(sanitizedName) ?? 1, {
@@ -3745,7 +3964,134 @@ class Mammotion extends utils.Adapter {
             }
         }
 
-        this.log.debug(`${deviceKey}: ${areas.length} Zone(n) aktualisiert.`);
+        await this.cleanupObsoleteZones(deviceKey, new Set(areas.map(area => this.sanitizeObjectId(area.name))));
+        this.log.debug(`${deviceKey}: ${areas.length} zone(s) updated.`);
+    }
+
+    private rememberAreaNames(deviceKey: string, areas: Array<{ name: string; hash: bigint }>): void {
+        let cached = this.pendingAreaNamesByDevice.get(deviceKey);
+        if (!cached) {
+            cached = new Map<string, string>();
+            this.pendingAreaNamesByDevice.set(deviceKey, cached);
+        }
+        for (const area of areas) {
+            const key = area.hash.toString();
+            if (!cached.has(key) || cached.get(key) !== area.name) {
+                cached.set(key, area.name);
+            }
+        }
+    }
+
+    private async cleanupObsoleteZones(deviceKey: string, activeSanitizedZoneIds: Set<string>): Promise<void> {
+        const zonesRoot = `devices.${deviceKey}.zones`;
+        const zoneChannels = await this.getChannelsOfAsync(zonesRoot);
+        for (const channel of zoneChannels) {
+            const fullId = channel._id || '';
+            const localId = fullId.startsWith(`${this.namespace}.`) ? fullId.slice(this.namespace.length + 1) : fullId;
+            const suffix = localId.startsWith(`${zonesRoot}.`) ? localId.slice(zonesRoot.length + 1) : '';
+            if (!suffix || suffix.includes('.')) {
+                continue;
+            }
+            if (!activeSanitizedZoneIds.has(suffix)) {
+                await this.deleteObjectTree(localId);
+            }
+        }
+    }
+
+    private async deleteObjectTree(rootLocalId: string): Promise<void> {
+        try {
+            const prefix = `${this.namespace}.${rootLocalId}`;
+            const list = await this.getObjectListAsync({
+                startkey: `${prefix}.`,
+                endkey: `${prefix}.\u9999`,
+            });
+            const ids = (list.rows || [])
+                .map(row => row.id)
+                .filter((id): id is string => typeof id === 'string');
+            ids.push(prefix);
+            ids.sort((a, b) => b.length - a.length);
+            for (const id of ids) {
+                const local = id.startsWith(`${this.namespace}.`) ? id.slice(this.namespace.length + 1) : id;
+                try {
+                    await this.delObjectAsync(local);
+                } catch {
+                    // Ignore missing/dependency errors while pruning obsolete zones
+                }
+            }
+        } catch (err) {
+            this.log.debug(`Could not delete obsolete zone tree ${rootLocalId} delete: ${this.extractAxiosError(err)}`);
+        }
+    }
+
+    private async hasKnownAreas(deviceKey: string): Promise<boolean> {
+        const areasJsonState = await this.getStateAsync(`devices.${deviceKey}.telemetry.areasJson`);
+        const raw = areasJsonState?.val;
+        if (typeof raw !== 'string' || !raw.trim()) {
+            return false;
+        }
+        try {
+            const parsed = JSON.parse(raw) as Array<{ hash?: string }>;
+            return Array.isArray(parsed) && parsed.length > 0;
+        } catch {
+            return false;
+        }
+    }
+
+    private clearAreaNameRetry(deviceKey: string): void {
+        const timer = this.areaNameRetryTimers.get(deviceKey);
+        if (timer) {
+            clearTimeout(timer);
+            this.areaNameRetryTimers.delete(deviceKey);
+        }
+        this.areaNameRetryAttempts.delete(deviceKey);
+    }
+
+    private startAreaNameRetry(deviceKey: string): void {
+        this.clearAreaNameRetry(deviceKey);
+        this.areaNameRetryAttempts.set(deviceKey, 0);
+        this.scheduleAreaNameRetry(deviceKey);
+    }
+
+    private scheduleAreaNameRetry(deviceKey: string): void {
+        const attempt = this.areaNameRetryAttempts.get(deviceKey) ?? 0;
+        if (attempt >= AREA_NAME_RETRY_DELAYS_MS.length) {
+            this.clearAreaNameRetry(deviceKey);
+            return;
+        }
+        const delay = AREA_NAME_RETRY_DELAYS_MS[attempt];
+        const timer = setTimeout(() => {
+            void this.runAreaNameRetry(deviceKey);
+        }, delay);
+        this.areaNameRetryTimers.set(deviceKey, timer);
+        this.areaNameRetryAttempts.set(deviceKey, attempt + 1);
+    }
+
+    private async runAreaNameRetry(deviceKey: string): Promise<void> {
+        this.areaNameRetryTimers.delete(deviceKey);
+        if (await this.hasKnownAreas(deviceKey)) {
+            this.clearAreaNameRetry(deviceKey);
+            return;
+        }
+
+        const ctx = this.deviceContexts.get(deviceKey);
+        if (!ctx) {
+            this.clearAreaNameRetry(deviceKey);
+            return;
+        }
+
+        const attempt = this.areaNameRetryAttempts.get(deviceKey) ?? 0;
+        this.log.debug(`[AREA-REQ] retry ${attempt}/${AREA_NAME_RETRY_DELAYS_MS.length} for ${ctx.deviceName || ctx.iotId}`);
+        try {
+            await this.sendAreaNameListRequest(ctx);
+        } catch (err) {
+            this.log.debug(`[AREA-REQ] retry failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
+        }
+
+        if (await this.hasKnownAreas(deviceKey)) {
+            this.clearAreaNameRetry(deviceKey);
+            return;
+        }
+        this.scheduleAreaNameRetry(deviceKey);
     }
 
     private async collectOrderedZoneHashes(
@@ -3834,7 +4180,7 @@ class Mammotion extends utils.Adapter {
     private async handleStartZones(deviceKey: string, localId: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unbekanntes Gerät: ${deviceKey}`, true);
+            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unknown device: ${deviceKey}`, true);
             await this.setStateChangedAsync(localId, false, true);
             return;
         }
@@ -3842,7 +4188,7 @@ class Mammotion extends utils.Adapter {
         try {
             const areasJsonState = await this.getStateAsync(`devices.${deviceKey}.telemetry.areasJson`);
             if (!areasJsonState?.val) {
-                throw new Error('Keine Zonen bekannt. Bitte erst "requestAreaNames" ausführen.');
+                throw new Error('No zones known. Please run "requestAreaNames" first.');
             }
 
             const areas = JSON.parse(`${areasJsonState.val}`) as Array<{ name: string; hash: string }>;
@@ -3852,7 +4198,7 @@ class Mammotion extends utils.Adapter {
             });
 
             if (!areaHashes.length) {
-                throw new Error('Keine Zone aktiviert. Bitte mindestens eine Zone unter devices.<id>.zones.<name>.enabled aktivieren.');
+                throw new Error('No zone enabled. Please enable at least one zone under devices.<id>.zones.<name>.enabled.');
             }
 
             const base = await this.readBaseRouteSettings(deviceKey);
@@ -3865,21 +4211,21 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, now, true);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.info(`startZones für ${ctx.deviceName || ctx.iotId}: ${areaHashes.length} Zone(n) gesendet.`);
+            this.log.info(`startZones for ${ctx.deviceName || ctx.iotId}: ${areaHashes.length} zone(s) sent.`);
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.error(`startZones fehlgeschlagen: ${msg}`);
+            this.log.error(`startZones failed: ${msg}`);
         }
     }
 
     private async handleStartAllZones(deviceKey: string, localId: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unbekanntes Gerät: ${deviceKey}`, true);
+            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unknown device: ${deviceKey}`, true);
             await this.setStateChangedAsync(localId, false, true);
             return;
         }
@@ -3887,14 +4233,14 @@ class Mammotion extends utils.Adapter {
         try {
             const areasJsonState = await this.getStateAsync(`devices.${deviceKey}.telemetry.areasJson`);
             if (!areasJsonState?.val) {
-                throw new Error('Keine Zonen bekannt. Bitte erst "requestAreaNames" ausführen.');
+                throw new Error('No zones known. Please run "requestAreaNames" first.');
             }
 
             const areas = JSON.parse(`${areasJsonState.val}`) as Array<{ name: string; hash: string }>;
             const areaHashes = await this.collectOrderedZoneHashes(deviceKey, areas, async () => true);
 
             if (!areaHashes.length) {
-                throw new Error('Keine Zonen gefunden.');
+                throw new Error('No zones found.');
             }
 
             const base = await this.readBaseRouteSettings(deviceKey);
@@ -3906,21 +4252,21 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, now, true);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.info(`startAllZones für ${ctx.deviceName || ctx.iotId}: ${areaHashes.length} Zone(n) gesendet.`);
+            this.log.info(`startAllZones for ${ctx.deviceName || ctx.iotId}: ${areaHashes.length} zone(s) sent.`);
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.error(`startAllZones fehlgeschlagen: ${msg}`);
+            this.log.error(`startAllZones failed: ${msg}`);
         }
     }
 
     private async handleStartSingleZone(deviceKey: string, zoneSanitizedName: string, localId: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unbekanntes Gerät: ${deviceKey}`, true);
+            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unknown device: ${deviceKey}`, true);
             await this.setStateChangedAsync(localId, false, true);
             return;
         }
@@ -3928,7 +4274,7 @@ class Mammotion extends utils.Adapter {
         try {
             const hashState = await this.getStateAsync(`devices.${deviceKey}.zones.${zoneSanitizedName}.hash`);
             if (!hashState?.val) {
-                throw new Error(`Kein Hash für Zone "${zoneSanitizedName}" gefunden.`);
+                throw new Error(`No hash found for zone "${zoneSanitizedName}".`);
             }
 
             const areaHashes = [BigInt(`${hashState.val}`)];
@@ -3942,14 +4288,14 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, '', true);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastTimestamp`, now, true);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.info(`startSingleZone für ${ctx.deviceName || ctx.iotId}: Zone "${zoneSanitizedName}" gesendet.`);
+            this.log.info(`startSingleZone for ${ctx.deviceName || ctx.iotId}: zone "${zoneSanitizedName}" sent.`);
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
             await this.setStateChangedAsync(localId, false, true);
-            this.log.error(`startSingleZone fehlgeschlagen: ${msg}`);
+            this.log.error(`startSingleZone failed: ${msg}`);
         }
     }
 
@@ -4001,7 +4347,7 @@ class Mammotion extends utils.Adapter {
     private async handlePayloadCommand(deviceKey: string, localId: string, jsonStr: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
-            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unbekanntes Gerät: ${deviceKey}`, true);
+            await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, `Unknown device: ${deviceKey}`, true);
             return;
         }
 
@@ -4026,7 +4372,7 @@ class Mammotion extends utils.Adapter {
                 } else {
                     await this.setStateChangedAsync(`devices.${deviceKey}.commands.routePayloadJson`, jsonStr, true);
                 }
-                this.log.info(`Payload-Command für ${ctx.deviceName || ctx.iotId} gesendet (${payloadDeviceCommand}).`);
+                this.log.info(`Payload command for ${ctx.deviceName || ctx.iotId} sent (${payloadDeviceCommand}).`);
                 await this.requestIotSync(ctx);
                 await this.refreshTelemetryAfterCommand();
                 return;
@@ -4065,13 +4411,13 @@ class Mammotion extends utils.Adapter {
             } else {
                 await this.setStateChangedAsync(`devices.${deviceKey}.commands.routePayloadJson`, jsonStr, true);
             }
-            this.log.info(`Payload-Command für ${ctx.deviceName || ctx.iotId} gesendet (${executeStart ? 'startRoute' : routeMode}).`);
+            this.log.info(`Payload command for ${ctx.deviceName || ctx.iotId} sent (${executeStart ? 'startRoute' : routeMode}).`);
             await this.requestIotSync(ctx);
             await this.refreshTelemetryAfterCommand();
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
-            this.log.error(`Payload-Command fehlgeschlagen: ${msg}`);
+            this.log.error(`Payload command failed: ${msg}`);
         }
     }
 
@@ -4092,7 +4438,7 @@ class Mammotion extends utils.Adapter {
             }
         }
         if (!areaHashes.length) {
-            throw new Error('payload: "areaHashes" fehlt oder ist leer.');
+            throw new Error('payload: "areaHashes" is missing or empty.');
         }
 
         const context = this.deviceContexts.get(deviceKey);
@@ -4850,14 +5196,14 @@ class Mammotion extends utils.Adapter {
         try {
             await this.delObjectAsync(id);
         } catch (err) {
-            this.log.debug(`Konnte Legacy-State ${id} nicht löschen: ${this.extractAxiosError(err)}`);
+            this.log.debug(`Could not delete legacy state ${id} delete: ${this.extractAxiosError(err)}`);
         }
     }
 
     private extractIotDomain(accessToken: string): string {
         const parts = accessToken.split('.');
         if (parts.length < 2) {
-            throw new Error('Access token ungültig: JWT Payload fehlt');
+            throw new Error('Access token invalid: JWT payload missing');
         }
         const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
         const padded = payload.padEnd(payload.length + ((4 - (payload.length % 4)) % 4), '=');
@@ -4865,7 +5211,7 @@ class Mammotion extends utils.Adapter {
         const claims = JSON.parse(decoded) as { iot?: string };
 
         if (!claims.iot) {
-            throw new Error('Access token enthält kein iot-Domain-Claim');
+            throw new Error('Access token does not contain iot domain claim');
         }
 
         const domain = claims.iot.startsWith('http') ? claims.iot : `https://${claims.iot}`;
