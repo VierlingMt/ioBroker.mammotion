@@ -141,6 +141,7 @@ See `README.md` "Object tree" for the user-facing layout. When you add new state
 - **One feature per commit.** Use Conventional-Commit-ish prefixes (`feat:`, `fix:`, `chore:`, `docs:`, `release:`).
 - **Update `CHANGELOG.md`** in the `[Unreleased]` section as part of every functional change. The release script will move it into a versioned section.
 - **Update `io-package.json#common.news`** only when bumping the version, and do not exceed 12 entries (the admin UI truncates older ones).
+- **Always commit a fresh `build/main.js` and `build/main.js.map`** with any change to `src/main.ts`. The npm/`package.json#main` points at `build/main.js`, so installations from GitHub run that file directly. Forgetting the rebuild ships the new version number with the old behaviour. Run `npm run build` (or `--legacy-peer-deps` then build) before committing.
 
 ## Pointers
 
