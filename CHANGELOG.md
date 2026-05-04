@@ -9,6 +9,10 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
+_No unreleased changes._
+
+## [0.0.9] – 2026-05-04
+
 ### Fixed
 - **Reconnect-storm log noise on shared accounts.** Three coordinated changes:
   1. JWT MQTT stability watchdog – when the broker disconnects shortly after each connect (lifetime

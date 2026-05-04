@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion",
-    "version": "0.0.8",
+    "version": "0.0.9",
     "news": {
+      "0.0.9": {
+        "en": "Fix log spam on shared accounts: JWT MQTT stability watchdog (suspends after a reconnect storm), throttled area-name re-requests and per-session cache of legacy-only devices so the modern-fallback warn fires at most once per device. Adds README/CHANGELOG/CLAUDE.md after the community fork takeover.",
+        "de": "Log-Spam bei geteilten Accounts behoben: JWT-MQTT-Stabilitaets-Watchdog (sperrt nach Reconnect-Sturm), gedrosselte Area-Name-Wiederholungen und Per-Session-Cache fuer Legacy-only-Geraete, damit der Modern-Fallback-Warn nur noch einmal pro Geraet erscheint. Ergaenzt README/CHANGELOG/CLAUDE.md nach Community-Fork-Uebernahme.",
+        "ru": "Исправлен спам в логах на shared-аккаунтах: watchdog стабильности JWT MQTT (приостановка после реконнект-шторма), троттлинг повторных запросов имён зон и per-session кэш legacy-only устройств, чтобы предупреждение modern-fallback срабатывало максимум раз на устройство. Добавлены README/CHANGELOG/CLAUDE.md после перехода форка к сообществу.",
+        "pt": "Corrigido o spam de log em contas compartilhadas: watchdog de estabilidade do JWT MQTT (suspende apos tempestade de reconexoes), re-requests de nomes de area com throttling e cache por sessao de dispositivos somente-legacy, para que o aviso de fallback moderno ocorra no maximo uma vez por dispositivo. Adicionado README/CHANGELOG/CLAUDE.md apos a tomada de manutencao pela comunidade.",
+        "nl": "Logspam op gedeelde accounts opgelost: JWT MQTT-stabiliteits-watchdog (pauzeert na reconnect-storm), getrotteld area-name herverzoek en per-sessie cache van legacy-only apparaten, zodat de modern-fallback waarschuwing maximaal eenmaal per apparaat verschijnt. README/CHANGELOG/CLAUDE.md toegevoegd na community-overname van de fork.",
+        "fr": "Correction du spam de log sur les comptes partages : watchdog de stabilite JWT MQTT (suspend apres tempete de reconnexions), throttling des re-requetes de noms de zone et cache par session des appareils legacy-only, pour que l'avertissement modern-fallback ne se declenche qu'une fois par appareil. Ajout de README/CHANGELOG/CLAUDE.md apres la reprise de la fork par la communaute.",
+        "it": "Risolto lo spam di log sugli account condivisi: watchdog di stabilita JWT MQTT (sospende dopo tempesta di riconnessioni), throttling delle re-richieste dei nomi di area e cache per sessione dei dispositivi solo-legacy, in modo che l'avviso di fallback moderno si attivi al massimo una volta per dispositivo. Aggiunti README/CHANGELOG/CLAUDE.md dopo il subentro della community.",
+        "es": "Corregido el spam de log en cuentas compartidas: watchdog de estabilidad de JWT MQTT (suspende tras tormenta de reconexiones), re-peticiones de nombre de area con throttling y cache por sesion de dispositivos solo-legacy, para que el aviso de fallback moderno se emita como maximo una vez por dispositivo. Anadidos README/CHANGELOG/CLAUDE.md tras la toma de la fork por la comunidad.",
+        "pl": "Naprawiono spam w logach dla kont wspoldzielonych: watchdog stabilnosci JWT MQTT (zawiesza po sztormie reconnectow), ograniczone ponowne zapytania o nazwy stref oraz per-sesyjny cache urzadzen tylko-legacy, tak ze ostrzezenie modern-fallback pojawia sie maksymalnie raz na urzadzenie. Dodano README/CHANGELOG/CLAUDE.md po przejeciu forka przez spolecznosc.",
+        "uk": "Виправлено спам у логах на shared-акаунтах: watchdog стабільності JWT MQTT (призупиняє після реконект-шторму), троттлінг повторних запитів імен зон і per-session кеш legacy-only пристроїв, щоб попередження modern-fallback спрацьовувало не більше разу на пристрій. Додано README/CHANGELOG/CLAUDE.md після переходу форку до спільноти.",
+        "zh-cn": "修复共享账号的日志刷屏：新增 JWT MQTT 稳定性看门狗（重连风暴后暂停）、按设备节流的分区名再请求，以及本会话的 legacy-only 设备缓存，使 modern-fallback 警告每台设备最多触发一次。社区接管 fork 后补充 README/CHANGELOG/CLAUDE.md。"
+      },
       "0.0.8": {
         "en": "Fix uncaught connack timeout crash: MQTT event handlers are now wrapped in try-catch and a no-op error listener is attached before teardown to prevent unhandled exceptions during shutdown or reconnect.",
         "de": "Absturz durch uncaught connack timeout behoben: MQTT-Event-Handler sind jetzt in try-catch eingebettet und vor dem Teardown wird ein leerer Error-Listener gesetzt.",
