@@ -9,6 +9,20 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
+### Fixed
+- **Reconnect-storm log noise on shared accounts.** Three coordinated changes:
+  1. JWT MQTT stability watchdog – when the broker disconnects shortly after each connect (lifetime
+     < 10 s) three times within 3 minutes, the JWT MQTT client is closed cleanly and suspended for
+     30 minutes; the adapter falls back to the Aliyun channel. `refreshSessionAndDeviceCache` honours
+     the suspension and does not recreate the client during the cooldown.
+  2. Area-name re-request is throttled to at most once per device per minute, so the request does not
+     fire on every JWT MQTT (re)connect.
+  3. Devices that respond with "Invalid device" or "Access to this resource requires authentication"
+     to the modern command path are remembered for the session. Subsequent commands skip the modern
+     attempt entirely; the recurring `warn` line is now a one-time `info` per device, with subsequent
+     fallbacks logged at `debug`.
+- Reconnect events now log at `debug` (`JWT MQTT reconnected.`) instead of repeating `info  MQTT connected.`.
+
 ### Added
 - Comprehensive `README.md` rewrite (table of contents, architecture chapter, troubleshooting, known issues).
 - `CHANGELOG.md` as the canonical change log; previous entries lived only inside the README.
@@ -16,8 +30,6 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ### Documented
 - Continuation fork notice (community continuation of the upstream repository).
-- Cosmetic log noise on shared-device accounts (repeated `MQTT connected` / `Modern command path returned Invalid device`).
-  Functionality is unaffected; mitigation is planned for the next release.
 
 ## [0.0.8] – 2026-01
 

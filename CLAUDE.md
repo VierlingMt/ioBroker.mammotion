@@ -119,10 +119,7 @@ See `README.md` "Object tree" for the user-facing layout. When you add new state
 
 ## Known issues / open work
 
-- **Shared-account log noise.** JWT MQTT churns every ~5 s on shared accounts and re-fires the area-name request, which falls back to legacy and emits a `warn`. Fix candidates:
-  - Detect "this account only sees shared devices" once per session and skip JWT MQTT for that case.
-  - Throttle `requestAreaNamesForMissingDevices` to fire at most once per N seconds across reconnects.
-  - Demote the modern-fallback `warn` to `debug` once the device is known to require legacy fallback.
+- **Shared-account log noise (fixed in `Unreleased`).** JWT MQTT used to churn every ~5 s on shared accounts. The watchdog (`JWT_MQTT_*` constants in `main.ts`) now suspends JWT MQTT for 30 minutes when the broker drops the connection within 10 seconds three times in a row; `requestAreaNamesForMissingDevices` is throttled per device (`AREA_NAME_REREQUEST_MIN_INTERVAL_MS`); the modern-fallback warn is demoted to `info` (first time) / `debug` (subsequent) via the `legacyOnlyDevices` set. If you change any of these mechanisms, keep them coordinated.
 - **Telemetry coverage.** Many MQTT events are not yet decoded into states. When debugging, enable `storeDebugPayloads` to keep raw payloads accessible.
 - **`legacyTelemetryTransport: 'mqtt'`** is reserved – polling is the only working transport.
 - **Hand-written protobuf.** If new device types start using fields outside our decoder coverage, extend the helpers in section 15 of `main.ts`. Test by enabling debug logs and inspecting `telemetry.lastProtoContent`.

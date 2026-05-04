@@ -289,7 +289,7 @@ Zone discovery:
 ## Troubleshooting
 
 - **`info.lastError` is your friend.** Every transport failure is mirrored there.
-- **`MQTT connected.` followed by `Modern command path returned Invalid device …` repeating every ~5 s** – see [Known issues](#known-issues) below. Workaround: wait for first zone discovery to complete (90 s) or temporarily disable the `requestAreaNames` retry by leaving the device idle.
+- **`MQTT connected.` followed by `Modern command path returned Invalid device …` repeating every ~5 s** – this used to be the most-reported pain point on shared accounts. From the `Unreleased` line onwards the adapter detects the JWT MQTT reconnect storm, suspends JWT MQTT for 30 minutes, throttles the area-name re-request and remembers legacy-only devices so the warning fires at most once per device per session.
 - **Telemetry stale / `lastUpdate` not advancing** – the cloud may simply not be pushing changes. Press a command (e.g. `applyTaskSettings`) to force a fresh IoT sync.
 - **Adapter and app keep logging each other out** – use the dedicated-account + share workflow described above.
 - **`No devices found (neither modern nor legacy)`** – your account has no devices, the share invitation was not accepted, or the API region differs. Check `account.iotDomain`.
@@ -297,16 +297,10 @@ Zone discovery:
 
 ## Known issues
 
-- **Repeating log line on shared accounts.** With a shared device the JWT MQTT channel can disconnect shortly after each subscribe, after which the adapter reconnects roughly every 5 s. On every reconnect the area-name request is retried and falls back to the legacy channel, producing this pattern in the log:
-
-  ```
-  info  MQTT connected.
-  warn  Modern command path returned Invalid device for <name>, trying Aliyun fallback.
-  ```
-
-  Functionality is **not** affected – telemetry and commands continue to work over the fallback channel – but the log becomes noisy. Reducing this is on the short-term roadmap (skip JWT MQTT for accounts where we already know the device is shared, throttle the area-name retry, demote the warn to debug after the first occurrence).
 - **Telemetry coverage is incomplete.** The most useful fields (battery, state, GPS, work time, mileage, area) are decoded, but several events are still being mapped. Enable `storeDebugPayloads` to capture raw payloads that help with future improvements.
 - **`legacyTelemetryTransport: mqtt` is a placeholder.** Polling is the only working transport at the moment.
+
+> **Resolved in `Unreleased`** – the previously documented log noise on shared accounts (`MQTT connected.` / `Modern command path returned Invalid device …` repeating every ~5 s) is fixed via a JWT-MQTT stability watchdog, throttled area-name re-requests and a per-session "legacy-only" device cache. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Development
 

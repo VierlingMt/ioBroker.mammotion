@@ -132,6 +132,11 @@ const ACTIVE_DEVICE_STATES = new Set<number>([13, 14, 19, 20, 31, 32, 34, 35, 36
 const IDLE_DEVICE_STATES = new Set<number>([0, 1, 2, 8, 10, 11, 12, 15, 16, 17, 22, 23, 39]);
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1000;
 const AREA_NAME_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000];
+const AREA_NAME_REREQUEST_MIN_INTERVAL_MS = 60_000;
+const JWT_MQTT_SHORT_LIFETIME_MS = 10_000;
+const JWT_MQTT_SHORT_LIFETIME_LIMIT = 3;
+const JWT_MQTT_BACKOFF_WINDOW_MS = 3 * 60 * 1000;
+const JWT_MQTT_DISABLE_DURATION_MS = 30 * 60 * 1000;
 
 class Mammotion extends utils.Adapter {
     private mqttClient: any = null;
@@ -173,6 +178,18 @@ class Mammotion extends utils.Adapter {
     private hashFrameAccumulator = new Map<string, { totalFrame: number; frames: Map<number, bigint[]> }>();
     /** Promise resolvers waiting for a specific field-33 response, keyed by "deviceKey:hash". */
     private classifyWaiters = new Map<string, (type: number) => void>();
+    /** Devices known to require the legacy/Aliyun command path (modern API returns "Invalid device"). */
+    private legacyOnlyDevices = new Set<string>();
+    /** Last time an area-name request was issued, keyed by deviceKey. Used to throttle MQTT-(re)connect retries. */
+    private lastAreaNameRequestAt = new Map<string, number>();
+    /** Timestamp when the active JWT MQTT client established its connection. */
+    private jwtMqttConnectedAt = 0;
+    /** Timestamps of recent JWT MQTT sessions that closed within JWT_MQTT_SHORT_LIFETIME_MS. */
+    private jwtMqttRecentShortLifetimes: number[] = [];
+    /** Wall-clock time until which JWT MQTT is suppressed after a reconnect storm. */
+    private jwtMqttDisabledUntil = 0;
+    /** Whether we already informed the user about the current JWT MQTT suspension. */
+    private jwtMqttBackoffLogged = false;
 
     public constructor(options: Partial<utils.AdapterOptions> = {}) {
         super({
@@ -247,6 +264,12 @@ class Mammotion extends utils.Adapter {
             this.pendingAreaNamesByDevice.clear();
             this.classifiedAreaHashesByDevice.clear();
             this.zoneDiscoveryInFlight.clear();
+            this.legacyOnlyDevices.clear();
+            this.lastAreaNameRequestAt.clear();
+            this.jwtMqttRecentShortLifetimes = [];
+            this.jwtMqttDisabledUntil = 0;
+            this.jwtMqttBackoffLogged = false;
+            this.jwtMqttConnectedAt = 0;
             this.stopLegacyPolling();
             this.syncConnectionStates();
             callback();
@@ -1290,9 +1313,20 @@ class Mammotion extends utils.Adapter {
             clean: true,
         });
         this.mqttClient = client;
+        // Reset stability counters whenever a fresh client is set up. The reconnect-storm
+        // bookkeeping below tracks only the lifetime of *this* client.
+        this.jwtMqttConnectedAt = 0;
+        this.jwtMqttBackoffLogged = false;
+        let firstConnect = true;
 
         client.on('connect', () => {
-            this.log.info('MQTT connected.');
+            this.jwtMqttConnectedAt = Date.now();
+            if (firstConnect) {
+                this.log.info('MQTT connected.');
+                firstConnect = false;
+            } else {
+                this.log.debug('JWT MQTT reconnected.');
+            }
             this.setJwtMqttConnected(true);
             this.setCloudConnected(true);
             this.authFailureSince = 0;
@@ -1348,7 +1382,38 @@ class Mammotion extends utils.Adapter {
         client.on('close', () => {
             try {
                 this.setJwtMqttConnected(false);
-                this.log.debug('JWT MQTT connection closed');
+                const lifetime = this.jwtMqttConnectedAt > 0 ? Date.now() - this.jwtMqttConnectedAt : 0;
+                this.jwtMqttConnectedAt = 0;
+                this.log.debug(`JWT MQTT connection closed (lifetime=${lifetime}ms)`);
+
+                if (lifetime > 0 && lifetime < JWT_MQTT_SHORT_LIFETIME_MS) {
+                    const cutoff = Date.now() - JWT_MQTT_BACKOFF_WINDOW_MS;
+                    this.jwtMqttRecentShortLifetimes = this.jwtMqttRecentShortLifetimes.filter(t => t >= cutoff);
+                    this.jwtMqttRecentShortLifetimes.push(Date.now());
+                    if (this.jwtMqttRecentShortLifetimes.length >= JWT_MQTT_SHORT_LIFETIME_LIMIT) {
+                        this.jwtMqttDisabledUntil = Date.now() + JWT_MQTT_DISABLE_DURATION_MS;
+                        this.jwtMqttRecentShortLifetimes = [];
+                        if (!this.jwtMqttBackoffLogged) {
+                            this.log.warn(
+                                `JWT MQTT keeps disconnecting shortly after connect (>=${JWT_MQTT_SHORT_LIFETIME_LIMIT}x within ${Math.round(
+                                    JWT_MQTT_BACKOFF_WINDOW_MS / 60_000,
+                                )}min). Suspending for ${Math.round(
+                                    JWT_MQTT_DISABLE_DURATION_MS / 60_000,
+                                )}min and falling back to the Aliyun channel.`,
+                            );
+                            this.jwtMqttBackoffLogged = true;
+                        }
+                        if (this.mqttClient === client) {
+                            this.mqttClient.removeAllListeners();
+                            this.mqttClient.on('error', () => {});
+                            this.mqttClient.end(true);
+                            this.mqttClient = null;
+                        }
+                        void this.ensureAliyunMqttRunning('jwt-suspended');
+                        return;
+                    }
+                }
+
                 void this.ensureAliyunMqttRunning('jwt-close');
             } catch {
                 // adapter may be shutting down
@@ -1685,6 +1750,13 @@ class Mammotion extends utils.Adapter {
         context: DeviceContext,
         content: string,
     ): Promise<string> {
+        // Once we have confirmed that the modern endpoint refuses this device for the current
+        // session (typical for shared / legacy devices), skip the modern attempt entirely.
+        // This both saves a round-trip and silences the repeating fallback log line.
+        if (this.legacyOnlyDevices.has(context.key)) {
+            return this.invokeTaskControlCommandLegacy(session, context, content);
+        }
+
         try {
             return await this.invokeTaskControlCommandModern(session, context, content);
         } catch (err) {
@@ -1697,7 +1769,16 @@ class Mammotion extends utils.Adapter {
             }
         }
 
-        this.log.warn(`Modern command path returned Invalid device for ${context.deviceName || context.iotId}, trying Aliyun fallback.`);
+        const wasKnown = this.legacyOnlyDevices.has(context.key);
+        this.legacyOnlyDevices.add(context.key);
+        const label = context.deviceName || context.iotId;
+        if (!wasKnown) {
+            this.log.info(
+                `Device ${label} requires the legacy/Aliyun command path. Subsequent commands will skip the modern attempt for this session.`,
+            );
+        } else {
+            this.log.debug(`Modern command path refused ${label}, using Aliyun fallback.`);
+        }
         return this.invokeTaskControlCommandLegacy(session, context, content);
     }
 
@@ -1825,7 +1906,10 @@ class Mammotion extends utils.Adapter {
         // Try JWT MQTT for ALL records (modern or legacy/shared).
         // With owner credentias this grants ACL to physical device topics (thing/event/+/post)
         // which carries both proactive telemetry AND command responses like NavGetCommDataAck.
-        if (records.length && (!this.mqttClient || !this.mqttClient.connected)) {
+        // Skip while we are within a reconnect-storm backoff window – the Aliyun channel covers
+        // shared devices in this case and re-creating JWT MQTT would only restart the loop.
+        const jwtSuspended = Date.now() < this.jwtMqttDisabledUntil;
+        if (records.length && !jwtSuspended && (!this.mqttClient || !this.mqttClient.connected)) {
             try {
                 const mqttAuth = await this.fetchMqttCredentias(session);
                 await this.connectMqtt(mqttAuth, records);
@@ -1838,6 +1922,14 @@ class Mammotion extends utils.Adapter {
                 }
                 this.setJwtMqttConnected(false);
             }
+        } else if (records.length && jwtSuspended) {
+            this.log.debug(
+                `JWT MQTT suspended for another ${Math.max(
+                    0,
+                    Math.round((this.jwtMqttDisabledUntil - Date.now()) / 1000),
+                )}s; relying on Aliyun channel.`,
+            );
+            await this.ensureAliyunMqttRunning('jwt-suspended-refresh').catch(() => {});
         }
         if (!records.length) {
             if (this.mqttClient) {
@@ -3563,11 +3655,22 @@ class Mammotion extends utils.Adapter {
     }
 
     private async requestAreaNamesForMissingDevices(): Promise<void> {
+        const now = Date.now();
         for (const ctx of this.deviceContexts.values()) {
             if (await this.hasKnownAreas(ctx.key)) {
                 this.clearAreaNameRetry(ctx.key);
                 continue;
             }
+            const lastAt = this.lastAreaNameRequestAt.get(ctx.key) || 0;
+            if (lastAt && now - lastAt < AREA_NAME_REREQUEST_MIN_INTERVAL_MS) {
+                this.log.debug(
+                    `Area-Name-Re-Request for ${ctx.deviceName || ctx.iotId} throttled (last attempt ${Math.round(
+                        (now - lastAt) / 1000,
+                    )}s ago).`,
+                );
+                continue;
+            }
+            this.lastAreaNameRequestAt.set(ctx.key, now);
             try {
                 await this.sendAreaNameListRequest(ctx);
                 this.startAreaNameRetry(ctx.key);
