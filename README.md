@@ -1,4 +1,5 @@
 ![Logo](admin/mammotion.png)
+
 # ioBroker.mammotion
 
 [![NPM version](https://img.shields.io/npm/v/iobroker.mammotion.svg)](https://www.npmjs.com/package/iobroker.mammotion)
@@ -8,264 +9,335 @@
 
 [![NPM](https://nodei.co/npm/iobroker.mammotion.png?downloads=true)](https://nodei.co/npm/iobroker.mammotion/)
 
-## Mammotion adapter for ioBroker
+ioBroker adapter to control and monitor **Mammotion Luba / Yuka / Spino / RTK / CM900** mowers and base stations through the official Mammotion cloud, with a fallback channel for shared and legacy devices.
 
-Cloud adapter for Mammotion Luba/Yuka devices.
+> **Fork notice (2026-05)** – This repository is a community continuation fork of [DNAngelX/ioBroker.mammotion](https://github.com/DNAngelX/ioBroker.mammotion), with thanks to the original author for the groundwork. The behaviour, control flows and protocol handling are kept compatible; this fork focuses on stability fixes, telemetry coverage and documentation.
+
+---
+
+## Table of contents
+
+- [Features](#features)
+- [Supported devices](#supported-devices)
+- [Installation](#installation)
+- [Account setup](#account-setup)
+- [Configuration](#configuration)
+- [Object tree](#object-tree)
+- [Command behaviour](#command-behaviour)
+- [Zone / area workflow](#zone--area-workflow)
+- [Custom JSON payloads](#custom-json-payloads)
+- [Architecture](#architecture)
+- [Troubleshooting](#troubleshooting)
+- [Known issues](#known-issues)
+- [Development](#development)
+- [Changelog](#changelog)
+- [License](#license)
+
+---
 
 ## Features
 
-- Login via Mammotion cloud (`id.mammotion.com`)
-- Device discovery and automatic object creation under `mammotion.0.devices.*`
-- Command support (start, pause, resume, stop, dock, cancel, route, non-work-hours, blade control)
-- Telemetry via MQTT where available
-- Telemetry fallback via Aliyun API polling (`thing/properties/get`, `thing/status/get`)
-- **Shared device support** – device can be shared from the main Mammotion account to a dedicated ioBroker account (avoids session conflicts with the mobile app)
-- Session retry/reconnect handling when app and adapter logins conflict
-- Automatic faster polling after commands and while device is active
-- Polling watchdog – automatically restarts polling if it silently stops
-- **Zone / area management** – automatic zone discovery, per-zone enable toggles, `startZones` button, `payload` for JS adapter
+- Login against the Mammotion identity service (`id.mammotion.com`)
+- Automatic device discovery, both **owned** (modern API) and **shared** (legacy / Aliyun bindings)
+- Object tree under `mammotion.0.devices.<deviceId>.{telemetry,commands,zones}`
+- Task control: **start / pause / resume / stop / dock / cancelJob / cancelDock**
+- Zone / area management: discovery, per-zone enable + position, single-zone start, batch start, "start all"
+- Route generator: `generateRoute`, `modifyRoute`, `queryRoute` plus inline route execution
+- Blade height + speed sync (auto-applied, debounced) and dedicated blade-control command
+- Non-work-hours (mute window) configuration
+- Telemetry via three transports, transparent to the user:
+  - **JWT MQTT** for owner accounts (real-time push)
+  - **Legacy/Aliyun IoT MQTT** for shared accounts (real-time push)
+  - **Aliyun REST polling** as fallback
+- Adaptive polling: faster cadence after commands and while a job is active, idle cadence otherwise; 10-minute polling watchdog auto-restarts a stalled poll loop
+- Automatic re-login + retry on session/auth failures (15-minute cooldown)
+- `commands.payload` / `commands.routePayloadJson` accept raw JSON for full automation control (JS adapter, Blockly, …)
+- Product-key driven model detection (Luba / Yuka / Yuka Mini / Yuka ML / Spino / RTK / CM900); product keys can be re-synced from PyMammotion via `npm run sync:product-keys`
+- Localised UI in 11 languages (admin JSON config + adapter `news`)
+
+## Supported devices
+
+The adapter recognises all mowers and base stations currently listed in `pymammotion/utility/device_type.py`. At the time of writing that includes:
+
+`Luba 1`, `Luba 2`, `Luba 2 Mini`, `Luba LA`, `Luba LD`, `Luba MB`, `Luba MD`, `Luba MN`, `Luba VA`, `Luba VP`, `Luba V Pro`, `Yuka`, `Yuka Plus`, `Yuka Mini`, `Yuka ML`, `Yuka MN100`, `Yuka MV`, `Yuka VP`, `Spino` / `Spino S1` / `Spino E1`, `RTK` / `RTK 3A0` / `RTK 3A1` / `RTK 3A2` / `RTK NB`, `CM900`.
+
+Run `npm run sync:product-keys` (or rely on the weekly GitHub Action `.github/workflows/sync-product-keys.yml`) to refresh the list when Mammotion releases new hardware.
 
 ## Installation
 
-1. Install adapter (local/dev or later via npm/repository).
-2. Open adapter instance settings.
-3. Enter Mammotion app credentials (see **Account setup** below).
-4. Save and start/restart the instance.
+While the npm release of this fork is not yet on the official ioBroker repository, install directly from GitHub:
+
+1. In the ioBroker admin go to **Adapters → Add custom adapter (octocat icon)**.
+2. Paste `https://github.com/VierlingMt/ioBroker.mammotion`.
+3. Restart the adapter and open the instance configuration.
+
+For development:
+
+```bash
+git clone https://github.com/VierlingMt/ioBroker.mammotion
+cd ioBroker.mammotion
+npm install
+npm run build
+npm run dev-server
+```
+
+Node.js **20+** is required.
 
 ## Account setup
 
-### ⚠️ Why you should NOT use your main account
+The Mammotion cloud allows **only one active session per account**. If both the mobile app and the adapter use the same credentials they will continuously log each other out. There are two supported configurations:
 
-The Mammotion cloud only allows **one active session per account** at a time. This means:
+### ✅ Recommended – dedicated ioBroker account + device sharing
 
-- Every time the adapter re-authenticates (e.g. after a session expiry), your **mobile app gets logged out**.
-- Every time you open the Mammotion app on your phone, the **adapter loses its session** and stops polling until it reconnects.
-
-This leads to unreliable automation and constant interruptions in both the app and the adapter.
-
-### ✅ Recommended: Dedicated ioBroker account + device sharing
-
-The clean solution is to create a **second Mammotion account** exclusively for ioBroker and share your device to it. Both accounts then have independent sessions – the adapter and the app never interfere with each other.
-
-**Setup steps:**
-
-1. Register a new Mammotion account (e.g. `yourname+iobroker@gmail.com`).
+1. Register a second Mammotion account, e.g. `you+iobroker@example.com`.
 2. In the Mammotion app (logged in with your **main** account):
-   - Open the device → **Settings** → **Share device**
-   - Enter the email of the new ioBroker account
-3. Log into the Mammotion app with the **new account** and accept the share invitation.
-4. Enter the **new account's** email and password in the adapter configuration.
+   - Open the device → **Settings → Share device**.
+   - Enter the new account's email.
+3. Log in with the **new** account on a phone once and accept the share invitation.
+4. Enter the **new account's** credentials in the adapter configuration.
 
-The adapter detects shared devices automatically – no extra configuration needed.
+The adapter detects shared devices automatically. No extra configuration is needed.
 
-> **Note:** The shared account uses Aliyun API polling instead of MQTT. This is fully functional and has no impact on the available features.
+> Shared devices use the legacy/Aliyun channel because the modern API only authorises owner sessions for them. This is fully functional – control commands (start, stop, zones, route, …) all work via the fallback path.
 
-### Option B – Direct login (not recommended)
-If you only have one account or do not use the mobile app regularly, you can enter your main credentials directly. Be aware that the adapter and the mobile app will log each other out whenever both are active.
+### ⚠️ Option B – direct login (not recommended)
+
+If you only own one account and never use the mobile app you can enter your main credentials directly. Be aware that the adapter and the mobile app **will fight over the session** whenever both are active.
 
 ## Configuration
 
-- `email`: Mammotion account email
-- `password`: Mammotion account password
-- `deviceUuid`: optional app device UUID (default is prefilled)
-- `legacyPollIntervalSec`: base polling interval for legacy telemetry (10-300 sec)
-- `legacyTelemetryTransport`: currently `poll` is used (`mqtt` option is reserved)
+| Field | Description |
+|---|---|
+| `email` | Mammotion account email |
+| `password` | Mammotion account password |
+| `deviceUuid` | Optional virtual device UUID. Pre-filled with a working default; only change if you understand the implications. |
+| `legacyPollIntervalSec` | Base polling interval for Aliyun REST telemetry (10–300 s, default 30 s). The adapter halves this while a job is active and quadruples it while the mower is idle. |
+| `legacyTelemetryTransport` | Currently `poll` is used. The `mqtt` option is reserved for a future direct-protocol implementation. |
+| `storeDebugPayloads` | When enabled, raw MQTT payloads, the last protobuf blob, last route payload, etc. are persisted as states for troubleshooting. Disabled by default. |
 
-## Objects
+## Object tree
 
-### Info
+```
+mammotion.0
+├── info
+│   ├── connection         (boolean) any cloud channel active
+│   ├── mqttConnected      (boolean) JWT or Aliyun MQTT connected
+│   ├── deviceCount        (number)
+│   ├── lastMessageTs      (number)
+│   └── lastError          (string)
+├── account
+│   ├── expiresAt
+│   ├── userId
+│   ├── userAccount
+│   └── iotDomain
+└── devices.<deviceId>
+    ├── name, iotId, deviceId, deviceType, deviceTypeText
+    ├── series, productSeries, productKey, productKeyGroup
+    ├── recordDeviceName, status, raw
+    ├── telemetry.*
+    │   ├── connected, batteryPercent, bladeHeightMm
+    │   ├── deviceState (number, with WORK_MODE_NAMES enum)
+    │   ├── latitude, longitude
+    │   ├── firmwareVersion, wifiRssi
+    │   ├── totalWorkTimeSec, totalMileageM, taskAreaM2
+    │   ├── lastTopic, lastPayload, lastEventId, lastProtoContent (debug)
+    │   ├── lastUpdate
+    │   └── areasJson
+    ├── commands.*
+    │   ├── start, pause, resume, stop, dock, cancelJob, cancelDock     (button)
+    │   ├── applyTaskSettings, applyNonWorkHours, applyBladeControl     (button)
+    │   ├── generateRoute, modifyRoute, queryRoute                      (button)
+    │   ├── startZones, startAllZones, requestAreaNames                 (button)
+    │   ├── targetMowSpeedMs, bladeHeightMm, bladeMaxSpeedMs            (writable)
+    │   ├── routeAreaIds, routeJobMode, routeJobVersion, routeJobId     (writable)
+    │   ├── routeUltraWave, routeChannelMode, routeChannelWidthCm       (writable)
+    │   ├── routeTowardDeg, routeTowardIncludedAngleDeg, routeTowardMode
+    │   ├── routeMowingLaps, routeBorderMode, routeObstacleLaps
+    │   ├── routeCollectGrassFrequency, routeStartProgress
+    │   ├── routeIsMow, routeIsDump, routeIsEdge                        (writable booleans)
+    │   ├── nonWorkStart, nonWorkEnd, nonWorkSubCmd
+    │   ├── bladePowerOn
+    │   ├── payload, routePayloadJson (legacy alias)                    (writable JSON)
+    │   ├── lastPayload, lastResult, lastError, lastTimestamp           (read-only)
+    │   └── debugLast{ZoneStartJson,RoutePayload,BladePayload,StartPayload}
+    └── zones.<zoneName>
+        ├── enabled    (boolean writable, batch selection)
+        ├── position   (number writable, 1..n execution order)
+        ├── start      (boolean trigger, mow this zone only)
+        └── hash       (string read-only)
+```
 
-- `info.connection`
-- `info.mqttConnected`
-- `info.deviceCount`
-- `info.lastMessageTs`
-- `info.lastError`
+## Command behaviour
 
-### Account
-
-- `account.expiresAt`
-- `account.userId`
-- `account.userAccount`
-- `account.iotDomain`
-
-### Per device
-
-- `devices.<id>.name`, `iotId`, `deviceId`, `deviceType`, `deviceTypeText`, `productKey`, `productKeyGroup`, ...
-- `devices.<id>.telemetry.*` (battery, state, gps, firmware version, WiFi RSSI, work time, mileage, task area, last payload/topic/update, areasJson, ...)
-- `devices.<id>.commands.*` (actions + writable parameters)
-- `devices.<id>.zones.<name>.enabled` – toggle individual zones on/off for batch mowing
-- `devices.<id>.zones.<name>.start` – trigger button: immediately starts mowing only this one zone
-- `devices.<id>.zones.<name>.hash` – zone hash ID (read-only, filled by device)
-
-## Command behavior
-
-- Action states (`start`, `pause`, `dock`, `applyTaskSettings`, ...) are trigger states (`true` -> execute -> auto reset to `false`).
-- `bladeHeightMm` + `targetMowSpeedMs` are auto-applied after value changes (debounced).
-- On `commands.start`, task settings are re-applied once after ~25 seconds (or earlier when active state is detected).
-- Route settings are auto-applied via `modifyRoute` after value changes (debounced).
-- Non-work settings are auto-applied via `applyNonWorkHours` after value changes (debounced).
-- `bladeHeightMm` is the canonical cut-height state.
-- Additional immediate IoT sync is requested after commands to refresh telemetry faster.
+- All `commands.*` action states are **trigger states**: writing `true` executes once and the state is reset to `false` automatically.
+- `bladeHeightMm` and `targetMowSpeedMs` are auto-applied whenever you change them (debounced).
+- After `commands.start` the adapter re-pushes task settings once after ~25 seconds (or earlier when a working state is detected) to make sure the device picked them up.
+- Route settings (`route*`) and non-work settings auto-apply via `modifyRoute` / `applyNonWorkHours` on change (debounced).
+- After every command an extra IoT sync request is fired so telemetry refreshes within seconds rather than minutes.
+- Command limits (cut height, route width, lap counts, mow speed) are model-aware. Yuka uses 15–30 cm route width, Yuka Mini 8–12 cm, Luba 20–35 cm.
 
 ## Zone / area workflow
 
-### Step 1 – Discover zones
+### Step 1 – discover zones
 
-Press `commands.requestAreaNames` (button). The adapter queries the device for its full zone list.
-The device responds via MQTT — this can take up to **60–90 seconds** on first run because each zone hash is classified individually. Once complete, zone objects appear under `devices.<id>.zones.<zoneName>/`.
+Press `commands.requestAreaNames`. The adapter asks the device for its full zone hash list. The response arrives **only via MQTT** and is decoded one hash at a time, so first-time discovery can take **60–90 seconds**.
 
-Each zone channel contains:
+After classification, zone objects appear under `devices.<id>.zones.<zoneName>/`:
 
 | State | Type | Description |
 |---|---|---|
-| `enabled` | boolean (writable) | Mark zone for batch mowing |
+| `enabled` | bool (writable) | Mark zone for batch mowing |
 | `position` | number (writable) | Execution order (1..n) for `startZones` / `startAllZones` |
-| `start` | boolean (writable, trigger) | Immediately start mowing this zone only |
-| `hash` | string (read-only) | Internal zone hash ID |
+| `start` | bool (writable, trigger) | Immediately mow this single zone |
+| `hash` | string (read-only) | Internal zone hash, filled by the device |
 
----
+### Option A – single zone
 
-### Option A – Start a single zone immediately
+Set `devices.<id>.zones.<zoneName>.start = true`. The adapter sends an immediate route command for exactly this zone, using the current global settings (`bladeHeightMm`, `targetMowSpeedMs`, …).
 
-Set `devices.<id>.zones.<zoneName>.start = true`.
-The adapter sends a mowing command for exactly that one zone using the current global settings (`bladeHeightMm`, `targetMowSpeedMs`, etc.).
-
----
-
-### Option B – Batch: mow multiple zones
+### Option B – batch a selection
 
 1. Set `zones.<zoneName>.enabled = true` for each zone you want to mow.
 2. Press `commands.startZones`.
 
-The adapter collects all enabled zones and sends them as a single `modifyRoute` command. Mow settings (knife height, speed, etc.) are taken from the current `commands.*` state values.
-Zone execution order is sorted by `zones.<name>.position` (ascending).
+The adapter aggregates all enabled zones into a single `modifyRoute` command. Order is sorted ascending by `zones.<name>.position`.
 
----
+### Option C – everything we know about
 
-### Option C – Start all known zones (ignore toggles)
+Press `commands.startAllZones`. The adapter takes every zone from `telemetry.areasJson` and starts a route with all of them, ignoring the `enabled` toggles. Order again follows `position`.
 
-Press `commands.startAllZones`.
+### Option D – manual hash entry
 
-The adapter takes all zones from `telemetry.areasJson` and starts a route with all hashes, independent of `zones.*.enabled`.
-Order is also sorted by `zones.<name>.position`.
+Write a comma-separated list of zone hashes into `commands.routeAreaIds` and trigger any of the above buttons – useful when MQTT discovery is unavailable.
 
----
+## Custom JSON payloads
 
-### Option D – Full custom payload via JS adapter
+Write any JSON object to `commands.payload` (or the legacy alias `commands.routePayloadJson`) for full programmatic control. Supported actions:
 
-Write a JSON object to `commands.payload` to send a completely custom command payload.
-Legacy alias `commands.routePayloadJson` still works.
+- Route execution: `action: "startRoute"` or `start: true`
+- Route planning only: `action: "generateRoute" | "modifyRoute" | "queryRoute"`
+- Task control: `action: "start" | "pause" | "resume" | "stop" | "dock" | "cancelJob" | "cancelDock"`
 
-Supported actions:
-- route workflow (`action: "startRoute"` or `start: true`)
-- route planning only (`action: "generateRoute"|"modifyRoute"|"queryRoute"`)
-- task-control buttons via payload (`action: "start"|"pause"|"resume"|"stop"|"dock"|"cancelJob"|"cancelDock"`)
 **Minimal example (JS adapter):**
 
 ```javascript
 // Mow two specific zones with custom settings
 setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
-    action: "startRoute",
-    areaHashes: ["12345678901234", "98765432109876"],
+    action: 'startRoute',
+    areaHashes: ['12345678901234', '98765432109876'],
     cutHeightMm: 65,
-    mowSpeedMs: 0.35
+    mowSpeedMs: 0.35,
 }));
 
 // Stop via payload
-setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
-    action: "stop"
-}));
+setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({ action: 'stop' }));
 ```
 
-**Full example with all available fields:**
+**All available route fields:**
 
 ```javascript
 setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
-    action: "startRoute",
-    // Required: at least one area hash (read from zones.<name>.hash)
-    areaHashes: ["12345678901234"],
+    action: 'startRoute',
+    areaHashes: ['12345678901234'],     // required, read from zones.<name>.hash
 
-    // Mowing settings
-    cutHeightMm: 65,        // Blade height in mm (model-dependent)
-    mowSpeedMs: 0.35,       // Mowing speed in m/s (model-dependent)
+    // Mowing
+    cutHeightMm: 65,                    // model-dependent
+    mowSpeedMs: 0.35,                   // model-dependent
 
-    // Route settings
-    jobMode: 4,             // Job mode (default: 4)
-    channelMode: 0,         // Channel mode: 0=default, 1=spiral, 2=zigzag, 3=custom
-    channelWidthCm: 25,     // Lane width in cm (model-dependent)
-    towardDeg: 0,           // Mowing direction in degrees (-180–180)
-    borderMode: 1,          // Border mode: 0=off, 1=on
-    mowingLaps: 1,          // Border laps (0–4)
-    obstacleLaps: 1,        // Obstacle laps (0–3)
-    isMow: true,            // Mow the area
-    isEdge: false,          // Mow edges only
-    isDump: true            // Allow grass dump
+    // Route
+    jobMode: 4,                         // default 4
+    channelMode: 0,                     // 0=parallel, 1=crosscheck, 2=segment, 3=adaptive
+    channelWidthCm: 25,                 // model-dependent
+    towardDeg: 0,                       // -180..180
+    borderMode: 1,                      // 0=off, 1=on
+    mowingLaps: 1,                      // 0..4
+    obstacleLaps: 1,                    // 0..3
+    isMow: true,
+    isEdge: false,
+    isDump: true,
 }));
 ```
 
-> **Note:** Zone discovery requires MQTT. Shared/legacy-only devices will send the request but the response can only arrive via MQTT — use `requestAreaNames` and wait up to 90 seconds. The `routeAreaIds` state still works as a manual fallback for entering hashes directly.
+The adapter persists the last executed payload to `commands.lastPayload` for traceability.
 
-> **Start button behavior:** `commands.start` is a task-control start (resume/continue on device side). It does not build a new zone selection by itself. Before start, current `bladeHeightMm` + `targetMowSpeedMs` are pushed once. Use `startZones` or `startAllZones` when you want an explicit zone set.
+## Architecture
 
-## Notes
+The adapter is a single TypeScript class (`src/main.ts`) that uses three loosely coupled cloud channels:
 
-- Control/commands are stable (start/pause/stop/dock, zone start/startZones/startAllZones, payload execution).
-- Telemetry is currently under active improvement. Some values can stay stale depending on cloud push behavior and MQTT topic coverage.
-- `telemetry.lastUpdate` only means a telemetry packet was processed. If values do not change, the cloud may be returning unchanged data.
-- Mammotion cloud sessions can invalidate each other (mobile app vs adapter). Using a shared device account (Option B above) avoids this entirely.
-- Command limits follow model defaults (example: Luba 20–35 cm route width, Yuka 15–30 cm, Yuka Mini 8–12 cm).
-- Device family detection uses productKey as primary source (fallback to deviceType/name), because some API responses report Yuka Mini as generic Yuka.
-- ProductKey groups are synchronized from PyMammotion (`pymammotion/utility/device_type.py`) via `npm run sync:product-keys`.
-- GitHub workflow `.github/workflows/sync-product-keys.yml` can auto-check weekly and open a PR if new product keys/devices are added upstream.
-- Shared devices use Aliyun polling (no MQTT). This is normal and fully functional.
+| Channel | Used for |
+|---|---|
+| **Modern Mammotion HTTP API** | Login, device list, command invocation for **owned** devices |
+| **JWT MQTT** | Real-time telemetry and command responses for owner accounts |
+| **Legacy/Aliyun IoT** | Shared and legacy devices: command invocation, MQTT push, REST polling fallback |
+
+The user-facing behaviour is identical regardless of which channel is active – `info.connection` and `info.mqttConnected` reflect the current state.
+
+Command flow at a glance:
+
+1. The command channel builds the device-specific payload.
+2. The modern endpoint is attempted first.
+3. On a permission/route error the request transparently falls back to the legacy channel (this is the normal path for shared devices).
+4. After every command, an additional sync request and a short fast-polling window are scheduled so telemetry catches up quickly.
+
+Zone discovery:
+
+1. The adapter asks the device for its full zone hash list and any directly-available names.
+2. Unknown hashes are classified one at a time, respecting the device's rate limit.
+3. Results are written to `zones.<sanitizedName>/`. Obsolete zones are pruned.
+4. A bounded retry schedule recovers from transient MQTT flapping.
+
+## Troubleshooting
+
+- **`info.lastError` is your friend.** Every transport failure is mirrored there.
+- **`MQTT connected.` followed by `Modern command path returned Invalid device …` repeating every ~5 s** – see [Known issues](#known-issues) below. Workaround: wait for first zone discovery to complete (90 s) or temporarily disable the `requestAreaNames` retry by leaving the device idle.
+- **Telemetry stale / `lastUpdate` not advancing** – the cloud may simply not be pushing changes. Press a command (e.g. `applyTaskSettings`) to force a fresh IoT sync.
+- **Adapter and app keep logging each other out** – use the dedicated-account + share workflow described above.
+- **`No devices found (neither modern nor legacy)`** – your account has no devices, the share invitation was not accepted, or the API region differs. Check `account.iotDomain`.
+- **Enable verbose (`debug`) logging** in the adapter instance to see additional traces tagged `[MQTT]`, `[AREA-REQ]`, `[ZONE]`, etc.
+
+## Known issues
+
+- **Repeating log line on shared accounts.** With a shared device the JWT MQTT channel can disconnect shortly after each subscribe, after which the adapter reconnects roughly every 5 s. On every reconnect the area-name request is retried and falls back to the legacy channel, producing this pattern in the log:
+
+  ```
+  info  MQTT connected.
+  warn  Modern command path returned Invalid device for <name>, trying Aliyun fallback.
+  ```
+
+  Functionality is **not** affected – telemetry and commands continue to work over the fallback channel – but the log becomes noisy. Reducing this is on the short-term roadmap (skip JWT MQTT for accounts where we already know the device is shared, throttle the area-name retry, demote the warn to debug after the first occurrence).
+- **Telemetry coverage is incomplete.** The most useful fields (battery, state, GPS, work time, mileage, area) are decoded, but several events are still being mapped. Enable `storeDebugPayloads` to capture raw payloads that help with future improvements.
+- **`legacyTelemetryTransport: mqtt` is a placeholder.** Polling is the only working transport at the moment.
+
+## Development
+
+```bash
+npm install        # install deps
+npm run build      # tsc -> build/main.js
+npm run watch      # dev rebuild
+npm run check      # tsc --noEmit
+npm run lint       # eslint
+npm test           # mocha + package validation
+npm run dev-server # iobroker dev-server
+```
+
+CI workflows in `.github/workflows/`:
+
+- `test-and-release.yml` – build, lint, test on Node 20/22, npm publish on tag (trusted publishing).
+- `sync-product-keys.yml` – weekly check against PyMammotion `device_type.py`; opens a PR if new product keys appear.
+- `automerge-dependabot.yml` – auto-merges Dependabot PRs after CI passes.
+
+To rebuild the product-key list manually:
+
+```bash
+npm run sync:product-keys
+```
 
 ## Changelog
 
-### 0.0.7
-- Fixed: zone discovery race condition by adding a per-device discovery lock (prevents parallel classification runs)
-- Fixed: unknown hash reclassification handling to reduce temporary zone drops during MQTT flapping
-- Fixed: fallback zone naming now creates unique and gap-free Area IDs (no duplicate like `Area_2_2`, no missing `Area_4`)
-- Changed: adapter log messages are now consistently in English
-- New: standard GitHub QA workflows (`test-and-release`, `dependabot`, `automerge-dependabot`)
-
-### 0.0.6
-- New: Product-key sync from PyMammotion (`npm run sync:product-keys`) and optional weekly GitHub workflow PR automation
-- New: `devices.<id>.productKeyGroup` state for transparent model classification
-- Improved: product-key based model detection to better handle variants like Yuka Mini
-
-### 0.0.5
-- Improved: Yuka compatibility for route execution (`startZones`/`startAllZones`/single zone)
-- Changed: model-aware limits for command states (including Yuka/Yuka Mini spacing ranges)
-- Changed: route reserved-byte mapping aligned with PyMammotion behavior
-- Changed: NAV receiver selection adjusted for route commands
-
-### 0.0.4
-- New: `commands.payload` + `commands.lastPayload` for JSON-based command execution and traceability
-- Changed: `commands.routePayloadJson` kept as legacy alias to `commands.payload`
-- Changed: start/route executions now persist the actual payload to `commands.lastPayload`
-- Changed: payload can also trigger task-control actions (`start/pause/resume/stop/dock/cancel...`)
-- Changed: clean UI profile (advanced/internal states marked as expert)
-- Changed: app-like limits enforced for cut height, route width, mowing laps and obstacle laps
-- Changed: model-aware command limits (Yuka/Yuka Mini spacing + speed ranges)
-- Changed: route reserved bytes and NAV receiver selection aligned to PyMammotion behavior (improves Yuka compatibility)
-- Changed: zone execution order via `zones.<name>.position` for `startZones` and `startAllZones`
-- Known issue: telemetry coverage is not complete yet (MQTT decoding/RTK fields still in progress)
-
-### 0.0.3
-- Fixed: polling silently stops when device cache becomes empty (watchdog added)
-- Fixed: shared devices (owned: 0) not detected – legacy bindings now always merged
-- Fixed: modern API errors no longer crash the full device refresh
-- New: Zone / area management – `requestAreaNames` button, per-zone enable toggles, per-zone `start` button, `startZones` batch button
-- New: `routePayloadJson` string state for JS-adapter automations (full route payload as JSON)
-- Changed: `routeAreasCsv` renamed to `routeAreaIds` (existing values are migrated automatically)
-
-### 0.0.2
-- Improved telemetry refresh strategy (adaptive polling + post-command sync)
-- Automatic apply for task, route and non-work settings
-- Extended command handling and retry flow
+The full change history is maintained in [CHANGELOG.md](CHANGELOG.md). The five most recent entries are also mirrored into `io-package.json#common.news` (translated, used by the ioBroker admin UI).
 
 ## License
 
-MIT License
+MIT License – see [LICENSE](LICENSE).
 
-Copyright (c) 2026 DNAngel
+Copyright (c) 2026 DNAngel and contributors.
