@@ -13,5 +13,7 @@
     "legacyTelemetryTransportMqtt": "MQTT push (experimental)",
     "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis.",
     "aliyunMqttUseTls": "TLS для legacy/Aliyun MQTT (порт 8883)",
-    "aliyunMqttUseTlsHint": "Увімкніть, якщо у вашій мережі заблоковано вихідний порт 1883. За замовчуванням вимкнено для сумісності."
+    "aliyunMqttUseTlsHint": "Увімкніть, якщо у вашій мережі заблоковано вихідний порт 1883. За замовчуванням вимкнено для сумісності.",
+    "aliyunMqttTlsAllowInsecure": "Пропустити перевірку TLS-сертифіката (legacy/Aliyun MQTT)",
+    "aliyunMqttTlsAllowInsecureHint": "Діє лише при увімкненому TLS. Вимикає перевірку сертифіката брокера (rejectUnauthorized=false). Вмикайте лише якщо ваш Node.js не може перевірити ланцюжок сертифікатів Aliyun (типова помилка: 'unable to get local issuer certificate'). З'єднання залишається зашифрованим, але вже не автентифікованим."
 }

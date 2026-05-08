@@ -11,6 +11,23 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 _No unreleased changes._
 
+## [0.0.11] – 2026-05-08
+
+### Added
+- New optional instance setting `aliyunMqttTlsAllowInsecure`. Effective only when
+  `aliyunMqttUseTls` is also enabled. Disables broker certificate verification
+  (`rejectUnauthorized: false`) for the legacy/Aliyun MQTT client. The connection stays
+  TLS-encrypted, but the broker identity is no longer authenticated.
+- Intended workaround for hosts whose Node.js installation cannot verify Aliyun's
+  certificate chain (typical error: `Aliyun IoT MQTT error: unable to get local issuer
+  certificate`). Aliyun sometimes serves the leaf certificate without the matching
+  GlobalSign intermediate; older Linux distributions ship a CA bundle that does not include
+  the necessary intermediate either.
+- Logs a one-time `warn` per session when the setting is active to keep the trade-off
+  visible.
+- UI checkbox is hidden until the parent `aliyunMqttUseTls` setting is enabled.
+- Translated UI labels, hints and news entry in all 11 supported locales.
+
 ## [0.0.10] – 2026-05-08
 
 ### Added

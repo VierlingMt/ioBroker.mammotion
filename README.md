@@ -115,6 +115,7 @@ If you only own one account and never use the mobile app you can enter your main
 | `legacyTelemetryTransport` | Currently `poll` is used. The `mqtt` option is reserved for a future direct-protocol implementation. |
 | `storeDebugPayloads` | When enabled, raw MQTT payloads, the last protobuf blob, last route payload, etc. are persisted as states for troubleshooting. Disabled by default. |
 | `aliyunMqttUseTls` | Switch the legacy/Aliyun MQTT client from plain TCP (port 1883) to TLS (port 8883, `securemode=3`). Off by default. Enable it if your network blocks outbound 1883 (typical symptom: repeated `Aliyun IoT MQTT error: connack timeout` in the log). Use a quick `Test-NetConnection -Port 1883` / `Test-NetConnection -Port 8883` (or `nc -zv host port`) from the ioBroker host to confirm before flipping. |
+| `aliyunMqttTlsAllowInsecure` | Only effective when `aliyunMqttUseTls` is on. Disables broker-certificate verification (`rejectUnauthorized: false`). The connection stays TLS-encrypted, but the broker identity is no longer authenticated. Use as a workaround when your Node.js installation cannot verify Aliyun's certificate chain (typical error: `Aliyun IoT MQTT error: unable to get local issuer certificate`). Off by default. |
 
 ## Object tree
 
@@ -295,6 +296,7 @@ Zone discovery:
 - **Adapter and app keep logging each other out** – use the dedicated-account + share workflow described above.
 - **`No devices found (neither modern nor legacy)`** – your account has no devices, the share invitation was not accepted, or the API region differs. Check `account.iotDomain`.
 - **Repeated `Aliyun IoT MQTT error: connack timeout`** every ~20 s usually means your network blocks outbound TCP 1883. Test with `Test-NetConnection -ComputerName <broker-host> -Port 1883 -InformationLevel Quiet` (PowerShell) or `nc -zv <host> 1883` (Linux). If 1883 is blocked but 8883 works, enable the `aliyunMqttUseTls` instance setting and restart the adapter.
+- **`Aliyun IoT MQTT error: unable to get local issuer certificate`** after enabling `aliyunMqttUseTls` means your Node.js installation cannot complete Aliyun's TLS chain (typically a missing GlobalSign intermediate on older Linux CA bundles). As a workaround, enable `aliyunMqttTlsAllowInsecure` in the instance settings — the connection stays TLS-encrypted, but the broker identity is no longer authenticated.
 - **Enable verbose (`debug`) logging** in the adapter instance to see additional traces tagged `[MQTT]`, `[AREA-REQ]`, `[ZONE]`, etc.
 
 ## Known issues

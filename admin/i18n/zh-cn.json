@@ -13,5 +13,7 @@
     "legacyTelemetryTransportMqtt": "MQTT push (experimental)",
     "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis.",
     "aliyunMqttUseTls": "为 legacy/Aliyun MQTT 启用 TLS（端口 8883）",
-    "aliyunMqttUseTlsHint": "当您的网络阻止出站 1883 端口时启用。默认关闭以保持向后兼容。"
+    "aliyunMqttUseTlsHint": "当您的网络阻止出站 1883 端口时启用。默认关闭以保持向后兼容。",
+    "aliyunMqttTlsAllowInsecure": "跳过 TLS 证书验证（legacy/Aliyun MQTT）",
+    "aliyunMqttTlsAllowInsecureHint": "仅在启用 TLS 时有效。禁用代理服务器证书验证（rejectUnauthorized=false）。仅当您的 Node.js 无法验证 Aliyun 证书链时启用（典型错误：'unable to get local issuer certificate'）。连接仍然加密但不再经过身份验证。"
 }

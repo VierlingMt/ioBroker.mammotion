@@ -194,6 +194,8 @@ class Mammotion extends utils.Adapter {
     private jwtMqttLastErrorMessage = '';
     /** Most recent error message logged for the Aliyun MQTT client (used to suppress repeating warns). */
     private aliyunMqttLastErrorMessage = '';
+    /** Whether the warning about disabled Aliyun TLS verification has already been logged. */
+    private aliyunMqttInsecureLogged = false;
 
     public constructor(options: Partial<utils.AdapterOptions> = {}) {
         super({
@@ -276,6 +278,7 @@ class Mammotion extends utils.Adapter {
             this.jwtMqttConnectedAt = 0;
             this.jwtMqttLastErrorMessage = '';
             this.aliyunMqttLastErrorMessage = '';
+            this.aliyunMqttInsecureLogged = false;
             this.stopLegacyPolling();
             this.syncConnectionStates();
             callback();
@@ -3753,12 +3756,19 @@ class Mammotion extends utils.Adapter {
         // running fine. Networks that block outbound 1883 (many consumer routers / ISPs /
         // corporate firewalls) can opt into TLS via the `aliyunMqttUseTls` instance setting.
         const useTls = this.config.aliyunMqttUseTls === true;
+        const allowInsecure = useTls && this.config.aliyunMqttTlsAllowInsecure === true;
         const brokerHost = `${creds.aepProductKey}.iot-as-mqtt.${creds.regionId}.aliyuncs.com`;
         const brokerPort = useTls ? 8883 : 1883;
         const brokerUrl = `${useTls ? 'mqtts' : 'mqtt'}://${brokerHost}:${brokerPort}`;
         const secureMode = useTls ? 3 : 2;
+        if (allowInsecure && !this.aliyunMqttInsecureLogged) {
+            this.log.warn(
+                'Aliyun MQTT TLS certificate verification is disabled (aliyunMqttTlsAllowInsecure=true). Connection stays encrypted but the broker identity is not authenticated.',
+            );
+            this.aliyunMqttInsecureLogged = true;
+        }
         this.log.debug(
-            `[ALIYUN-MQTT] Connecting to ${brokerHost}:${brokerPort} (${useTls ? 'TLS' : 'plain'}, securemode=${secureMode}) as ${creds.aepDeviceName}&${creds.aepProductKey}`,
+            `[ALIYUN-MQTT] Connecting to ${brokerHost}:${brokerPort} (${useTls ? 'TLS' : 'plain'}${allowInsecure ? ', cert-verify=off' : ''}, securemode=${secureMode}) as ${creds.aepDeviceName}&${creds.aepProductKey}`,
         );
 
         const client = mqtt.connect(brokerUrl, {
@@ -3769,6 +3779,7 @@ class Mammotion extends utils.Adapter {
             connectTimeout: 15_000,
             protocolVersion: 4,
             clean: true,
+            ...(allowInsecure ? { rejectUnauthorized: false } : {}),
         });
         this.aliyunMqttClient = client;
 

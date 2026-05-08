@@ -11,6 +11,7 @@ declare global {
             legacyTelemetryTransport: 'poll' | 'mqtt';
             storeDebugPayloads: boolean;
             aliyunMqttUseTls: boolean;
+            aliyunMqttTlsAllowInsecure: boolean;
         }
     }
 }

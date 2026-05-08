@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion",
-    "version": "0.0.10",
+    "version": "0.0.11",
     "news": {
+      "0.0.11": {
+        "en": "New optional setting `aliyunMqttTlsAllowInsecure` (only effective when `aliyunMqttUseTls` is also enabled). When the host's Node.js cannot verify Aliyun's certificate chain (typical error: 'unable to get local issuer certificate'), enabling this option disables broker certificate verification. The connection stays TLS-encrypted, but is no longer authenticated. Default off.",
+        "de": "Neue optionale Einstellung `aliyunMqttTlsAllowInsecure` (nur wirksam, wenn `aliyunMqttUseTls` ebenfalls aktiv ist). Wenn das Node.js des Hosts die Zertifikatskette von Aliyun nicht verifizieren kann (typischer Fehler: 'unable to get local issuer certificate'), schaltet diese Option die Verifikation des Broker-Zertifikats ab. Die Verbindung bleibt TLS-verschluesselt, ist aber nicht mehr authentifiziert. Standardmaessig aus.",
+        "ru": "Новый необязательный параметр `aliyunMqttTlsAllowInsecure` (действует только при включенном `aliyunMqttUseTls`). Если Node.js хоста не может проверить цепочку сертификатов Aliyun (типичная ошибка: 'unable to get local issuer certificate'), включение этой опции отключает проверку сертификата брокера. Соединение остаётся зашифрованным TLS, но больше не аутентифицируется. По умолчанию выключено.",
+        "pt": "Nova configuracao opcional `aliyunMqttTlsAllowInsecure` (so funciona quando `aliyunMqttUseTls` tambem esta ativo). Se o Node.js do host nao conseguir verificar a cadeia de certificados da Aliyun (erro tipico: 'unable to get local issuer certificate'), ativar esta opcao desliga a verificacao do certificado do broker. A conexao continua criptografada por TLS mas deixa de ser autenticada. Por padrao desligado.",
+        "nl": "Nieuwe optionele instelling `aliyunMqttTlsAllowInsecure` (alleen actief als `aliyunMqttUseTls` ook is ingeschakeld). Wanneer de Node.js van de host Aliyun's certificaatketen niet kan verifieren (typische fout: 'unable to get local issuer certificate'), schakelt deze optie de brokercertificaatverificatie uit. De verbinding blijft TLS-versleuteld maar is niet langer geauthenticeerd. Standaard uit.",
+        "fr": "Nouvelle option `aliyunMqttTlsAllowInsecure` (active uniquement quand `aliyunMqttUseTls` l'est aussi). Si le Node.js de l'hote ne peut pas verifier la chaine de certificats Aliyun (erreur typique : 'unable to get local issuer certificate'), cette option desactive la verification du certificat du broker. La connexion reste chiffree en TLS mais n'est plus authentifiee. Desactive par defaut.",
+        "it": "Nuova impostazione opzionale `aliyunMqttTlsAllowInsecure` (effettiva solo se anche `aliyunMqttUseTls` e attivo). Se il Node.js dell'host non riesce a verificare la catena di certificati Aliyun (errore tipico: 'unable to get local issuer certificate'), attivare questa opzione disabilita la verifica del certificato del broker. La connessione resta cifrata via TLS ma non e piu autenticata. Disattivo di default.",
+        "es": "Nuevo ajuste opcional `aliyunMqttTlsAllowInsecure` (solo activo cuando `aliyunMqttUseTls` tambien esta activado). Si el Node.js del host no puede verificar la cadena de certificados de Aliyun (error tipico: 'unable to get local issuer certificate'), activar esta opcion desactiva la verificacion del certificado del broker. La conexion sigue cifrada con TLS pero deja de estar autenticada. Desactivado por defecto.",
+        "pl": "Nowa opcjonalna opcja `aliyunMqttTlsAllowInsecure` (dziala tylko gdy `aliyunMqttUseTls` rowniez jest wlaczone). Jesli Node.js hosta nie moze zweryfikowac lancucha certyfikatow Aliyun (typowy blad: 'unable to get local issuer certificate'), wlaczenie tej opcji wylacza weryfikacje certyfikatu brokera. Polaczenie pozostaje szyfrowane TLS, ale nie jest juz uwierzytelnione. Domyslnie wylaczone.",
+        "uk": "Нове необов'язкове налаштування `aliyunMqttTlsAllowInsecure` (діє лише за умови, що `aliyunMqttUseTls` теж увімкнено). Якщо Node.js хоста не може перевірити ланцюжок сертифікатів Aliyun (типова помилка: 'unable to get local issuer certificate'), увімкнення цієї опції вимикає перевірку сертифіката брокера. З'єднання залишається зашифрованим TLS, але більше не автентифікованим. За замовчуванням вимкнено.",
+        "zh-cn": "新增可选设置 `aliyunMqttTlsAllowInsecure`（仅在同时启用 `aliyunMqttUseTls` 时生效）。当主机的 Node.js 无法验证 Aliyun 证书链（典型错误：'unable to get local issuer certificate'）时，启用此选项会关闭代理服务器证书验证。连接仍然采用 TLS 加密但不再经过身份验证。默认关闭。"
+      },
       "0.0.10": {
         "en": "New optional setting `aliyunMqttUseTls` switches the legacy/Aliyun MQTT client from plain TCP (1883) to TLS (8883). Default off keeps the existing behaviour for setups that already work; enable on networks that block outbound 1883. Repeating MQTT error warnings are now demoted to debug after the first occurrence.",
         "de": "Neue optionale Einstellung `aliyunMqttUseTls` schaltet den Legacy/Aliyun-MQTT-Client von Plain-TCP (1883) auf TLS (8883). Standardmaessig aus, damit bestehende Installationen unveraendert weiterlaufen; in Netzen mit blockiertem ausgehendem 1883 aktivieren. Wiederholte MQTT-Error-Warnungen werden nach dem ersten Auftreten auf debug demoted.",
@@ -188,7 +201,8 @@
     "legacyPollIntervalSec": 30,
     "legacyTelemetryTransport": "poll",
     "storeDebugPayloads": false,
-    "aliyunMqttUseTls": false
+    "aliyunMqttUseTls": false,
+    "aliyunMqttTlsAllowInsecure": false
   },
   "objects": [],
   "instanceObjects": []

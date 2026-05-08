@@ -13,5 +13,7 @@
     "legacyTelemetryTransportMqtt": "MQTT push (experimental)",
     "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis.",
     "aliyunMqttUseTls": "TLS dla legacy/Aliyun MQTT (port 8883)",
-    "aliyunMqttUseTlsHint": "Wlacz, jesli port 1883 wychodzacy jest zablokowany w twojej sieci. Domyslnie wylaczone dla zgodnosci wstecznej."
+    "aliyunMqttUseTlsHint": "Wlacz, jesli port 1883 wychodzacy jest zablokowany w twojej sieci. Domyslnie wylaczone dla zgodnosci wstecznej.",
+    "aliyunMqttTlsAllowInsecure": "Pomin weryfikacje certyfikatu TLS (legacy/Aliyun MQTT)",
+    "aliyunMqttTlsAllowInsecureHint": "Dziala tylko gdy TLS jest wlaczone. Wylacza weryfikacje certyfikatu brokera (rejectUnauthorized=false). Wlaczyc tylko gdy twoj Node.js nie moze zweryfikowac lancucha certyfikatow Aliyun (typowy blad: 'unable to get local issuer certificate'). Polaczenie pozostaje szyfrowane ale nie jest juz uwierzytelnione."
 }

@@ -90,6 +90,18 @@
             "md": 6,
             "lg": 4,
             "xl": 4
+        },
+        "aliyunMqttTlsAllowInsecure": {
+            "type": "checkbox",
+            "label": "aliyunMqttTlsAllowInsecure",
+            "hint": "aliyunMqttTlsAllowInsecureHint",
+            "hidden": "!data.aliyunMqttUseTls",
+            "newLine": true,
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
         }
     }
 }
