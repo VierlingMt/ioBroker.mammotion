@@ -10,6 +10,7 @@ declare global {
             legacyPollIntervalSec: number;
             legacyTelemetryTransport: 'poll' | 'mqtt';
             storeDebugPayloads: boolean;
+            aliyunMqttUseTls: boolean;
         }
     }
 }

@@ -190,6 +190,10 @@ class Mammotion extends utils.Adapter {
     private jwtMqttDisabledUntil = 0;
     /** Whether we already informed the user about the current JWT MQTT suspension. */
     private jwtMqttBackoffLogged = false;
+    /** Most recent error message logged for the JWT MQTT client (used to suppress repeating warns). */
+    private jwtMqttLastErrorMessage = '';
+    /** Most recent error message logged for the Aliyun MQTT client (used to suppress repeating warns). */
+    private aliyunMqttLastErrorMessage = '';
 
     public constructor(options: Partial<utils.AdapterOptions> = {}) {
         super({
@@ -270,6 +274,8 @@ class Mammotion extends utils.Adapter {
             this.jwtMqttDisabledUntil = 0;
             this.jwtMqttBackoffLogged = false;
             this.jwtMqttConnectedAt = 0;
+            this.jwtMqttLastErrorMessage = '';
+            this.aliyunMqttLastErrorMessage = '';
             this.stopLegacyPolling();
             this.syncConnectionStates();
             callback();
@@ -1330,6 +1336,7 @@ class Mammotion extends utils.Adapter {
             this.setJwtMqttConnected(true);
             this.setCloudConnected(true);
             this.authFailureSince = 0;
+            this.jwtMqttLastErrorMessage = '';
 
             const topics = new Set<string>();
             for (const record of records) {
@@ -1371,7 +1378,12 @@ class Mammotion extends utils.Adapter {
 
         client.on('error', (err: Error) => {
             try {
-                this.log.warn(`MQTT error: ${err.message}`);
+                if (this.jwtMqttLastErrorMessage === err.message) {
+                    this.log.debug(`MQTT error (repeat): ${err.message}`);
+                } else {
+                    this.log.warn(`MQTT error: ${err.message}`);
+                    this.jwtMqttLastErrorMessage = err.message;
+                }
                 void this.setStateChangedAsync('info.lastError', `MQTT: ${err.message}`, true);
                 void this.ensureAliyunMqttRunning('jwt-error');
             } catch {
@@ -3736,14 +3748,21 @@ class Mammotion extends utils.Adapter {
         const clientIdBase = this.legacyUtdid.substring(0, 8);
         const signStr = `clientId${clientIdBase}deviceName${creds.aepDeviceName}productKey${creds.aepProductKey}`;
         const password = createHmac('sha1', creds.aepDeviceSecret).update(signStr, 'utf8').digest('hex');
-        // securemode=2 = plain TCP (port 1883), securemode=3 = TLS (port 8883)
-        // Use plain TCP to avoid Aliyun root-CA issues in Node.js
+        // securemode=2 = plain TCP (port 1883), securemode=3 = TLS (port 8883).
+        // Default is plain TCP for backwards compatibility with installations that have been
+        // running fine. Networks that block outbound 1883 (many consumer routers / ISPs /
+        // corporate firewalls) can opt into TLS via the `aliyunMqttUseTls` instance setting.
+        const useTls = this.config.aliyunMqttUseTls === true;
         const brokerHost = `${creds.aepProductKey}.iot-as-mqtt.${creds.regionId}.aliyuncs.com`;
-        const brokerUrl = `mqtt://${brokerHost}:1883`;
-        this.log.debug(`[ALIYUN-MQTT] Connecting to ${brokerHost}:1883 as ${creds.aepDeviceName}&${creds.aepProductKey}`);
+        const brokerPort = useTls ? 8883 : 1883;
+        const brokerUrl = `${useTls ? 'mqtts' : 'mqtt'}://${brokerHost}:${brokerPort}`;
+        const secureMode = useTls ? 3 : 2;
+        this.log.debug(
+            `[ALIYUN-MQTT] Connecting to ${brokerHost}:${brokerPort} (${useTls ? 'TLS' : 'plain'}, securemode=${secureMode}) as ${creds.aepDeviceName}&${creds.aepProductKey}`,
+        );
 
         const client = mqtt.connect(brokerUrl, {
-            clientId: `${clientIdBase}|securemode=2,signmethod=hmacsha1|`,
+            clientId: `${clientIdBase}|securemode=${secureMode},signmethod=hmacsha1|`,
             username: `${creds.aepDeviceName}&${creds.aepProductKey}`,
             password,
             reconnectPeriod: 5_000,
@@ -3758,6 +3777,7 @@ class Mammotion extends utils.Adapter {
             this.setAliyunMqttConnected(true);
             this.setCloudConnected(true);
             this.authFailureSince = 0;
+            this.aliyunMqttLastErrorMessage = '';
 
             // Bind the user session (iotToken) to this MQTT connection
             const bindTopic = `/sys/${creds.aepProductKey}/${creds.aepDeviceName}/app/up/account/bind`;
@@ -3808,7 +3828,12 @@ class Mammotion extends utils.Adapter {
 
         client.on('error', (err: Error) => {
             try {
-                this.log.warn(`Aliyun IoT MQTT error: ${err.message}`);
+                if (this.aliyunMqttLastErrorMessage === err.message) {
+                    this.log.debug(`Aliyun IoT MQTT error (repeat): ${err.message}`);
+                } else {
+                    this.log.warn(`Aliyun IoT MQTT error: ${err.message}`);
+                    this.aliyunMqttLastErrorMessage = err.message;
+                }
                 void this.setStateChangedAsync('info.lastError', `Aliyun MQTT: ${err.message}`, true);
             } catch {
                 // adapter may be shutting down

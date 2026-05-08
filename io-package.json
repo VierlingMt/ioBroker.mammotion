@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion",
-    "version": "0.0.9",
+    "version": "0.0.10",
     "news": {
+      "0.0.10": {
+        "en": "New optional setting `aliyunMqttUseTls` switches the legacy/Aliyun MQTT client from plain TCP (1883) to TLS (8883). Default off keeps the existing behaviour for setups that already work; enable on networks that block outbound 1883. Repeating MQTT error warnings are now demoted to debug after the first occurrence.",
+        "de": "Neue optionale Einstellung `aliyunMqttUseTls` schaltet den Legacy/Aliyun-MQTT-Client von Plain-TCP (1883) auf TLS (8883). Standardmaessig aus, damit bestehende Installationen unveraendert weiterlaufen; in Netzen mit blockiertem ausgehendem 1883 aktivieren. Wiederholte MQTT-Error-Warnungen werden nach dem ersten Auftreten auf debug demoted.",
+        "ru": "Новый необязательный параметр `aliyunMqttUseTls` переключает legacy/Aliyun MQTT клиент с открытого TCP (1883) на TLS (8883). По умолчанию выключено для совместимости с существующими установками; включайте в сетях, где исходящий 1883 заблокирован. Повторяющиеся MQTT-error-предупреждения теперь понижаются до debug после первого появления.",
+        "pt": "Nova configuracao opcional `aliyunMqttUseTls` muda o cliente MQTT legacy/Aliyun de TCP simples (1883) para TLS (8883). Por padrao desligado para manter o comportamento atual; ative em redes que bloqueiam a porta 1883 de saida. Avisos de erro MQTT repetidos agora sao rebaixados para debug apos a primeira ocorrencia.",
+        "nl": "Nieuwe optionele instelling `aliyunMqttUseTls` schakelt de legacy/Aliyun MQTT-client van plain TCP (1883) naar TLS (8883). Standaard uit voor compatibiliteit met bestaande installaties; inschakelen op netwerken die uitgaande 1883 blokkeren. Herhaalde MQTT-foutwaarschuwingen worden nu na de eerste keer naar debug gedegradeerd.",
+        "fr": "Nouvelle option `aliyunMqttUseTls` qui bascule le client MQTT legacy/Aliyun du TCP simple (1883) vers le TLS (8883). Desactive par defaut pour preserver le comportement existant ; activer sur les reseaux qui bloquent le port 1883 sortant. Les avertissements d'erreur MQTT repetes sont maintenant retrogrades en debug apres la premiere occurrence.",
+        "it": "Nuova impostazione opzionale `aliyunMqttUseTls` che passa il client MQTT legacy/Aliyun da TCP normale (1883) a TLS (8883). Disattivo di default per non rompere installazioni esistenti; attivare su reti che bloccano la 1883 in uscita. Gli avvisi di errore MQTT ripetuti ora vengono retrocessi a debug dopo la prima occorrenza.",
+        "es": "Nuevo ajuste opcional `aliyunMqttUseTls` que cambia el cliente MQTT legacy/Aliyun de TCP simple (1883) a TLS (8883). Desactivado por defecto para mantener instalaciones existentes; activelo en redes que bloquean la 1883 saliente. Las advertencias de error MQTT repetidas ahora se degradan a debug tras la primera aparicion.",
+        "pl": "Nowa opcjonalna opcja `aliyunMqttUseTls` przelacza klienta MQTT legacy/Aliyun ze zwyklego TCP (1883) na TLS (8883). Domyslnie wylaczona, aby istniejace instalacje dzialaly bez zmian; wlacz w sieciach blokujacych wychodzacy 1883. Powtarzajace sie ostrzezenia MQTT sa teraz degradowane do debug po pierwszym wystapieniu.",
+        "uk": "Нове необов'язкове налаштування `aliyunMqttUseTls` перемикає legacy/Aliyun MQTT-клієнта з простого TCP (1883) на TLS (8883). За замовчуванням вимкнено для сумісності з існуючими встановленнями; увімкніть у мережах, де заблоковано вихідний 1883. Повторні попередження про MQTT-помилки тепер знижуються до debug після першого появи.",
+        "zh-cn": "新增可选设置 `aliyunMqttUseTls`，将 legacy/Aliyun MQTT 客户端从普通 TCP (1883) 切换到 TLS (8883)。默认关闭以保持现有安装的行为；在出站 1883 被阻止的网络中启用。重复的 MQTT 错误警告在首次出现后将降级为 debug。"
+      },
       "0.0.9": {
         "en": "Fix log spam on shared accounts: JWT MQTT stability watchdog (suspends after a reconnect storm), throttled area-name re-requests and per-session cache of legacy-only devices so the modern-fallback warn fires at most once per device. Adds README/CHANGELOG/CLAUDE.md after the community fork takeover.",
         "de": "Log-Spam bei geteilten Accounts behoben: JWT-MQTT-Stabilitaets-Watchdog (sperrt nach Reconnect-Sturm), gedrosselte Area-Name-Wiederholungen und Per-Session-Cache fuer Legacy-only-Geraete, damit der Modern-Fallback-Warn nur noch einmal pro Geraet erscheint. Ergaenzt README/CHANGELOG/CLAUDE.md nach Community-Fork-Uebernahme.",
@@ -174,7 +187,8 @@
     "deviceUuid": "A9D0F177-F701-4212-8676-EDF9B354AE48",
     "legacyPollIntervalSec": 30,
     "legacyTelemetryTransport": "poll",
-    "storeDebugPayloads": false
+    "storeDebugPayloads": false,
+    "aliyunMqttUseTls": false
   },
   "objects": [],
   "instanceObjects": []

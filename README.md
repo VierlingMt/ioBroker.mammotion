@@ -114,6 +114,7 @@ If you only own one account and never use the mobile app you can enter your main
 | `legacyPollIntervalSec` | Base polling interval for Aliyun REST telemetry (10–300 s, default 30 s). The adapter halves this while a job is active and quadruples it while the mower is idle. |
 | `legacyTelemetryTransport` | Currently `poll` is used. The `mqtt` option is reserved for a future direct-protocol implementation. |
 | `storeDebugPayloads` | When enabled, raw MQTT payloads, the last protobuf blob, last route payload, etc. are persisted as states for troubleshooting. Disabled by default. |
+| `aliyunMqttUseTls` | Switch the legacy/Aliyun MQTT client from plain TCP (port 1883) to TLS (port 8883, `securemode=3`). Off by default. Enable it if your network blocks outbound 1883 (typical symptom: repeated `Aliyun IoT MQTT error: connack timeout` in the log). Use a quick `Test-NetConnection -Port 1883` / `Test-NetConnection -Port 8883` (or `nc -zv host port`) from the ioBroker host to confirm before flipping. |
 
 ## Object tree
 
@@ -293,6 +294,7 @@ Zone discovery:
 - **Telemetry stale / `lastUpdate` not advancing** – the cloud may simply not be pushing changes. Press a command (e.g. `applyTaskSettings`) to force a fresh IoT sync.
 - **Adapter and app keep logging each other out** – use the dedicated-account + share workflow described above.
 - **`No devices found (neither modern nor legacy)`** – your account has no devices, the share invitation was not accepted, or the API region differs. Check `account.iotDomain`.
+- **Repeated `Aliyun IoT MQTT error: connack timeout`** every ~20 s usually means your network blocks outbound TCP 1883. Test with `Test-NetConnection -ComputerName <broker-host> -Port 1883 -InformationLevel Quiet` (PowerShell) or `nc -zv <host> 1883` (Linux). If 1883 is blocked but 8883 works, enable the `aliyunMqttUseTls` instance setting and restart the adapter.
 - **Enable verbose (`debug`) logging** in the adapter instance to see additional traces tagged `[MQTT]`, `[AREA-REQ]`, `[ZONE]`, etc.
 
 ## Known issues

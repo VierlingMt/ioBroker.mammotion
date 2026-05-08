@@ -201,6 +201,10 @@ class Mammotion extends utils.Adapter {
   jwtMqttDisabledUntil = 0;
   /** Whether we already informed the user about the current JWT MQTT suspension. */
   jwtMqttBackoffLogged = false;
+  /** Most recent error message logged for the JWT MQTT client (used to suppress repeating warns). */
+  jwtMqttLastErrorMessage = "";
+  /** Most recent error message logged for the Aliyun MQTT client (used to suppress repeating warns). */
+  aliyunMqttLastErrorMessage = "";
   constructor(options = {}) {
     super({
       ...options,
@@ -274,6 +278,8 @@ class Mammotion extends utils.Adapter {
       this.jwtMqttDisabledUntil = 0;
       this.jwtMqttBackoffLogged = false;
       this.jwtMqttConnectedAt = 0;
+      this.jwtMqttLastErrorMessage = "";
+      this.aliyunMqttLastErrorMessage = "";
       this.stopLegacyPolling();
       this.syncConnectionStates();
       callback();
@@ -1201,6 +1207,7 @@ class Mammotion extends utils.Adapter {
       this.setJwtMqttConnected(true);
       this.setCloudConnected(true);
       this.authFailureSince = 0;
+      this.jwtMqttLastErrorMessage = "";
       const topics = /* @__PURE__ */ new Set();
       for (const record of records) {
         if (record.productKey && record.deviceName) {
@@ -1234,7 +1241,12 @@ class Mammotion extends utils.Adapter {
     });
     client.on("error", (err) => {
       try {
-        this.log.warn(`MQTT error: ${err.message}`);
+        if (this.jwtMqttLastErrorMessage === err.message) {
+          this.log.debug(`MQTT error (repeat): ${err.message}`);
+        } else {
+          this.log.warn(`MQTT error: ${err.message}`);
+          this.jwtMqttLastErrorMessage = err.message;
+        }
         void this.setStateChangedAsync("info.lastError", `MQTT: ${err.message}`, true);
         void this.ensureAliyunMqttRunning("jwt-error");
       } catch {
@@ -3245,11 +3257,16 @@ ${url}`;
     const clientIdBase = this.legacyUtdid.substring(0, 8);
     const signStr = `clientId${clientIdBase}deviceName${creds.aepDeviceName}productKey${creds.aepProductKey}`;
     const password = (0, import_node_crypto.createHmac)("sha1", creds.aepDeviceSecret).update(signStr, "utf8").digest("hex");
+    const useTls = this.config.aliyunMqttUseTls === true;
     const brokerHost = `${creds.aepProductKey}.iot-as-mqtt.${creds.regionId}.aliyuncs.com`;
-    const brokerUrl = `mqtt://${brokerHost}:1883`;
-    this.log.debug(`[ALIYUN-MQTT] Connecting to ${brokerHost}:1883 as ${creds.aepDeviceName}&${creds.aepProductKey}`);
+    const brokerPort = useTls ? 8883 : 1883;
+    const brokerUrl = `${useTls ? "mqtts" : "mqtt"}://${brokerHost}:${brokerPort}`;
+    const secureMode = useTls ? 3 : 2;
+    this.log.debug(
+      `[ALIYUN-MQTT] Connecting to ${brokerHost}:${brokerPort} (${useTls ? "TLS" : "plain"}, securemode=${secureMode}) as ${creds.aepDeviceName}&${creds.aepProductKey}`
+    );
     const client = mqtt.connect(brokerUrl, {
-      clientId: `${clientIdBase}|securemode=2,signmethod=hmacsha1|`,
+      clientId: `${clientIdBase}|securemode=${secureMode},signmethod=hmacsha1|`,
       username: `${creds.aepDeviceName}&${creds.aepProductKey}`,
       password,
       reconnectPeriod: 5e3,
@@ -3263,6 +3280,7 @@ ${url}`;
       this.setAliyunMqttConnected(true);
       this.setCloudConnected(true);
       this.authFailureSince = 0;
+      this.aliyunMqttLastErrorMessage = "";
       const bindTopic = `/sys/${creds.aepProductKey}/${creds.aepDeviceName}/app/up/account/bind`;
       client.publish(
         bindTopic,
@@ -3304,7 +3322,12 @@ ${url}`;
     });
     client.on("error", (err) => {
       try {
-        this.log.warn(`Aliyun IoT MQTT error: ${err.message}`);
+        if (this.aliyunMqttLastErrorMessage === err.message) {
+          this.log.debug(`Aliyun IoT MQTT error (repeat): ${err.message}`);
+        } else {
+          this.log.warn(`Aliyun IoT MQTT error: ${err.message}`);
+          this.aliyunMqttLastErrorMessage = err.message;
+        }
         void this.setStateChangedAsync("info.lastError", `Aliyun MQTT: ${err.message}`, true);
       } catch {
       }

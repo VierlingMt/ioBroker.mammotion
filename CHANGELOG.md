@@ -11,6 +11,24 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 _No unreleased changes._
 
+## [0.0.10] – 2026-05-08
+
+### Added
+- New optional instance setting `aliyunMqttUseTls`. When enabled, the legacy/Aliyun MQTT client
+  connects via TLS on port 8883 (`securemode=3`) instead of plain TCP on port 1883
+  (`securemode=2`). Useful for networks where outbound 1883 is blocked (consumer routers,
+  ISPs, corporate firewalls).
+- The setting defaults to **off** so existing installations keep the original plain-TCP
+  behaviour after the update. No automatic migration; users who need TLS opt in via the
+  adapter instance settings.
+- Translated UI labels and hints for the new setting in all 11 supported locales.
+
+### Changed
+- Repeating MQTT `error` events (e.g. continuous `connack timeout`) are now logged at `warn`
+  only on first occurrence per client; identical follow-up errors drop to `debug` until
+  the next successful connect resets the counter. Both the JWT MQTT and the legacy/Aliyun
+  MQTT client benefit from this. `info.lastError` is still updated on every error.
+
 ## [0.0.9] – 2026-05-04
 
 ### Fixed

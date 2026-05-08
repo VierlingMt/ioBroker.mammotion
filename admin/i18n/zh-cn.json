@@ -11,5 +11,7 @@
     "legacyTelemetryTransportHint": "MQTT push is experimental; polling is currently recommended.",
     "legacyTelemetryTransportPoll": "Polling (stable)",
     "legacyTelemetryTransportMqtt": "MQTT push (experimental)",
-    "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis."
+    "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis.",
+    "aliyunMqttUseTls": "为 legacy/Aliyun MQTT 启用 TLS（端口 8883）",
+    "aliyunMqttUseTlsHint": "当您的网络阻止出站 1883 端口时启用。默认关闭以保持向后兼容。"
 }

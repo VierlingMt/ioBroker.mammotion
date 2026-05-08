@@ -11,5 +11,7 @@
     "legacyTelemetryTransportHint": "MQTT push is experimental; polling is currently recommended.",
     "legacyTelemetryTransportPoll": "Polling (stable)",
     "legacyTelemetryTransportMqtt": "MQTT push (experimental)",
-    "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis."
+    "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis.",
+    "aliyunMqttUseTls": "TLS para MQTT legacy/Aliyun (puerto 8883)",
+    "aliyunMqttUseTlsHint": "Activa si el puerto 1883 saliente esta bloqueado en tu red. Desactivado por defecto por compatibilidad."
 }
