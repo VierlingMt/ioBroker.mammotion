@@ -171,6 +171,7 @@ class Mammotion extends utils.Adapter {
   legacyPollInFlight = false;
   legacyHasActiveDevice = false;
   legacyFastPollUntil = 0;
+  legacyPollFirstSuccessLogged = false;
   lastRealtimeMqttMessageAt = 0;
   aliyunEnsureInFlight = false;
   lastAliyunEnsureAt = 0;
@@ -1929,6 +1930,7 @@ class Mammotion extends utils.Adapter {
     this.legacyHasActiveDevice = false;
     this.legacyFastPollUntil = 0;
     this.lastRealtimeMqttMessageAt = 0;
+    this.legacyPollFirstSuccessLogged = false;
   }
   startLegacyPolling() {
     this.legacyPollingEnabled = true;
@@ -2002,13 +2004,12 @@ class Mammotion extends utils.Adapter {
   getLegacyNextPollDelayMs() {
     const configuredInterval = Number(this.config.legacyPollIntervalSec);
     const baseSec = Number.isFinite(configuredInterval) ? Math.min(300, Math.max(10, Math.trunc(configuredInterval))) : 30;
-    const activeSec = Math.min(60, Math.max(15, Math.trunc(baseSec / 2)));
-    const idleSec = Math.min(300, Math.max(120, baseSec * 4));
+    const activeSec = Math.min(60, Math.max(10, Math.trunc(baseSec / 2)));
     const boostSec = Math.max(10, Math.min(15, activeSec));
     if (Date.now() < this.legacyFastPollUntil) {
       return boostSec * 1e3;
     }
-    return (this.legacyHasActiveDevice ? activeSec : idleSec) * 1e3;
+    return (this.legacyHasActiveDevice ? activeSec : baseSec) * 1e3;
   }
   enableFastLegacyPollingWindow() {
     this.legacyFastPollUntil = Math.max(this.legacyFastPollUntil, Date.now() + LEGACY_FAST_POLL_WINDOW_MS);
@@ -2056,10 +2057,6 @@ class Mammotion extends utils.Adapter {
     if (!this.deviceContexts.size) {
       return false;
     }
-    const mqttActive = this.jwtMqttConnected || this.aliyunMqttConnected;
-    if (mqttActive && this.lastRealtimeMqttMessageAt > 0 && Date.now() - this.lastRealtimeMqttMessageAt < 5 * 6e4) {
-      return this.legacyHasActiveDevice;
-    }
     let session;
     try {
       session = await this.ensureValidSession(!this.cloudConnected);
@@ -2068,6 +2065,7 @@ class Mammotion extends utils.Adapter {
       return this.legacyHasActiveDevice;
     }
     let hasActiveDevice = false;
+    let gotAnyData = false;
     for (const ctx of this.deviceContexts.values()) {
       if (!ctx.iotId) {
         continue;
@@ -2076,6 +2074,7 @@ class Mammotion extends utils.Adapter {
         const properties = await this.fetchLegacyProperties(session, ctx.iotId);
         if (properties) {
           await this.applyLegacyTelemetry(`devices.${ctx.key}`, properties);
+          gotAnyData = true;
         }
       } catch (err) {
         const msg = this.extractAxiosError(err);
@@ -2088,6 +2087,7 @@ class Mammotion extends utils.Adapter {
         const status = await this.fetchLegacyStatus(session, ctx.iotId);
         if (status) {
           await this.applyLegacyStatusTelemetry(`devices.${ctx.key}`, status);
+          gotAnyData = true;
         }
       } catch (err) {
         const msg = this.extractAxiosError(err);
@@ -2103,6 +2103,13 @@ class Mammotion extends utils.Adapter {
       if (this.shouldUseActiveLegacyPolling(this.asNumericStateValue(deviceState == null ? void 0 : deviceState.val), this.asBooleanStateValue(connected == null ? void 0 : connected.val))) {
         hasActiveDevice = true;
       }
+    }
+    if (gotAnyData && !this.legacyPollFirstSuccessLogged) {
+      this.legacyPollFirstSuccessLogged = true;
+      const intervalSec = Math.round(this.getLegacyNextPollDelayMs() / 1e3);
+      this.log.info(
+        `Legacy REST polling: first telemetry update received (next poll in ~${intervalSec}s, ${hasActiveDevice ? "active" : "idle"} cycle).`
+      );
     }
     return hasActiveDevice;
   }
