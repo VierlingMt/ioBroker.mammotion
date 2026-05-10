@@ -11,6 +11,24 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 _No unreleased changes._
 
+## [0.0.12] – 2026-05-08
+
+### Changed
+- Legacy/Aliyun REST polling honours the configured `legacyPollIntervalSec` directly when the
+  mower is idle, instead of stretching to `4 × interval` (clamped 120..300s). With the default
+  30s setting the polling rate is now 30s instead of the previous 120s. Active polling stays
+  at half the configured interval (clamped 10..60s).
+- Removed the 5-minute polling suspension that fired after any MQTT message landed. For
+  shared/legacy-only accounts the Aliyun MQTT push channel rarely delivers full telemetry, so
+  the suspension caused long gaps in `info.lastMessageTs` and per-device `telemetry.lastUpdate`
+  even when REST polling would have happily delivered fresh data. Polling now runs in parallel
+  with MQTT; duplicate updates are absorbed by `setStateChangedAsync`.
+
+### Added
+- One-time `info` log on the first successful polling cycle per session
+  (`Legacy REST polling: first telemetry update received …`) so operators can confirm that
+  REST polling is actually delivering data without enabling debug logging.
+
 ## [0.0.11] – 2026-05-08
 
 ### Added

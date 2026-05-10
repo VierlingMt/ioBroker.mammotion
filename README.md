@@ -111,7 +111,7 @@ If you only own one account and never use the mobile app you can enter your main
 | `email` | Mammotion account email |
 | `password` | Mammotion account password |
 | `deviceUuid` | Optional virtual device UUID. Pre-filled with a working default; only change if you understand the implications. |
-| `legacyPollIntervalSec` | Base polling interval for Aliyun REST telemetry (10–300 s, default 30 s). The adapter halves this while a job is active and quadruples it while the mower is idle. |
+| `legacyPollIntervalSec` | Base polling interval for Aliyun REST telemetry (10–300 s, default 30 s). Used as-is while the mower is idle, halved while a job is active (clamped 10–60 s). REST polling now runs in parallel with MQTT push so the configured interval is the worst-case staleness even when MQTT push delivers nothing useful. |
 | `legacyTelemetryTransport` | Currently `poll` is used. The `mqtt` option is reserved for a future direct-protocol implementation. |
 | `storeDebugPayloads` | When enabled, raw MQTT payloads, the last protobuf blob, last route payload, etc. are persisted as states for troubleshooting. Disabled by default. |
 | `aliyunMqttUseTls` | Switch the legacy/Aliyun MQTT client from plain TCP (port 1883) to TLS (port 8883, `securemode=3`). Off by default. Enable it if your network blocks outbound 1883 (typical symptom: repeated `Aliyun IoT MQTT error: connack timeout` in the log). Use a quick `Test-NetConnection -Port 1883` / `Test-NetConnection -Port 8883` (or `nc -zv host port`) from the ioBroker host to confirm before flipping. |
