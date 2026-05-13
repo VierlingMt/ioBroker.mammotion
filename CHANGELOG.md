@@ -11,6 +11,28 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 _No unreleased changes._
 
+## [0.0.13] – 2026-05-13
+
+### Added
+- **Data-staleness watchdog for legacy/Aliyun REST polling.** Tracks the timestamp of the last
+  successful poll that returned data. When no telemetry data lands for more than 5 minutes
+  while polling is enabled, the adapter forces a full recovery: tears down the existing
+  Aliyun MQTT client (which may still claim to be connected while the broker-side AEP binding
+  is silently broken after a keepalive timeout), clears the legacy session cache, re-runs
+  `refreshSessionAndDeviceCache`, and re-establishes the Aliyun channel. The first-success
+  log line re-arms so the operator can see in the log when telemetry resumes.
+- **Empty-cycle warn line.** After 5 consecutive empty poll cycles (~2.5 minutes at the
+  default 30 s interval) a one-time `warn` is emitted with the last fetch error
+  (`Legacy polling: 5 consecutive empty cycles. Last fetch issue: …`). Previously these
+  failures stayed at `debug` and silent failures were invisible in normal log levels.
+
+### Context
+- Symptom this addresses: shared/legacy-only account, Aliyun MQTT keepalive timeout, MQTT
+  auto-reconnects so the client reports "connected" again, but the AEP virtual-device
+  binding is gone — REST polling then keeps firing every 30 s but its calls return errors
+  that don't match `isAuthError()`, so `markAuthFailure()` never triggers and `lastUpdate`
+  freezes for hours while `info.connection` stays `true`.
+
 ## [0.0.12] – 2026-05-08
 
 ### Changed

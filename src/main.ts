@@ -161,6 +161,11 @@ class Mammotion extends utils.Adapter {
     private legacyHasActiveDevice = false;
     private legacyFastPollUntil = 0;
     private legacyPollFirstSuccessLogged = false;
+    private legacyLastDataAt = 0;
+    private legacyEmptyPollCount = 0;
+    private legacyEmptyPollWarned = false;
+    private legacyLastPollErrorMessage = '';
+    private legacyStalenessRecoveryInFlight = false;
     private lastRealtimeMqttMessageAt = 0;
     private aliyunEnsureInFlight = false;
     private lastAliyunEnsureAt = 0;
@@ -2237,10 +2242,20 @@ class Mammotion extends utils.Adapter {
         this.legacyFastPollUntil = 0;
         this.lastRealtimeMqttMessageAt = 0;
         this.legacyPollFirstSuccessLogged = false;
+        this.legacyLastDataAt = 0;
+        this.legacyEmptyPollCount = 0;
+        this.legacyEmptyPollWarned = false;
+        this.legacyLastPollErrorMessage = '';
+        this.legacyStalenessRecoveryInFlight = false;
     }
 
     private startLegacyPolling(): void {
         this.legacyPollingEnabled = true;
+        // Seed the data-staleness watchdog with the start timestamp so the 5-min grace runs
+        // from the polling start rather than from epoch.
+        this.legacyLastDataAt = Date.now();
+        this.legacyEmptyPollCount = 0;
+        this.legacyEmptyPollWarned = false;
         void this.ensureAliyunMqttRunning('start-polling');
 
         this.scheduleLegacyPolling(0);
@@ -2303,6 +2318,7 @@ class Mammotion extends utils.Adapter {
             if (this.legacyPollingEnabled) {
                 if (this.deviceContexts.size) {
                     this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
+                    this.maybeRecoverFromDataStaleness();
                 } else {
                     this.log.warn('Legacy polling: no devices in cache - forcing reconnect.');
                     this.setCloudConnected(false);
@@ -2312,6 +2328,61 @@ class Mammotion extends utils.Adapter {
                     }
                 }
             }
+        }
+    }
+
+    private maybeRecoverFromDataStaleness(): void {
+        if (this.legacyStalenessRecoveryInFlight) {
+            return;
+        }
+        if (this.legacyLastDataAt <= 0) {
+            return;
+        }
+        const stalenessMs = 5 * 60 * 1000;
+        const age = Date.now() - this.legacyLastDataAt;
+        if (age <= stalenessMs) {
+            return;
+        }
+        void this.runDataStalenessRecovery(age);
+    }
+
+    private async runDataStalenessRecovery(ageMs: number): Promise<void> {
+        this.legacyStalenessRecoveryInFlight = true;
+        // Reset the timestamp so a second recovery only fires after another full staleness window
+        // even if this one fails to deliver data immediately.
+        this.legacyLastDataAt = Date.now();
+        // Re-arm the first-success info log so the operator can see in the log that data resumed.
+        this.legacyPollFirstSuccessLogged = false;
+        const ageMinutes = Math.round(ageMs / 60000);
+        const lastErr = this.legacyLastPollErrorMessage || 'unknown';
+        this.log.warn(
+            `Legacy polling: no telemetry data for ${ageMinutes}min (last issue: ${lastErr}) - forcing session + MQTT refresh.`,
+        );
+        try {
+            if (this.aliyunMqttClient) {
+                this.aliyunMqttClient.removeAllListeners();
+                this.aliyunMqttClient.on('error', () => {});
+                this.aliyunMqttClient.end(true);
+                this.aliyunMqttClient = null;
+                this.setAliyunMqttConnected(false);
+            }
+            if (this.mqttClient && !this.mqttClient.connected) {
+                this.mqttClient.removeAllListeners();
+                this.mqttClient.on('error', () => {});
+                this.mqttClient.end(true);
+                this.mqttClient = null;
+                this.setJwtMqttConnected(false);
+            }
+            this.legacySession = null;
+            await this.refreshSessionAndDeviceCache();
+            await this.ensureAliyunMqttRunning('staleness-recovery').catch(() => {});
+            this.log.info('Legacy polling: staleness recovery completed, polling continues.');
+        } catch (err) {
+            const msg = this.extractAxiosError(err);
+            this.log.warn(`Legacy polling: staleness recovery failed: ${msg}`);
+            this.markAuthFailure(msg);
+        } finally {
+            this.legacyStalenessRecoveryInFlight = false;
         }
     }
 
@@ -2406,6 +2477,7 @@ class Mammotion extends utils.Adapter {
                 }
             } catch (err) {
                 const msg = this.extractAxiosError(err);
+                this.legacyLastPollErrorMessage = `properties (${ctx.deviceName || ctx.iotId}): ${msg}`;
                 if (this.isAuthError(err, msg)) {
                     this.markAuthFailure(msg);
                 }
@@ -2420,6 +2492,7 @@ class Mammotion extends utils.Adapter {
                 }
             } catch (err) {
                 const msg = this.extractAxiosError(err);
+                this.legacyLastPollErrorMessage = `status (${ctx.deviceName || ctx.iotId}): ${msg}`;
                 if (this.isAuthError(err, msg)) {
                     this.markAuthFailure(msg);
                 }
@@ -2435,14 +2508,29 @@ class Mammotion extends utils.Adapter {
             }
         }
 
-        if (gotAnyData && !this.legacyPollFirstSuccessLogged) {
-            this.legacyPollFirstSuccessLogged = true;
-            const intervalSec = Math.round(this.getLegacyNextPollDelayMs() / 1000);
-            this.log.info(
-                `Legacy REST polling: first telemetry update received (next poll in ~${intervalSec}s, ${
-                    hasActiveDevice ? 'active' : 'idle'
-                } cycle).`,
-            );
+        if (gotAnyData) {
+            this.legacyLastDataAt = Date.now();
+            this.legacyEmptyPollCount = 0;
+            this.legacyEmptyPollWarned = false;
+            if (!this.legacyPollFirstSuccessLogged) {
+                this.legacyPollFirstSuccessLogged = true;
+                const intervalSec = Math.round(this.getLegacyNextPollDelayMs() / 1000);
+                this.log.info(
+                    `Legacy REST polling: first telemetry update received (next poll in ~${intervalSec}s, ${
+                        hasActiveDevice ? 'active' : 'idle'
+                    } cycle).`,
+                );
+            }
+        } else {
+            this.legacyEmptyPollCount++;
+            // After ~5 empty cycles in a row (~2.5min at default 30s) make the silence visible.
+            if (this.legacyEmptyPollCount === 5 && !this.legacyEmptyPollWarned) {
+                this.legacyEmptyPollWarned = true;
+                const lastErr = this.legacyLastPollErrorMessage || 'no data and no error from device';
+                this.log.warn(
+                    `Legacy polling: ${this.legacyEmptyPollCount} consecutive empty cycles. Last fetch issue: ${lastErr}`,
+                );
+            }
         }
 
         return hasActiveDevice;
