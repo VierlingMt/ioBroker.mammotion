@@ -172,6 +172,11 @@ class Mammotion extends utils.Adapter {
   legacyHasActiveDevice = false;
   legacyFastPollUntil = 0;
   legacyPollFirstSuccessLogged = false;
+  legacyLastDataAt = 0;
+  legacyEmptyPollCount = 0;
+  legacyEmptyPollWarned = false;
+  legacyLastPollErrorMessage = "";
+  legacyStalenessRecoveryInFlight = false;
   lastRealtimeMqttMessageAt = 0;
   aliyunEnsureInFlight = false;
   lastAliyunEnsureAt = 0;
@@ -1931,9 +1936,17 @@ class Mammotion extends utils.Adapter {
     this.legacyFastPollUntil = 0;
     this.lastRealtimeMqttMessageAt = 0;
     this.legacyPollFirstSuccessLogged = false;
+    this.legacyLastDataAt = 0;
+    this.legacyEmptyPollCount = 0;
+    this.legacyEmptyPollWarned = false;
+    this.legacyLastPollErrorMessage = "";
+    this.legacyStalenessRecoveryInFlight = false;
   }
   startLegacyPolling() {
     this.legacyPollingEnabled = true;
+    this.legacyLastDataAt = Date.now();
+    this.legacyEmptyPollCount = 0;
+    this.legacyEmptyPollWarned = false;
     void this.ensureAliyunMqttRunning("start-polling");
     this.scheduleLegacyPolling(0);
   }
@@ -1991,6 +2004,7 @@ class Mammotion extends utils.Adapter {
       if (this.legacyPollingEnabled) {
         if (this.deviceContexts.size) {
           this.scheduleLegacyPolling(this.getLegacyNextPollDelayMs());
+          this.maybeRecoverFromDataStaleness();
         } else {
           this.log.warn("Legacy polling: no devices in cache - forcing reconnect.");
           this.setCloudConnected(false);
@@ -1999,6 +2013,59 @@ class Mammotion extends utils.Adapter {
           }
         }
       }
+    }
+  }
+  maybeRecoverFromDataStaleness() {
+    if (this.legacyStalenessRecoveryInFlight) {
+      return;
+    }
+    if (this.legacyLastDataAt <= 0) {
+      return;
+    }
+    const stalenessMs = 5 * 60 * 1e3;
+    const age = Date.now() - this.legacyLastDataAt;
+    if (age <= stalenessMs) {
+      return;
+    }
+    void this.runDataStalenessRecovery(age);
+  }
+  async runDataStalenessRecovery(ageMs) {
+    this.legacyStalenessRecoveryInFlight = true;
+    this.legacyLastDataAt = Date.now();
+    this.legacyPollFirstSuccessLogged = false;
+    const ageMinutes = Math.round(ageMs / 6e4);
+    const lastErr = this.legacyLastPollErrorMessage || "unknown";
+    this.log.warn(
+      `Legacy polling: no telemetry data for ${ageMinutes}min (last issue: ${lastErr}) - forcing session + MQTT refresh.`
+    );
+    try {
+      if (this.aliyunMqttClient) {
+        this.aliyunMqttClient.removeAllListeners();
+        this.aliyunMqttClient.on("error", () => {
+        });
+        this.aliyunMqttClient.end(true);
+        this.aliyunMqttClient = null;
+        this.setAliyunMqttConnected(false);
+      }
+      if (this.mqttClient && !this.mqttClient.connected) {
+        this.mqttClient.removeAllListeners();
+        this.mqttClient.on("error", () => {
+        });
+        this.mqttClient.end(true);
+        this.mqttClient = null;
+        this.setJwtMqttConnected(false);
+      }
+      this.legacySession = null;
+      await this.refreshSessionAndDeviceCache();
+      await this.ensureAliyunMqttRunning("staleness-recovery").catch(() => {
+      });
+      this.log.info("Legacy polling: staleness recovery completed, polling continues.");
+    } catch (err) {
+      const msg = this.extractAxiosError(err);
+      this.log.warn(`Legacy polling: staleness recovery failed: ${msg}`);
+      this.markAuthFailure(msg);
+    } finally {
+      this.legacyStalenessRecoveryInFlight = false;
     }
   }
   getLegacyNextPollDelayMs() {
@@ -2078,6 +2145,7 @@ class Mammotion extends utils.Adapter {
         }
       } catch (err) {
         const msg = this.extractAxiosError(err);
+        this.legacyLastPollErrorMessage = `properties (${ctx.deviceName || ctx.iotId}): ${msg}`;
         if (this.isAuthError(err, msg)) {
           this.markAuthFailure(msg);
         }
@@ -2091,6 +2159,7 @@ class Mammotion extends utils.Adapter {
         }
       } catch (err) {
         const msg = this.extractAxiosError(err);
+        this.legacyLastPollErrorMessage = `status (${ctx.deviceName || ctx.iotId}): ${msg}`;
         if (this.isAuthError(err, msg)) {
           this.markAuthFailure(msg);
         }
@@ -2104,12 +2173,26 @@ class Mammotion extends utils.Adapter {
         hasActiveDevice = true;
       }
     }
-    if (gotAnyData && !this.legacyPollFirstSuccessLogged) {
-      this.legacyPollFirstSuccessLogged = true;
-      const intervalSec = Math.round(this.getLegacyNextPollDelayMs() / 1e3);
-      this.log.info(
-        `Legacy REST polling: first telemetry update received (next poll in ~${intervalSec}s, ${hasActiveDevice ? "active" : "idle"} cycle).`
-      );
+    if (gotAnyData) {
+      this.legacyLastDataAt = Date.now();
+      this.legacyEmptyPollCount = 0;
+      this.legacyEmptyPollWarned = false;
+      if (!this.legacyPollFirstSuccessLogged) {
+        this.legacyPollFirstSuccessLogged = true;
+        const intervalSec = Math.round(this.getLegacyNextPollDelayMs() / 1e3);
+        this.log.info(
+          `Legacy REST polling: first telemetry update received (next poll in ~${intervalSec}s, ${hasActiveDevice ? "active" : "idle"} cycle).`
+        );
+      }
+    } else {
+      this.legacyEmptyPollCount++;
+      if (this.legacyEmptyPollCount === 5 && !this.legacyEmptyPollWarned) {
+        this.legacyEmptyPollWarned = true;
+        const lastErr = this.legacyLastPollErrorMessage || "no data and no error from device";
+        this.log.warn(
+          `Legacy polling: ${this.legacyEmptyPollCount} consecutive empty cycles. Last fetch issue: ${lastErr}`
+        );
+      }
     }
     return hasActiveDevice;
   }
