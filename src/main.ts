@@ -166,6 +166,7 @@ class Mammotion extends utils.Adapter {
     private legacyEmptyPollWarned = false;
     private legacyLastPollErrorMessage = '';
     private legacyStalenessRecoveryInFlight = false;
+    private lastCommandActivityAt = 0;
     private lastRealtimeMqttMessageAt = 0;
     private aliyunEnsureInFlight = false;
     private lastAliyunEnsureAt = 0;
@@ -1771,6 +1772,10 @@ class Mammotion extends utils.Adapter {
         context: DeviceContext,
         content: string,
     ): Promise<string> {
+        // Tell the staleness watchdog that the operator is actively driving the device, so it
+        // does not pile a refreshSessionAndDeviceCache() on top of a possibly rate-limited account.
+        this.lastCommandActivityAt = Date.now();
+
         // Once we have confirmed that the modern endpoint refuses this device for the current
         // session (typical for shared / legacy devices), skip the modern attempt entirely.
         // This both saves a round-trip and silences the repeating fallback log line.
@@ -1778,22 +1783,48 @@ class Mammotion extends utils.Adapter {
             return this.invokeTaskControlCommandLegacy(session, context, content);
         }
 
+        let modernFailureWasRateLimit = false;
+        let modernFailureWasServerError = false;
         try {
             return await this.invokeTaskControlCommandModern(session, context, content);
         } catch (err) {
             const msg = this.extractAxiosError(err).toLowerCase();
-            // Fall through to legacy for "Invalid device" (Luba1/legacy devices) and
-            // "Access to this resource requires authentication" (shared-account devices).
-            // Legacy uses iotToken which is independent of the modern Bearer JWT.
-            if (!msg.includes('invalid device') && !msg.includes('access to this resource')) {
+            const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+            modernFailureWasRateLimit = status === 429 || msg.includes('status code 429');
+            modernFailureWasServerError = (status !== undefined && status >= 500 && status <= 599)
+                || /status code 5\d\d/.test(msg);
+            // Fall through to legacy for "Invalid device" (Luba1/legacy devices),
+            // "Access to this resource requires authentication" (shared-account devices),
+            // 429 (account-level rate limit on the modern endpoint - legacy uses a different
+            // endpoint with separate quota), and 5xx (transient cloud problems).
+            const shouldFallback =
+                msg.includes('invalid device')
+                || msg.includes('access to this resource')
+                || modernFailureWasRateLimit
+                || modernFailureWasServerError;
+            if (!shouldFallback) {
                 throw err;
             }
         }
 
         const wasKnown = this.legacyOnlyDevices.has(context.key);
-        this.legacyOnlyDevices.add(context.key);
+        // Only "structural" refusals (invalid device / access denied) prove the device permanently
+        // belongs on the legacy path. 429 and 5xx are transient, so do not cache the routing
+        // decision - the next command should retry modern first.
+        const cacheLegacyOnly = !modernFailureWasRateLimit && !modernFailureWasServerError;
+        if (cacheLegacyOnly) {
+            this.legacyOnlyDevices.add(context.key);
+        }
         const label = context.deviceName || context.iotId;
-        if (!wasKnown) {
+        if (modernFailureWasRateLimit) {
+            this.log.warn(
+                `Modern command path rate-limited (429) for ${label}; using Aliyun fallback for this command.`,
+            );
+        } else if (modernFailureWasServerError) {
+            this.log.warn(
+                `Modern command path returned server error for ${label}; using Aliyun fallback for this command.`,
+            );
+        } else if (!wasKnown) {
             this.log.info(
                 `Device ${label} requires the legacy/Aliyun command path. Subsequent commands will skip the modern attempt for this session.`,
             );
@@ -1969,7 +2000,19 @@ class Mammotion extends utils.Adapter {
     }
 
     private isRetryableCommandError(msg: string, err: unknown): boolean {
-        return this.isAuthError(err, msg) || msg.toLowerCase().includes('invalid device');
+        if (this.isAuthError(err, msg) || msg.toLowerCase().includes('invalid device')) {
+            return true;
+        }
+        // 429 and 5xx come from the modern endpoint when the account is rate-limited or the
+        // upstream is transiently broken. Both warrant a single retry (after the fallback
+        // has switched to the legacy Aliyun channel) instead of bubbling up to the operator.
+        if (axios.isAxiosError(err)) {
+            const status = err.response?.status;
+            if (status === 429 || (status !== undefined && status >= 500 && status <= 599)) {
+                return true;
+            }
+        }
+        return /status code (?:429|5\d\d)/.test(msg);
     }
 
     private isAuthError(err: unknown, msg: string): boolean {
@@ -2341,6 +2384,19 @@ class Mammotion extends utils.Adapter {
         const stalenessMs = 5 * 60 * 1000;
         const age = Date.now() - this.legacyLastDataAt;
         if (age <= stalenessMs) {
+            return;
+        }
+        // If the operator just sent a command, the cloud might be rate-limiting and the legacy
+        // poll responses naturally trail the active interaction. Skip this recovery cycle and
+        // try again on the next poll; either fresh data arrives or staleness keeps climbing
+        // until the user-activity window passes.
+        const commandActivityWindowMs = 30 * 1000;
+        if (this.lastCommandActivityAt && Date.now() - this.lastCommandActivityAt < commandActivityWindowMs) {
+            this.log.debug(
+                `Legacy polling: skipping staleness recovery (active command within last ${
+                    commandActivityWindowMs / 1000
+                }s).`,
+            );
             return;
         }
         void this.runDataStalenessRecovery(age);
