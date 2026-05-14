@@ -167,6 +167,11 @@ class Mammotion extends utils.Adapter {
     private legacyLastPollErrorMessage = '';
     private legacyStalenessRecoveryInFlight = false;
     private lastCommandActivityAt = 0;
+    // Per-device "do not re-hit the cloud for X ms" circuit breaker armed on 429.
+    // Maps deviceKey → unix-ms timestamp until which all invokes for this device fast-fail
+    // without an HTTP call. Independent of legacyOnlyDevices (which is about routing).
+    private rateLimitBackoffUntil = new Map<string, number>();
+    private readonly RATE_LIMIT_BACKOFF_MS = 30_000;
     private lastRealtimeMqttMessageAt = 0;
     private aliyunEnsureInFlight = false;
     private lastAliyunEnsureAt = 0;
@@ -278,6 +283,7 @@ class Mammotion extends utils.Adapter {
             this.classifiedAreaHashesByDevice.clear();
             this.zoneDiscoveryInFlight.clear();
             this.legacyOnlyDevices.clear();
+            this.rateLimitBackoffUntil.clear();
             this.lastAreaNameRequestAt.clear();
             this.jwtMqttRecentShortLifetimes = [];
             this.jwtMqttDisabledUntil = 0;
@@ -1772,15 +1778,27 @@ class Mammotion extends utils.Adapter {
         context: DeviceContext,
         content: string,
     ): Promise<string> {
-        // Tell the staleness watchdog that the operator is actively driving the device, so it
-        // does not pile a refreshSessionAndDeviceCache() on top of a possibly rate-limited account.
-        this.lastCommandActivityAt = Date.now();
+        // Per-device 429 circuit breaker: if the cloud told us to slow down within the last
+        // RATE_LIMIT_BACKOFF_MS window, fail fast WITHOUT making an HTTP call. This breaks
+        // the retry loop that would otherwise pile refreshSessionAndDeviceCache traffic on
+        // top of an already throttled account.
+        const backoffUntil = this.rateLimitBackoffUntil.get(context.key) ?? 0;
+        const now = Date.now();
+        if (backoffUntil > now) {
+            const remaining = Math.ceil((backoffUntil - now) / 1000);
+            throw new Error(`Cloud rate-limited (429); backing off for another ${remaining}s.`);
+        }
 
         // Once we have confirmed that the modern endpoint refuses this device for the current
         // session (typical for shared / legacy devices), skip the modern attempt entirely.
         // This both saves a round-trip and silences the repeating fallback log line.
         if (this.legacyOnlyDevices.has(context.key)) {
-            return this.invokeTaskControlCommandLegacy(session, context, content);
+            try {
+                return await this.invokeTaskControlCommandLegacy(session, context, content);
+            } catch (err) {
+                this.armRateLimitBackoffIfNeeded(context, err);
+                throw err;
+            }
         }
 
         let modernFailureWasRateLimit = false;
@@ -1803,6 +1821,7 @@ class Mammotion extends utils.Adapter {
                 || modernFailureWasRateLimit
                 || modernFailureWasServerError;
             if (!shouldFallback) {
+                this.armRateLimitBackoffIfNeeded(context, err);
                 throw err;
             }
         }
@@ -1831,10 +1850,38 @@ class Mammotion extends utils.Adapter {
         } else {
             this.log.debug(`Modern command path refused ${label}, using Aliyun fallback.`);
         }
-        return this.invokeTaskControlCommandLegacy(session, context, content);
+        try {
+            return await this.invokeTaskControlCommandLegacy(session, context, content);
+        } catch (err) {
+            this.armRateLimitBackoffIfNeeded(context, err);
+            throw err;
+        }
+    }
+
+    private armRateLimitBackoffIfNeeded(context: DeviceContext, err: unknown): void {
+        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+        const msg = this.extractAxiosError(err);
+        const is429 = status === 429 || /status code 429/.test(msg);
+        if (!is429) {
+            return;
+        }
+        const existingUntil = this.rateLimitBackoffUntil.get(context.key) ?? 0;
+        const newUntil = Date.now() + this.RATE_LIMIT_BACKOFF_MS;
+        // Only log the first arm in a window; refreshing the window from a follow-up 429 is silent.
+        if (existingUntil <= Date.now()) {
+            this.log.warn(
+                `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${
+                    this.RATE_LIMIT_BACKOFF_MS / 1000
+                }s.`,
+            );
+        }
+        this.rateLimitBackoffUntil.set(context.key, Math.max(existingUntil, newUntil));
     }
 
     private async executeTaskControlCommand(context: DeviceContext, command: DeviceCommand): Promise<string> {
+        // Mark user-driven control activity so the staleness watchdog yields to it.
+        // Background syncs (executeEncodedContentCommand) intentionally do NOT bump this.
+        this.lastCommandActivityAt = Date.now();
         const session = await this.ensureValidSession(!this.cloudConnected);
         const content = this.buildTaskControlContent(session, context, command);
         try {
@@ -1856,6 +1903,7 @@ class Mammotion extends utils.Adapter {
     }
 
     private async executeTaskSettingsCommand(context: DeviceContext, cutHeightMm: number, mowSpeedMs: number): Promise<string> {
+        this.lastCommandActivityAt = Date.now();
         const session = await this.ensureValidSession(!this.cloudConnected);
         try {
             const bladeContent = this.buildSetBladeHeightContent(session, cutHeightMm);
@@ -2003,16 +2051,20 @@ class Mammotion extends utils.Adapter {
         if (this.isAuthError(err, msg) || msg.toLowerCase().includes('invalid device')) {
             return true;
         }
-        // 429 and 5xx come from the modern endpoint when the account is rate-limited or the
-        // upstream is transiently broken. Both warrant a single retry (after the fallback
-        // has switched to the legacy Aliyun channel) instead of bubbling up to the operator.
+        // 5xx is transient on the cloud side - one re-login retry is worthwhile.
+        // 429 is intentionally NOT retryable: it means "you are sending too fast", so
+        // immediately running refreshSessionAndDeviceCache + a second invoke only adds
+        // load to an already throttled account. The fallback inside
+        // invokeTaskControlCommandWithFallback has already routed this attempt through the
+        // legacy channel; let the caller see the failure and back off naturally instead of
+        // amplifying it.
         if (axios.isAxiosError(err)) {
             const status = err.response?.status;
-            if (status === 429 || (status !== undefined && status >= 500 && status <= 599)) {
+            if (status !== undefined && status >= 500 && status <= 599) {
                 return true;
             }
         }
-        return /status code (?:429|5\d\d)/.test(msg);
+        return /status code 5\d\d/.test(msg);
     }
 
     private isAuthError(err: unknown, msg: string): boolean {
