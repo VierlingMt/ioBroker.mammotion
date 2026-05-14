@@ -11,6 +11,42 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 _No unreleased changes._
 
+## [0.0.15] – 2026-05-14
+
+### Fixed
+- **Hotfix for 0.0.14: 429 retry storm on rate-limited accounts.** User report on 0.0.14
+  showed `Command request-iot-sync first attempt failed (Request failed with status code 429), new login + retry`
+  repeating every 5-6 seconds.
+
+  Root cause: 0.0.14 added 429 to `isRetryableCommandError` so the existing re-login retry
+  could absorb transient throttling. On accounts where the modern API rate-limits AND the
+  legacy/Aliyun command endpoint also returns 429 (account-level throttle), every retry
+  called `refreshSessionAndDeviceCache` (login + device list + records + bindings = ~3-4
+  extra HTTP calls), then re-invoked the command, which 429'd again. Each background
+  `requestIotSync` produced one warn line and made the throttling worse.
+
+  Two-part fix:
+  1. **Remove 429 from `isRetryableCommandError`.** 5xx stays retryable (transient server
+     side), but 429 means "you are sending too fast" - retrying with a session refresh is
+     the opposite of what you want. The fallback inside `invokeTaskControlCommandWithFallback`
+     already routes the attempt through the legacy channel once; if that also 429s, surface
+     the failure and let the natural call cadence give the cloud a chance to recover.
+  2. **Per-device 429 circuit breaker.** New `rateLimitBackoffUntil: Map<deviceKey, unix-ms>`
+     and `RATE_LIMIT_BACKOFF_MS = 30_000`. Whenever an invoke fails with 429 (either modern
+     or legacy path), the breaker arms for 30 s on that device. While armed, every
+     subsequent invoke for that device fast-fails locally with
+     `Cloud rate-limited (429); backing off for another Xs.` - no HTTP call, no
+     `refreshSessionAndDeviceCache`, no log spam beyond a single warn at arm-time. The
+     breaker resets on adapter unload.
+
+### Changed
+- **`lastCommandActivityAt` is only bumped by user-driven entry points** now -
+  `executeTaskControlCommand` and `executeTaskSettingsCommand`. The previous placement
+  inside `invokeTaskControlCommandWithFallback` also fired for background syncs
+  (`requestIotSync`, area-name requests etc.), which meant the 0.0.13 staleness watchdog
+  was effectively disabled whenever a background sync was failing in a loop (the
+  30-second active-command window kept getting renewed by the failing syncs themselves).
+
 ## [0.0.14] – 2026-05-14
 
 ### Fixed

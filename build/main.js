@@ -178,6 +178,11 @@ class Mammotion extends utils.Adapter {
   legacyLastPollErrorMessage = "";
   legacyStalenessRecoveryInFlight = false;
   lastCommandActivityAt = 0;
+  // Per-device "do not re-hit the cloud for X ms" circuit breaker armed on 429.
+  // Maps deviceKey → unix-ms timestamp until which all invokes for this device fast-fail
+  // without an HTTP call. Independent of legacyOnlyDevices (which is about routing).
+  rateLimitBackoffUntil = /* @__PURE__ */ new Map();
+  RATE_LIMIT_BACKOFF_MS = 3e4;
   lastRealtimeMqttMessageAt = 0;
   aliyunEnsureInFlight = false;
   lastAliyunEnsureAt = 0;
@@ -282,6 +287,7 @@ class Mammotion extends utils.Adapter {
       this.classifiedAreaHashesByDevice.clear();
       this.zoneDiscoveryInFlight.clear();
       this.legacyOnlyDevices.clear();
+      this.rateLimitBackoffUntil.clear();
       this.lastAreaNameRequestAt.clear();
       this.jwtMqttRecentShortLifetimes = [];
       this.jwtMqttDisabledUntil = 0;
@@ -1561,10 +1567,20 @@ class Mammotion extends utils.Adapter {
     return ((_d = response.data) == null ? void 0 : _d.result) || "ok";
   }
   async invokeTaskControlCommandWithFallback(session, context, content) {
-    var _a;
-    this.lastCommandActivityAt = Date.now();
+    var _a, _b;
+    const backoffUntil = (_a = this.rateLimitBackoffUntil.get(context.key)) != null ? _a : 0;
+    const now = Date.now();
+    if (backoffUntil > now) {
+      const remaining = Math.ceil((backoffUntil - now) / 1e3);
+      throw new Error(`Cloud rate-limited (429); backing off for another ${remaining}s.`);
+    }
     if (this.legacyOnlyDevices.has(context.key)) {
-      return this.invokeTaskControlCommandLegacy(session, context, content);
+      try {
+        return await this.invokeTaskControlCommandLegacy(session, context, content);
+      } catch (err) {
+        this.armRateLimitBackoffIfNeeded(context, err);
+        throw err;
+      }
     }
     let modernFailureWasRateLimit = false;
     let modernFailureWasServerError = false;
@@ -1572,11 +1588,12 @@ class Mammotion extends utils.Adapter {
       return await this.invokeTaskControlCommandModern(session, context, content);
     } catch (err) {
       const msg = this.extractAxiosError(err).toLowerCase();
-      const status = import_axios.default.isAxiosError(err) ? (_a = err.response) == null ? void 0 : _a.status : void 0;
+      const status = import_axios.default.isAxiosError(err) ? (_b = err.response) == null ? void 0 : _b.status : void 0;
       modernFailureWasRateLimit = status === 429 || msg.includes("status code 429");
       modernFailureWasServerError = status !== void 0 && status >= 500 && status <= 599 || /status code 5\d\d/.test(msg);
       const shouldFallback = msg.includes("invalid device") || msg.includes("access to this resource") || modernFailureWasRateLimit || modernFailureWasServerError;
       if (!shouldFallback) {
+        this.armRateLimitBackoffIfNeeded(context, err);
         throw err;
       }
     }
@@ -1601,9 +1618,32 @@ class Mammotion extends utils.Adapter {
     } else {
       this.log.debug(`Modern command path refused ${label}, using Aliyun fallback.`);
     }
-    return this.invokeTaskControlCommandLegacy(session, context, content);
+    try {
+      return await this.invokeTaskControlCommandLegacy(session, context, content);
+    } catch (err) {
+      this.armRateLimitBackoffIfNeeded(context, err);
+      throw err;
+    }
+  }
+  armRateLimitBackoffIfNeeded(context, err) {
+    var _a, _b;
+    const status = import_axios.default.isAxiosError(err) ? (_a = err.response) == null ? void 0 : _a.status : void 0;
+    const msg = this.extractAxiosError(err);
+    const is429 = status === 429 || /status code 429/.test(msg);
+    if (!is429) {
+      return;
+    }
+    const existingUntil = (_b = this.rateLimitBackoffUntil.get(context.key)) != null ? _b : 0;
+    const newUntil = Date.now() + this.RATE_LIMIT_BACKOFF_MS;
+    if (existingUntil <= Date.now()) {
+      this.log.warn(
+        `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${this.RATE_LIMIT_BACKOFF_MS / 1e3}s.`
+      );
+    }
+    this.rateLimitBackoffUntil.set(context.key, Math.max(existingUntil, newUntil));
   }
   async executeTaskControlCommand(context, command) {
+    this.lastCommandActivityAt = Date.now();
     const session = await this.ensureValidSession(!this.cloudConnected);
     const content = this.buildTaskControlContent(session, context, command);
     try {
@@ -1623,6 +1663,7 @@ class Mammotion extends utils.Adapter {
     }
   }
   async executeTaskSettingsCommand(context, cutHeightMm, mowSpeedMs) {
+    this.lastCommandActivityAt = Date.now();
     const session = await this.ensureValidSession(!this.cloudConnected);
     try {
       const bladeContent = this.buildSetBladeHeightContent(session, cutHeightMm);
@@ -1749,11 +1790,11 @@ class Mammotion extends utils.Adapter {
     }
     if (import_axios.default.isAxiosError(err)) {
       const status = (_a = err.response) == null ? void 0 : _a.status;
-      if (status === 429 || status !== void 0 && status >= 500 && status <= 599) {
+      if (status !== void 0 && status >= 500 && status <= 599) {
         return true;
       }
     }
-    return /status code (?:429|5\d\d)/.test(msg);
+    return /status code 5\d\d/.test(msg);
   }
   isAuthError(err, msg) {
     var _a;
