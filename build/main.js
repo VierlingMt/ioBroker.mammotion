@@ -177,6 +177,7 @@ class Mammotion extends utils.Adapter {
   legacyEmptyPollWarned = false;
   legacyLastPollErrorMessage = "";
   legacyStalenessRecoveryInFlight = false;
+  lastCommandActivityAt = 0;
   lastRealtimeMqttMessageAt = 0;
   aliyunEnsureInFlight = false;
   lastAliyunEnsureAt = 0;
@@ -1560,21 +1561,40 @@ class Mammotion extends utils.Adapter {
     return ((_d = response.data) == null ? void 0 : _d.result) || "ok";
   }
   async invokeTaskControlCommandWithFallback(session, context, content) {
+    var _a;
+    this.lastCommandActivityAt = Date.now();
     if (this.legacyOnlyDevices.has(context.key)) {
       return this.invokeTaskControlCommandLegacy(session, context, content);
     }
+    let modernFailureWasRateLimit = false;
+    let modernFailureWasServerError = false;
     try {
       return await this.invokeTaskControlCommandModern(session, context, content);
     } catch (err) {
       const msg = this.extractAxiosError(err).toLowerCase();
-      if (!msg.includes("invalid device") && !msg.includes("access to this resource")) {
+      const status = import_axios.default.isAxiosError(err) ? (_a = err.response) == null ? void 0 : _a.status : void 0;
+      modernFailureWasRateLimit = status === 429 || msg.includes("status code 429");
+      modernFailureWasServerError = status !== void 0 && status >= 500 && status <= 599 || /status code 5\d\d/.test(msg);
+      const shouldFallback = msg.includes("invalid device") || msg.includes("access to this resource") || modernFailureWasRateLimit || modernFailureWasServerError;
+      if (!shouldFallback) {
         throw err;
       }
     }
     const wasKnown = this.legacyOnlyDevices.has(context.key);
-    this.legacyOnlyDevices.add(context.key);
+    const cacheLegacyOnly = !modernFailureWasRateLimit && !modernFailureWasServerError;
+    if (cacheLegacyOnly) {
+      this.legacyOnlyDevices.add(context.key);
+    }
     const label = context.deviceName || context.iotId;
-    if (!wasKnown) {
+    if (modernFailureWasRateLimit) {
+      this.log.warn(
+        `Modern command path rate-limited (429) for ${label}; using Aliyun fallback for this command.`
+      );
+    } else if (modernFailureWasServerError) {
+      this.log.warn(
+        `Modern command path returned server error for ${label}; using Aliyun fallback for this command.`
+      );
+    } else if (!wasKnown) {
       this.log.info(
         `Device ${label} requires the legacy/Aliyun command path. Subsequent commands will skip the modern attempt for this session.`
       );
@@ -1723,7 +1743,17 @@ class Mammotion extends utils.Adapter {
     }
   }
   isRetryableCommandError(msg, err) {
-    return this.isAuthError(err, msg) || msg.toLowerCase().includes("invalid device");
+    var _a;
+    if (this.isAuthError(err, msg) || msg.toLowerCase().includes("invalid device")) {
+      return true;
+    }
+    if (import_axios.default.isAxiosError(err)) {
+      const status = (_a = err.response) == null ? void 0 : _a.status;
+      if (status === 429 || status !== void 0 && status >= 500 && status <= 599) {
+        return true;
+      }
+    }
+    return /status code (?:429|5\d\d)/.test(msg);
   }
   isAuthError(err, msg) {
     var _a;
@@ -2025,6 +2055,13 @@ class Mammotion extends utils.Adapter {
     const stalenessMs = 5 * 60 * 1e3;
     const age = Date.now() - this.legacyLastDataAt;
     if (age <= stalenessMs) {
+      return;
+    }
+    const commandActivityWindowMs = 30 * 1e3;
+    if (this.lastCommandActivityAt && Date.now() - this.lastCommandActivityAt < commandActivityWindowMs) {
+      this.log.debug(
+        `Legacy polling: skipping staleness recovery (active command within last ${commandActivityWindowMs / 1e3}s).`
+      );
       return;
     }
     void this.runDataStalenessRecovery(age);

@@ -11,6 +11,30 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 _No unreleased changes._
 
+## [0.0.14] – 2026-05-14
+
+### Fixed
+- **`status code 429` from the modern cloud no longer kills control commands.**
+  Reported case: `Command resume for Luba-VPKC532K failed: Request failed with status code 429`.
+  The modern endpoint `POST {iotDomain}/v1/mqtt/rpc/thing/service/invoke` rate-limits the
+  account, but the legacy/Aliyun command endpoint uses a separate quota and was already
+  available — the fallback in `invokeTaskControlCommandWithFallback` simply did not list 429
+  as a fallback trigger. Now both `429` and `5xx` responses (axios status or message match)
+  fall through to the legacy path. Routing decisions for transient failures (429, 5xx) are
+  not cached in `legacyOnlyDevices`, so the next command still attempts modern first.
+- **Re-login retry now covers 429/5xx too.** `isRetryableCommandError` previously only
+  considered 401/403 and "invalid device". After the fallback, if the retry path runs, 429
+  and 5xx are now classified retryable so the existing re-login + retry chain in
+  `executeTaskControlCommand` absorbs a transient failure instead of bubbling it up.
+
+### Changed
+- **Staleness recovery yields to active commands.** The 0.0.13 data-staleness watchdog
+  (`maybeRecoverFromDataStaleness`) tracks `lastCommandActivityAt` (set at the entry of
+  `invokeTaskControlCommandWithFallback`) and skips the heavy session/MQTT refresh if a
+  command was sent within the last 30 seconds. Avoids piling additional refresh traffic on
+  top of an account that the cloud is already throttling, which would only make 429
+  fallout worse.
+
 ## [0.0.13] – 2026-05-13
 
 ### Added
