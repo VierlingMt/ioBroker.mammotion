@@ -8,6 +8,7 @@ declare global {
             password: string;
             deviceUuid: string;
             legacyPollIntervalSec: number;
+            healthStaleThresholdMin: number;
             legacyTelemetryTransport: 'poll' | 'mqtt';
             storeDebugPayloads: boolean;
             aliyunMqttUseTls: boolean;

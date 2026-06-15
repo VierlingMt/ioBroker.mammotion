@@ -130,6 +130,13 @@ const YUKA_MINI_ROUTE_CHANNEL_WIDTH_MIN_CM = 8;
 const YUKA_MINI_ROUTE_CHANNEL_WIDTH_MAX_CM = 12;
 const ACTIVE_DEVICE_STATES = new Set<number>([13, 14, 19, 20, 31, 32, 34, 35, 36, 37, 38]);
 const IDLE_DEVICE_STATES = new Set<number>([0, 1, 2, 8, 10, 11, 12, 15, 16, 17, 22, 23, 39]);
+// Health detection: states where a device sitting still for a long time is normal
+// (docked, charging, idle, updating) and must NOT raise a staleness problem.
+const HEALTH_BENIGN_IDLE_STATES = new Set<number>([0, 1, 10, 11, 15, 16, 22, 39]);
+// States that are themselves a problem the moment the cloud reports them.
+const HEALTH_FAULT_STATES = new Set<number>([2, 8, 12, 23, 37]);
+const HEALTH_CHECK_INTERVAL_MS = 60_000;
+const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1000;
 const AREA_NAME_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000];
 const AREA_NAME_REREQUEST_MIN_INTERVAL_MS = 60_000;
@@ -151,6 +158,11 @@ class Mammotion extends utils.Adapter {
     private authFailureSince = 0;
     private reconnectTimer: NodeJS.Timeout | null = null;
     private legacyPollTimer: NodeJS.Timeout | null = null;
+    private healthCheckTimer: NodeJS.Timeout | null = null;
+    // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
+    private deviceHealthSnapshots = new Map<string, { fingerprint: string; lastChangeAt: number }>();
+    // Per-device current health-problem flag, used to log only on transitions.
+    private deviceHealthProblem = new Map<string, boolean>();
     private legacyLastPollAt = 0;
     private taskSettingsAutoApplyTimers = new Map<string, NodeJS.Timeout>();
     private routeAutoApplyTimers = new Map<string, NodeJS.Timeout>();
@@ -223,6 +235,7 @@ class Mammotion extends utils.Adapter {
         await this.ensureBaseStates();
         await this.updateConnectionStates();
         this.startReconnectTimer();
+        this.startHealthCheckTimer();
 
         if (!this.config.email || !this.config.password) {
             this.log.warn('Please enter the Mammotion app email and password in the adapter settings.');
@@ -272,6 +285,12 @@ class Mammotion extends utils.Adapter {
                 clearInterval(this.reconnectTimer);
                 this.reconnectTimer = null;
             }
+            if (this.healthCheckTimer) {
+                clearInterval(this.healthCheckTimer);
+                this.healthCheckTimer = null;
+            }
+            this.deviceHealthSnapshots.clear();
+            this.deviceHealthProblem.clear();
             this.clearAutoApplyTimers(this.taskSettingsAutoApplyTimers);
             this.clearAutoApplyTimers(this.routeAutoApplyTimers);
             this.clearAutoApplyTimers(this.nonWorkAutoApplyTimers);
@@ -2555,6 +2574,98 @@ class Mammotion extends utils.Adapter {
             }
         }
         return null;
+    }
+
+    private getHealthStaleThresholdMs(): number {
+        const raw = Number(this.config.healthStaleThresholdMin);
+        const minutes = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HEALTH_STALE_THRESHOLD_MIN;
+        return minutes * 60_000;
+    }
+
+    private startHealthCheckTimer(): void {
+        if (this.healthCheckTimer) {
+            clearInterval(this.healthCheckTimer);
+        }
+        this.healthCheckTimer = setInterval(() => {
+            void this.runHealthCheck();
+        }, HEALTH_CHECK_INTERVAL_MS);
+    }
+
+    private async runHealthCheck(): Promise<void> {
+        if (!this.deviceContexts.size) {
+            return;
+        }
+        for (const ctx of this.deviceContexts.values()) {
+            try {
+                await this.evaluateDeviceHealth(ctx.key);
+            } catch (err) {
+                this.log.debug(`[HEALTH] Evaluation failed for ${ctx.key}: ${(err as Error).message}`);
+            }
+        }
+    }
+
+    /**
+     * Robust problem detection that does NOT rely on telemetry.connected / telemetry.lastUpdate,
+     * because both reflect the adapter<->cloud link (they tick on every poll even when the robot
+     * is off). Instead we watch whether the *real* robot values actually change and judge the
+     * reported deviceState. A robot stuck in a non-resting state (e.g. PAUSE) with no value change
+     * for longer than the configured threshold is flagged as a problem.
+     */
+    private async evaluateDeviceHealth(deviceKey: string): Promise<void> {
+        const channelId = `devices.${deviceKey}`;
+        const [deviceStateRaw, batteryRaw, latRaw, lonRaw] = await Promise.all([
+            this.getStateAsync(`${channelId}.telemetry.deviceState`),
+            this.getStateAsync(`${channelId}.telemetry.batteryPercent`),
+            this.getStateAsync(`${channelId}.telemetry.latitude`),
+            this.getStateAsync(`${channelId}.telemetry.longitude`),
+        ]);
+
+        const deviceState = this.asNumericStateValue(deviceStateRaw?.val);
+        // No telemetry observed yet: nothing meaningful to judge.
+        if (deviceState === null) {
+            return;
+        }
+
+        const now = Date.now();
+        const fingerprint = JSON.stringify([
+            deviceState,
+            this.asNumericStateValue(batteryRaw?.val),
+            this.asNumericStateValue(latRaw?.val),
+            this.asNumericStateValue(lonRaw?.val),
+        ]);
+
+        let snapshot = this.deviceHealthSnapshots.get(deviceKey);
+        if (!snapshot || snapshot.fingerprint !== fingerprint) {
+            snapshot = { fingerprint, lastChangeAt: now };
+            this.deviceHealthSnapshots.set(deviceKey, snapshot);
+            await this.setStateChangedAsync(`${channelId}.telemetry.lastRealChange`, now, true);
+        }
+
+        const stalenessMs = now - snapshot.lastChangeAt;
+        const thresholdMs = this.getHealthStaleThresholdMs();
+        const stateName = WORK_MODE_NAMES[deviceState] ?? `STATE_${deviceState}`;
+
+        let problem = false;
+        let reason = '';
+        if (HEALTH_FAULT_STATES.has(deviceState)) {
+            problem = true;
+            reason = `Device reports state ${stateName}`;
+        } else if (!HEALTH_BENIGN_IDLE_STATES.has(deviceState) && stalenessMs > thresholdMs) {
+            problem = true;
+            const stalledMin = Math.round(stalenessMs / 60_000);
+            reason = `No telemetry change for ${stalledMin} min while state is ${stateName}`;
+        }
+
+        const wasProblem = this.deviceHealthProblem.get(deviceKey) === true;
+        if (problem && !wasProblem) {
+            this.log.warn(`[HEALTH] ${deviceKey}: ${reason}`);
+        } else if (!problem && wasProblem) {
+            this.log.info(`[HEALTH] ${deviceKey}: telemetry healthy again (state: ${stateName}).`);
+        }
+        this.deviceHealthProblem.set(deviceKey, problem);
+
+        await this.setStateChangedAsync(`${channelId}.telemetry.healthProblem`, problem, true);
+        await this.setStateChangedAsync(`${channelId}.telemetry.healthReason`, problem ? reason : '', true);
     }
 
     private async pollLegacyTelemetry(): Promise<boolean> {
@@ -5105,6 +5216,18 @@ class Mammotion extends utils.Adapter {
             this.createReadonlyState('Last protobuf content (base64, debug)', 'string', 'text'),
         );
         await this.setObjectNotExistsAsync(`${channelId}.telemetry.lastUpdate`, this.createReadonlyState('Last telemetry timestamp', 'number', 'value.time'));
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.lastRealChange`,
+            this.createReadonlyState('Last real telemetry change', 'number', 'value.time'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.healthProblem`,
+            this.createReadonlyState('Telemetry health problem', 'boolean', 'indicator.maintenance'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.healthReason`,
+            this.createReadonlyState('Telemetry health reason', 'string', 'text'),
+        );
         await this.setObjectNotExistsAsync(`${channelId}.telemetry.firmwareVersion`, this.createReadonlyState('Firmware version', 'string', 'text'));
         await this.setObjectNotExistsAsync(`${channelId}.telemetry.wifiRssi`, this.createReadonlyState('WiFi RSSI', 'number', 'value'));
         await this.setObjectNotExistsAsync(`${channelId}.telemetry.totalWorkTimeSec`, this.createReadonlyState('Total work time (seconds)', 'number', 'value.interval'));

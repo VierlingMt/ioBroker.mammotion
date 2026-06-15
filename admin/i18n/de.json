@@ -8,6 +8,8 @@
     "deviceUuidHint": "Standardwert lassen, ausser du willst deine eigene Device-ID nachbilden",
     "legacyPollIntervalSec": "Legacy Poll Intervall (s)",
     "legacyPollIntervalSecHint": "Nur bei Legacy/Aliyun-Telemetrie aktiv. Bereich: 10-300 Sekunden.",
+    "healthStaleThresholdMin": "Health: Stillstands-Schwelle (Min)",
+    "healthStaleThresholdMinHint": "Bleibt der Roboter laenger als hier angegeben in einem Nicht-Ruhezustand (z. B. PAUSE) ohne echte Wertaenderung, wird telemetry.healthProblem gesetzt. Laden/Dock/Bereit loesen nie aus. Bereich: 5-1440 Minuten.",
     "legacyTelemetryTransport": "Legacy Telemetrie-Transport",
     "legacyTelemetryTransportHint": "MQTT Push ist experimentell; Polling wird aktuell empfohlen.",
     "legacyTelemetryTransportPoll": "Polling (stabil)",

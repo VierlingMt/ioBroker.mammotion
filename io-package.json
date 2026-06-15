@@ -251,6 +251,7 @@
     "password": "",
     "deviceUuid": "A9D0F177-F701-4212-8676-EDF9B354AE48",
     "legacyPollIntervalSec": 30,
+    "healthStaleThresholdMin": 60,
     "legacyTelemetryTransport": "poll",
     "storeDebugPayloads": false,
     "aliyunMqttUseTls": false,

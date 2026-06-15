@@ -48,6 +48,20 @@
             "lg": 4,
             "xl": 4
         },
+        "healthStaleThresholdMin": {
+            "type": "number",
+            "label": "healthStaleThresholdMin",
+            "hint": "healthStaleThresholdMinHint",
+            "newLine": true,
+            "min": 5,
+            "max": 1440,
+            "step": 1,
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
+        },
         "legacyTelemetryTransport": {
             "type": "select",
             "label": "legacyTelemetryTransport",
