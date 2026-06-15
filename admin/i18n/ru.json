@@ -7,6 +7,8 @@
     "deviceUuidHint": "Leave default unless you want to mimic your own device id",
     "legacyPollIntervalSec": "Legacy poll interval (s)",
     "legacyPollIntervalSecHint": "Only used for legacy/Aliyun telemetry. Range: 10-300 seconds.",
+    "healthStaleThresholdMin": "Состояние: порог простоя (мин)",
+    "healthStaleThresholdMinHint": "Если робот дольше указанного времени остаётся в нерабочем состоянии (например, PAUSE) без реальных изменений значений, устанавливается telemetry.healthProblem. Состояния зарядки/дока/ожидания его никогда не вызывают. Диапазон: 5-1440 минут.",
     "legacyTelemetryTransport": "Legacy telemetry transport",
     "legacyTelemetryTransportHint": "MQTT push is experimental; polling is currently recommended.",
     "legacyTelemetryTransportPoll": "Polling (stable)",

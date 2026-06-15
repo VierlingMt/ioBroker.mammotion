@@ -9,7 +9,16 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- **Robust problem detection (`telemetry.healthProblem` / `telemetry.healthReason` / `telemetry.lastRealChange`).**
+  `telemetry.connected` and `telemetry.lastUpdate` reflect the adapter<->cloud link only: `lastUpdate`
+  is rewritten to `Date.now()` on every poll and `connected` mirrors the cloud's cached online flag, so
+  both keep looking "ok" even when the robot is switched off. The new states judge the *real* robot data
+  instead: `lastRealChange` records when a real value (deviceState, battery, coordinates) last actually
+  changed, and `healthProblem` is raised when the robot is in a non-resting state (e.g. PAUSE) without any
+  change for longer than the configurable threshold, or when the cloud reports an explicit fault state
+  (OFFLINE/UNCONNECTED/DISABLE/LOCATION_ERROR/OTA_UPGRADE_FAIL). Charging/docked/idle states never trigger it.
+  New instance option `healthStaleThresholdMin` (default 60 minutes).
 
 ## [0.0.15] – 2026-05-14
 
