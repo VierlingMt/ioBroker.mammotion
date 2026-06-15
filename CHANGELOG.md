@@ -9,6 +9,10 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
+_No unreleased changes._
+
+## [0.0.16] – 2026-06-15
+
 ### Added
 - **Robust problem detection (`telemetry.healthProblem` / `telemetry.healthReason` / `telemetry.lastRealChange`).**
   `telemetry.connected` and `telemetry.lastUpdate` reflect the adapter<->cloud link only: `lastUpdate`
