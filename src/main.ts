@@ -5,6 +5,7 @@
 import * as utils from '@iobroker/adapter-core';
 import axios, { AxiosError } from 'axios';
 import { createHash, createHmac, randomInt } from 'node:crypto';
+import { mergeDeviceRecords, resolveDeviceListRefresh } from './lib/device-list';
 import {
     LUBA_PRO_PRODUCT_KEYS,
     YUKA_MINI_PRODUCT_KEYS,
@@ -1990,30 +1991,60 @@ class Mammotion extends utils.Adapter {
     private async refreshSessionAndDeviceCache(): Promise<void> {
         const session = await this.ensureValidSession(true);
 
-        // Modern APIs may not return shared devices (owned: 0) – make resilient
+        // Modern APIs may not return shared devices (owned: 0) – make resilient.
+        // Every request failure is remembered: an empty result is only trusted when all
+        // requests succeeded (see resolveDeviceListRefresh).
+        const fetchErrors: string[] = [];
         let devices: MammotionDevice[] = [];
         try {
             devices = await this.fetchDeviceList(session);
         } catch (err) {
-            this.log.debug(`Modern device list unavailable: ${this.extractAxiosError(err)}`);
+            const msg = this.extractAxiosError(err);
+            fetchErrors.push(`device list: ${msg}`);
+            this.log.debug(`Modern device list unavailable: ${msg}`);
         }
 
         let modernRecords: DeviceRecord[] = [];
         try {
             modernRecords = await this.fetchDeviceRecords(session);
         } catch (err) {
-            this.log.debug(`Modern device records unavailable: ${this.extractAxiosError(err)}`);
+            const msg = this.extractAxiosError(err);
+            fetchErrors.push(`device records: ${msg}`);
+            this.log.debug(`Modern device records unavailable: ${msg}`);
         }
 
         // Legacy bindings always fetched – shared devices (owned: 0) only appear here
         const legacyRecords = await this.fetchLegacyDeviceRecords(session);
+        if (legacyRecords === null) {
+            fetchErrors.push('legacy bindings');
+        }
 
         // Merge: modern records first, add legacy entries not already covered
-        const modernIotIds = new Set(modernRecords.map(r => r.iotId).filter(Boolean));
-        const records = [
-            ...modernRecords,
-            ...legacyRecords.filter(r => r.iotId && !modernIotIds.has(r.iotId)),
-        ];
+        const records = mergeDeviceRecords(modernRecords, legacyRecords ?? []);
+
+        const decision = resolveDeviceListRefresh({
+            recordCount: records.length,
+            fetchFailed: fetchErrors.length > 0,
+            cachedCount: this.deviceContexts.size,
+        });
+
+        if (decision === 'keep-cached') {
+            // A transient cloud failure (e.g. a short internet outage) returned no devices.
+            // Do NOT wipe the cache: the adapter only polls devices it knows about, so an empty
+            // cache would silently stop telemetry until the next adapter restart.
+            const msg = `Device list refresh returned no devices (${fetchErrors.join('; ')})`;
+            this.log.warn(`${msg} - keeping ${this.deviceContexts.size} cached device(s), polling continues.`);
+            await this.setStateChangedAsync('info.lastError', msg, true);
+            await this.setStateChangedAsync('info.deviceCount', this.deviceContexts.size, true);
+            return;
+        }
+
+        if (decision === 'unavailable') {
+            // Nothing cached and the cloud could not be asked: fail the refresh so the caller's
+            // error path (markAuthFailure -> reconnectIfAllowed) retries instead of settling on
+            // "0 devices" forever.
+            throw new Error(`Device list unavailable (${fetchErrors.join('; ')})`);
+        }
 
         if (!records.length) {
             this.log.warn('No devices found (neither modern nor legacy). Is a shared device configured?');
@@ -2179,7 +2210,11 @@ class Mammotion extends utils.Adapter {
         }
     }
 
-    private async fetchLegacyDeviceRecords(session: AuthSession): Promise<DeviceRecord[]> {
+    /**
+     * Returns the legacy (Aliyun) device bindings, or `null` when the request failed.
+     * `null` lets the caller distinguish "the cloud reported no devices" from "we could not ask".
+     */
+    private async fetchLegacyDeviceRecords(session: AuthSession): Promise<DeviceRecord[] | null> {
         try {
             const legacy = await this.ensureLegacySession(session);
             const bindings = await this.fetchLegacyBindings(legacy);
@@ -2195,7 +2230,7 @@ class Mammotion extends utils.Adapter {
                 }));
         } catch (err) {
             this.log.warn(`Legacy bindings could not be loaded: ${this.extractAxiosError(err)}`);
-            return [];
+            return null;
         }
     }
 
