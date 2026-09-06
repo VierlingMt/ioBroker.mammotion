@@ -9,7 +9,27 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Fixed
+- **Adapter went silent after a failed device-list refresh.** When a device-list refresh (daily restart,
+  staleness recovery, command retry) hit a transient cloud failure such as a short internet outage, the
+  legacy bindings request failed, the merged device list came back empty and `syncDevices` replaced the
+  cache with that empty list. With no cached devices the adapter stopped legacy polling, `info.deviceCount`
+  dropped to 0 and `info.connection` stayed `true`, so the reconnect watchdog never fired. The adapter then
+  produced no telemetry and no log line until the next scheduled restart (observed: 14 hours of silence while
+  the mower was working normally).
+
+  `refreshSessionAndDeviceCache` now records which requests failed and only trusts an empty result when every
+  request succeeded. If a request failed and devices are cached, the cache is kept, polling continues and
+  `info.lastError` names the failed requests. If a request failed and nothing is cached, the refresh throws so
+  the existing error path (`markAuthFailure` -> `reconnectIfAllowed`) retries instead of settling on
+  "0 devices". A genuinely empty account still syncs to zero devices as before. The decision logic lives in
+  `src/lib/device-list.ts` and is unit-tested.
+
+### Changed
+- `npm run check` and the build-time type-check work again with TypeScript 6: the root `tsconfig.json` now
+  lists `types: ["node", "mocha"]` explicitly (TypeScript 6 stopped including every `@types/*` package
+  automatically) and enables `rewriteRelativeImportExtensions` so `*.test.ts` files can import sibling
+  modules with a `.ts` extension, which the native type-stripping loader of Node 22+/24 requires.
 
 ## [0.0.16] – 2026-06-15
 

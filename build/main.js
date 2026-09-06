@@ -24,6 +24,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 var utils = __toESM(require("@iobroker/adapter-core"));
 var import_axios = __toESM(require("axios"));
 var import_node_crypto = require("node:crypto");
+var import_device_list = require("./lib/device-list");
 var import_product_keys = require("./lib/product-keys");
 const mqtt = require("mqtt");
 const MAMMOTION_DOMAIN = "https://id.mammotion.com";
@@ -1738,24 +1739,43 @@ class Mammotion extends utils.Adapter {
   }
   async refreshSessionAndDeviceCache() {
     const session = await this.ensureValidSession(true);
+    const fetchErrors = [];
     let devices = [];
     try {
       devices = await this.fetchDeviceList(session);
     } catch (err) {
-      this.log.debug(`Modern device list unavailable: ${this.extractAxiosError(err)}`);
+      const msg = this.extractAxiosError(err);
+      fetchErrors.push(`device list: ${msg}`);
+      this.log.debug(`Modern device list unavailable: ${msg}`);
     }
     let modernRecords = [];
     try {
       modernRecords = await this.fetchDeviceRecords(session);
     } catch (err) {
-      this.log.debug(`Modern device records unavailable: ${this.extractAxiosError(err)}`);
+      const msg = this.extractAxiosError(err);
+      fetchErrors.push(`device records: ${msg}`);
+      this.log.debug(`Modern device records unavailable: ${msg}`);
     }
     const legacyRecords = await this.fetchLegacyDeviceRecords(session);
-    const modernIotIds = new Set(modernRecords.map((r) => r.iotId).filter(Boolean));
-    const records = [
-      ...modernRecords,
-      ...legacyRecords.filter((r) => r.iotId && !modernIotIds.has(r.iotId))
-    ];
+    if (legacyRecords === null) {
+      fetchErrors.push("legacy bindings");
+    }
+    const records = (0, import_device_list.mergeDeviceRecords)(modernRecords, legacyRecords != null ? legacyRecords : []);
+    const decision = (0, import_device_list.resolveDeviceListRefresh)({
+      recordCount: records.length,
+      fetchFailed: fetchErrors.length > 0,
+      cachedCount: this.deviceContexts.size
+    });
+    if (decision === "keep-cached") {
+      const msg = `Device list refresh returned no devices (${fetchErrors.join("; ")})`;
+      this.log.warn(`${msg} - keeping ${this.deviceContexts.size} cached device(s), polling continues.`);
+      await this.setStateChangedAsync("info.lastError", msg, true);
+      await this.setStateChangedAsync("info.deviceCount", this.deviceContexts.size, true);
+      return;
+    }
+    if (decision === "unavailable") {
+      throw new Error(`Device list unavailable (${fetchErrors.join("; ")})`);
+    }
     if (!records.length) {
       this.log.warn("No devices found (neither modern nor legacy). Is a shared device configured?");
     }
@@ -1868,6 +1888,10 @@ class Mammotion extends utils.Adapter {
       this.markAuthFailure(msg);
     }
   }
+  /**
+   * Returns the legacy (Aliyun) device bindings, or `null` when the request failed.
+   * `null` lets the caller distinguish "the cloud reported no devices" from "we could not ask".
+   */
   async fetchLegacyDeviceRecords(session) {
     try {
       const legacy = await this.ensureLegacySession(session);
@@ -1885,7 +1909,7 @@ class Mammotion extends utils.Adapter {
       });
     } catch (err) {
       this.log.warn(`Legacy bindings could not be loaded: ${this.extractAxiosError(err)}`);
-      return [];
+      return null;
     }
   }
   async invokeTaskControlCommandLegacy(session, context, content) {
