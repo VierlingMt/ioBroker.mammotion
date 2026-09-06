@@ -19,6 +19,13 @@
         // This is necessary for the automatic typing of the adapter config
         "resolveJsonModule": true,
 
+        // TypeScript 6 no longer includes every @types/* package automatically:
+        // list the globals this project relies on (node: process/Buffer/require, mocha: describe/it)
+        "types": ["node", "mocha"],
+        // Allow `./module.ts` imports in tests (Node 22+/24 run *.test.ts through the native
+        // type-stripping loader, which needs explicit extensions); rewritten to .js on emit.
+        "rewriteRelativeImportExtensions": true,
+
         // If you want to disable the stricter type checks (not recommended), uncomment the following line
         // "strict": false,
         // And enable some of those features for more fine-grained control
