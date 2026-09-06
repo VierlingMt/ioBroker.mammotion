@@ -9,6 +9,10 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
+_No unreleased changes._
+
+## [0.0.17] – 2026-09-06
+
 ### Fixed
 - **Adapter went silent after a failed device-list refresh.** When a device-list refresh (daily restart,
   staleness recovery, command retry) hit a transient cloud failure such as a short internet outage, the

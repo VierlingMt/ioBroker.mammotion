@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion",
-    "version": "0.0.16",
+    "version": "0.0.17",
     "news": {
+      "0.0.17": {
+        "en": "Fix: a failed device-list refresh (e.g. a short internet outage) no longer wipes the cached devices and silently stops polling until the next restart. The adapter keeps the known devices, or retries through the reconnect watchdog when nothing is cached yet.",
+        "de": "Fix: Ein fehlgeschlagener Geraetelisten-Abruf (z.B. kurzer Internet-Aussetzer) loescht die bekannten Geraete nicht mehr und stoppt das Polling nicht mehr still bis zum naechsten Neustart. Der Adapter behaelt die bekannten Geraete oder versucht es ueber den Reconnect-Watchdog erneut, wenn noch nichts im Cache ist.",
+        "ru": "Исправление: неудачное обновление списка устройств (например, кратковременный сбой интернета) больше не стирает кэшированные устройства и не останавливает опрос до следующего перезапуска. Адаптер сохраняет известные устройства или повторяет попытку через сторожевой таймер переподключения, если кэш пуст.",
+        "pt": "Correcao: uma atualizacao falhada da lista de dispositivos (p. ex. uma breve falha de internet) ja nao apaga os dispositivos em cache nem para o polling silenciosamente ate ao proximo reinicio. O adaptador mantem os dispositivos conhecidos ou tenta novamente atraves do watchdog de reconexao quando ainda nao ha cache.",
+        "nl": "Fix: een mislukte vernieuwing van de apparatenlijst (bijv. een korte internetstoring) wist de gecachte apparaten niet meer en stopt het pollen niet meer stilletjes tot de volgende herstart. De adapter behoudt de bekende apparaten of probeert het opnieuw via de reconnect-watchdog als er nog niets in de cache staat.",
+        "fr": "Correctif : un rafraichissement echoue de la liste des appareils (p. ex. une courte coupure internet) n'efface plus les appareils en cache et n'arrete plus silencieusement l'interrogation jusqu'au prochain redemarrage. L'adaptateur conserve les appareils connus ou reessaie via le watchdog de reconnexion si le cache est encore vide.",
+        "it": "Fix: un aggiornamento fallito dell'elenco dispositivi (ad es. una breve interruzione di internet) non cancella piu i dispositivi in cache e non ferma piu silenziosamente il polling fino al riavvio successivo. L'adattatore mantiene i dispositivi noti oppure riprova tramite il watchdog di riconnessione se la cache e ancora vuota.",
+        "es": "Correccion: una actualizacion fallida de la lista de dispositivos (p. ej. un corte breve de internet) ya no borra los dispositivos en cache ni detiene el sondeo en silencio hasta el siguiente reinicio. El adaptador conserva los dispositivos conocidos o reintenta mediante el watchdog de reconexion si la cache aun esta vacia.",
+        "pl": "Poprawka: nieudane odswiezenie listy urzadzen (np. krotka przerwa w internecie) nie kasuje juz urzadzen z pamieci podrecznej i nie zatrzymuje po cichu odpytywania do nastepnego restartu. Adapter zachowuje znane urzadzenia lub ponawia probe przez watchdog ponownego polaczenia, gdy pamiec podreczna jest jeszcze pusta.",
+        "uk": "Виправлення: невдале оновлення списку пристроїв (наприклад, короткий збій інтернету) більше не стирає кешовані пристрої та не зупиняє опитування до наступного перезапуску. Адаптер зберігає відомі пристрої або повторює спробу через сторожовий таймер перепідключення, якщо кеш ще порожній.",
+        "zh-cn": "修复：设备列表刷新失败（例如短暂断网）不再清空已缓存的设备，也不再在下次重启前静默停止轮询。适配器会保留已知设备；若缓存为空，则通过重连看门狗重试。"
+      },
       "0.0.16": {
         "en": "New robust health detection: telemetry.healthProblem/healthReason/lastRealChange flag a stuck or switched-off robot, because connected/lastUpdate only reflect the cloud link. New option healthStaleThresholdMin (default 60 min).",
         "de": "Neue robuste Problemerkennung: telemetry.healthProblem/healthReason/lastRealChange melden einen haengenden oder ausgeschalteten Roboter, da connected/lastUpdate nur die Cloud-Verbindung abbilden. Neue Option healthStaleThresholdMin (Standard 60 Min).",
@@ -145,19 +158,6 @@
         "pl": "Dodano synchronizacje product key z PyMammotion (reczny skrypt + opcjonalny workflow GitHub), ulepszono wykrywanie modelu po product key (w tym Yuka Mini) oraz dodano devices.<id>.productKeyGroup.",
         "uk": "Додано синхронізацію product key з PyMammotion (ручний скрипт + опціональний workflow GitHub), покращено визначення моделі за product key (включно з Yuka Mini) та додано devices.<id>.productKeyGroup.",
         "zh-cn": "新增从 PyMammotion 同步 product key（手动脚本 + 可选 GitHub 工作流），改进基于 product key 的机型识别（包括 Yuka Mini），并新增 devices.<id>.productKeyGroup。"
-      },
-      "0.0.5": {
-        "en": "Improved Yuka compatibility: model-aware limits (e.g. Yuka Mini lane width), route reserved-byte mapping aligned, and receiver selection adjusted for route commands.",
-        "de": "Yuka-Kompatibilitaet verbessert: modellabhaengige Limits (z. B. Yuka Mini Bahnbreite), Route-Reserved-Bytes angepasst und Receiver-Auswahl fuer Route-Befehle korrigiert.",
-        "ru": "Улучшена совместимость с Yuka: лимиты по модели (например, ширина прохода Yuka Mini), согласована карта reserved-байтов маршрута и скорректирован выбор receiver для команд маршрута.",
-        "pt": "Compatibilidade com Yuka melhorada: limites por modelo (ex.: largura de faixa no Yuka Mini), mapeamento de bytes reservados de rota alinhado e seleção de receiver ajustada para comandos de rota.",
-        "nl": "Yuka-compatibiliteit verbeterd: modelafhankelijke limieten (bijv. baanbreedte Yuka Mini), route-reserved-byte mapping uitgelijnd en receiverselectie aangepast voor routecommando's.",
-        "fr": "Compatibilite Yuka amelioree : limites selon le modele (ex. largeur de bande Yuka Mini), mappage des octets reserves de route aligne et selection du receiver ajustee pour les commandes de route.",
-        "it": "Compatibilita Yuka migliorata: limiti per modello (es. larghezza corsia Yuka Mini), mapping dei byte reserved della route allineato e selezione receiver corretta per i comandi route.",
-        "es": "Compatibilidad con Yuka mejorada: limites por modelo (p. ej. ancho de pasada en Yuka Mini), mapeo de bytes reservados de ruta alineado y seleccion de receiver ajustada para comandos de ruta.",
-        "pl": "Poprawiono kompatybilnosc z Yuka: limity zalezne od modelu (np. szerokosc pasa Yuka Mini), dopasowano mapowanie bajtow reserved trasy i poprawiono wybor receiver dla komend trasy.",
-        "uk": "Покращено сумісність з Yuka: ліміти за моделлю (наприклад, ширина проходу Yuka Mini), узгоджено мапінг reserved-байтів маршруту та виправлено вибір receiver для команд маршруту.",
-        "zh-cn": "改进了 Yuka 兼容性：按机型应用限制（如 Yuka Mini 割草道宽度）、对齐了路线 reserved 字节映射，并修正了路线命令的接收端选择。"
       }
     },
     "titleLang": {
