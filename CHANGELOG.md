@@ -18,6 +18,9 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   bindings list are now sent to the Aliyun path directly (logged once at start), and a Mammotion
   `50103/50104` answer falls back to Aliyun for that command. The wake-up request is only used for
   Mammotion-platform devices.
+- **No more 429 bursts.** Invokes to the same device are now queued with at least 1.5 s between them (the
+  Aliyun invoke answered 429 to a second call 0.35 s after the first). Map loading waits out a 429
+  back-off and continues instead of failing.
 - **JWT MQTT is only used for Mammotion-platform devices** (the device page), as in the app. Subscribing an
   Aliyun device's topics on the Mammotion broker made it close the connection, which was the real cause of
   the "keeps disconnecting" loop on shared accounts. Without such devices the adapter uses the Aliyun MQTT

@@ -182,6 +182,11 @@ const WAKE_MIN_INTERVAL_MS = 60_000;
 const WAKE_RETRY_DELAYS_MS = [5_000, 5_000, 10_000, 10_000, 15_000, 15_000, 15_000, 15_000];
 /** The cloud answers the wake-up request only after a while (seen: more than 10 s). */
 const WAKE_REQUEST_TIMEOUT_MS = 60_000;
+/**
+ * Minimum gap between two invokes to the same device. The Aliyun invoke answers 429 to
+ * bursts (seen: the second call 0.35 s after the first), e.g. during map loading.
+ */
+const INVOKE_MIN_GAP_MS = 1_500;
 /** Aliyun / Mammotion codes for "device offline". */
 const DEVICE_OFFLINE_CODES = ['6205', '6221', '50103', '50104'];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
@@ -218,6 +223,9 @@ class Mammotion extends utils.Adapter {
     /** Last wake-up request per device key (unix ms). */
     private readonly lastWakeAt = new Map<string, number>();
     private deviceSourcesLogged = false;
+    /** Serialises invokes per device key and keeps INVOKE_MIN_GAP_MS between them. */
+    private readonly invokeQueue = new Map<string, Promise<unknown>>();
+    private readonly lastInvokeAt = new Map<string, number>();
     /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
     private readonly aliyunOnlyDevices = new Set<string>();
     // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
@@ -364,6 +372,8 @@ class Mammotion extends utils.Adapter {
             this.zoneDiscoveryInFlight.clear();
             this.legacyOnlyDevices.clear();
             this.rateLimitBackoffUntil.clear();
+            this.invokeQueue.clear();
+            this.lastInvokeAt.clear();
             this.lastAreaNameRequestAt.clear();
             this.jwtMqttRecentShortLifetimes = [];
             this.jwtMqttDisabledUntil = 0;
@@ -1917,13 +1927,32 @@ class Mammotion extends utils.Adapter {
         return response.data?.code === 0 && response.data.data !== false;
     }
 
+    private paced<T>(key: string, fn: () => Promise<T>): Promise<T> {
+        const previous = this.invokeQueue.get(key) ?? Promise.resolve();
+        const run = previous
+            .catch(() => undefined)
+            .then(async () => {
+                const wait = INVOKE_MIN_GAP_MS - (Date.now() - (this.lastInvokeAt.get(key) ?? 0));
+                if (wait > 0) {
+                    await new Promise(resolve => setTimeout(resolve, wait));
+                }
+                try {
+                    return await fn();
+                } finally {
+                    this.lastInvokeAt.set(key, Date.now());
+                }
+            });
+        this.invokeQueue.set(key, run);
+        return run;
+    }
+
     private async invokeTaskControlCommandWithFallback(
         session: AuthSession,
         context: DeviceContext,
         content: string,
     ): Promise<string> {
         try {
-            return await this.invokeTaskControlCommandOnce(session, context, content);
+            return await this.paced(context.key, () => this.invokeTaskControlCommandOnce(session, context, content));
         } catch (err) {
             if (!this.isDeviceOfflineError(err)) {
                 throw err;
@@ -1950,7 +1979,9 @@ class Mammotion extends utils.Adapter {
             for (const delay of WAKE_RETRY_DELAYS_MS) {
                 await new Promise(resolve => setTimeout(resolve, delay));
                 try {
-                    return await this.invokeTaskControlCommandOnce(session, context, content);
+                    return await this.paced(context.key, () =>
+                        this.invokeTaskControlCommandOnce(session, context, content),
+                    );
                 } catch (retryErr) {
                     lastErr = retryErr;
                     if (!this.isDeviceOfflineError(retryErr)) {
@@ -4636,9 +4667,22 @@ class Mammotion extends utils.Adapter {
             }
         };
         const send = async (commandLabel: string, build: (session: AuthSession) => string): Promise<void> => {
-            const result = await this.executeEncodedContentCommand(ctx, commandLabel, session => build(session));
-            if (result && result !== 'ok' && result.length > 20) {
-                accept(result);
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    const result = await this.executeEncodedContentCommand(ctx, commandLabel, session => build(session));
+                    if (result && result !== 'ok' && result.length > 20) {
+                        accept(result);
+                    }
+                    return;
+                } catch (err) {
+                    const msg = this.extractAxiosError(err);
+                    if (attempt >= 2 || !(msg.includes('429') || msg.includes('rate-limited'))) {
+                        throw err;
+                    }
+                    // Rate limited: wait until the per-device back-off is over, then continue.
+                    this.log.debug(`[MAP] ${label}: rate limited, pausing before ${commandLabel}.`);
+                    await new Promise(resolve => setTimeout(resolve, this.RATE_LIMIT_BACKOFF_MS + 2_000));
+                }
             }
         };
 

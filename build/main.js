@@ -162,6 +162,7 @@ const USER_INTENT_WINDOW_MS = 5 * 6e4;
 const WAKE_MIN_INTERVAL_MS = 6e4;
 const WAKE_RETRY_DELAYS_MS = [5e3, 5e3, 1e4, 1e4, 15e3, 15e3, 15e3, 15e3];
 const WAKE_REQUEST_TIMEOUT_MS = 6e4;
+const INVOKE_MIN_GAP_MS = 1500;
 const DEVICE_OFFLINE_CODES = ["6205", "6221", "50103", "50104"];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
@@ -196,6 +197,9 @@ class Mammotion extends utils.Adapter {
   /** Last wake-up request per device key (unix ms). */
   lastWakeAt = /* @__PURE__ */ new Map();
   deviceSourcesLogged = false;
+  /** Serialises invokes per device key and keeps INVOKE_MIN_GAP_MS between them. */
+  invokeQueue = /* @__PURE__ */ new Map();
+  lastInvokeAt = /* @__PURE__ */ new Map();
   /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
   aliyunOnlyDevices = /* @__PURE__ */ new Set();
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
@@ -335,6 +339,8 @@ class Mammotion extends utils.Adapter {
       this.zoneDiscoveryInFlight.clear();
       this.legacyOnlyDevices.clear();
       this.rateLimitBackoffUntil.clear();
+      this.invokeQueue.clear();
+      this.lastInvokeAt.clear();
       this.lastAreaNameRequestAt.clear();
       this.jwtMqttRecentShortLifetimes = [];
       this.jwtMqttDisabledUntil = 0;
@@ -1666,10 +1672,28 @@ class Mammotion extends utils.Adapter {
     this.log.info(`[WAKE] ${name}: cloud answered ${JSON.stringify(response.data)}`);
     return ((_a = response.data) == null ? void 0 : _a.code) === 0 && response.data.data !== false;
   }
+  paced(key, fn) {
+    var _a;
+    const previous = (_a = this.invokeQueue.get(key)) != null ? _a : Promise.resolve();
+    const run = previous.catch(() => void 0).then(async () => {
+      var _a2;
+      const wait = INVOKE_MIN_GAP_MS - (Date.now() - ((_a2 = this.lastInvokeAt.get(key)) != null ? _a2 : 0));
+      if (wait > 0) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+      try {
+        return await fn();
+      } finally {
+        this.lastInvokeAt.set(key, Date.now());
+      }
+    });
+    this.invokeQueue.set(key, run);
+    return run;
+  }
   async invokeTaskControlCommandWithFallback(session, context, content) {
     var _a, _b;
     try {
-      return await this.invokeTaskControlCommandOnce(session, context, content);
+      return await this.paced(context.key, () => this.invokeTaskControlCommandOnce(session, context, content));
     } catch (err) {
       if (!this.isDeviceOfflineError(err)) {
         throw err;
@@ -1695,7 +1719,10 @@ class Mammotion extends utils.Adapter {
       for (const delay of WAKE_RETRY_DELAYS_MS) {
         await new Promise((resolve) => setTimeout(resolve, delay));
         try {
-          return await this.invokeTaskControlCommandOnce(session, context, content);
+          return await this.paced(
+            context.key,
+            () => this.invokeTaskControlCommandOnce(session, context, content)
+          );
         } catch (retryErr) {
           lastErr = retryErr;
           if (!this.isDeviceOfflineError(retryErr)) {
@@ -3986,9 +4013,21 @@ ${url}`;
       }
     };
     const send = async (commandLabel, build) => {
-      const result = await this.executeEncodedContentCommand(ctx, commandLabel, (session) => build(session));
-      if (result && result !== "ok" && result.length > 20) {
-        accept(result);
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const result = await this.executeEncodedContentCommand(ctx, commandLabel, (session) => build(session));
+          if (result && result !== "ok" && result.length > 20) {
+            accept(result);
+          }
+          return;
+        } catch (err) {
+          const msg = this.extractAxiosError(err);
+          if (attempt >= 2 || !(msg.includes("429") || msg.includes("rate-limited"))) {
+            throw err;
+          }
+          this.log.debug(`[MAP] ${label}: rate limited, pausing before ${commandLabel}.`);
+          await new Promise((resolve) => setTimeout(resolve, this.RATE_LIMIT_BACKOFF_MS + 2e3));
+        }
       }
     };
     this.mapFrameListeners.set(key, accept);
