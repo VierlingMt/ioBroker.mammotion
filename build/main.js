@@ -100,7 +100,8 @@ const WORK_MODE_NAMES = {
   36: "EDIT_BOUNDARY",
   37: "LOCATION_ERROR",
   38: "BOUNDARY_JUMP",
-  39: "CHARGING_PAUSE"
+  39: "CHARGING_PAUSE",
+  48: "SLEEPING"
 };
 const ROUTE_JOB_MODE_NAMES = {
   0: "MODE_0",
@@ -155,6 +156,12 @@ const MAP_SYNC_REFRESH_MS = 1e4;
 const MAP_FETCH_MAX_MS = 15 * 6e4;
 const MAP_MAX_ELEMENTS = 300;
 const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 6e4;
+const MAP_AUTO_FETCH_DELAY_MS = 2e4;
+const MAP_AUTO_FETCH_RETRY_MS = 2 * 6e4;
+const USER_INTENT_WINDOW_MS = 5 * 6e4;
+const WAKE_MIN_INTERVAL_MS = 6e4;
+const WAKE_RETRY_DELAYS_MS = [5e3, 5e3, 1e4, 1e4, 15e3];
+const DEVICE_OFFLINE_CODES = ["6205", "6221", "50103", "50104"];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
 const AREA_NAME_RETRY_DELAYS_MS = [5e3, 1e4, 2e4, 3e4, 6e4];
@@ -183,6 +190,10 @@ class Mammotion extends utils.Adapter {
   mapFrameListeners = /* @__PURE__ */ new Map();
   /** Last automatic map load per device key (unix ms). */
   mapAutoFetchedAt = /* @__PURE__ */ new Map();
+  /** Last user-triggered command per device key (unix ms); allows waking a sleeping mower. */
+  userIntentAt = /* @__PURE__ */ new Map();
+  /** Last wake-up request per device key (unix ms). */
+  lastWakeAt = /* @__PURE__ */ new Map();
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
   deviceHealthSnapshots = /* @__PURE__ */ new Map();
   // Per-device current health-problem flag, used to log only on transitions.
@@ -366,6 +377,10 @@ class Mammotion extends utils.Adapter {
       return;
     }
     const localId = id.replace(`${this.namespace}.`, "");
+    const intentMatch = localId.match(/^devices\.([^.]+)\.(commands|zones)\./);
+    if (intentMatch) {
+      this.userIntentAt.set(intentMatch[1], Date.now());
+    }
     const routeCommandMatch = localId.match(/^devices\.([^.]+)\.commands\.(generateRoute|modifyRoute|queryRoute)$/);
     if (routeCommandMatch) {
       if (state.val !== true) {
@@ -1616,7 +1631,77 @@ class Mammotion extends utils.Adapter {
     this.log.debug(`[MODERN-INVOKE] result len=${(_c = (_b = (_a = response.data) == null ? void 0 : _a.result) == null ? void 0 : _b.length) != null ? _c : 0}`);
     return ((_d = response.data) == null ? void 0 : _d.result) || "ok";
   }
+  isDeviceOfflineError(err) {
+    const msg = this.extractAxiosError(err).toLowerCase();
+    return msg.includes("device is offline") || DEVICE_OFFLINE_CODES.some((code) => msg.includes(code));
+  }
+  // Asks the cloud to wake a sleeping mower (POST device-server/v1/device/wakeup, by device name).
+  // A positive answer only means the request was accepted; the mower reconnects on its own.
+  async wakeDevice(session, context) {
+    var _a;
+    const name = context.deviceName || context.recordDeviceName;
+    if (!name) {
+      return false;
+    }
+    const response = await import_axios.default.post(
+      `${MAMMOTION_API_DOMAIN}/device-server/v1/device/wakeup`,
+      { deviceName: name },
+      {
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "Content-Type": "application/json",
+          "User-Agent": "okhttp/4.9.3",
+          "Client-Id": session.clientId,
+          "Client-Type": "1"
+        },
+        timeout: 1e4
+      }
+    );
+    this.log.debug(`[WAKE] ${name}: ${JSON.stringify(response.data)}`);
+    return ((_a = response.data) == null ? void 0 : _a.code) === 0 && response.data.data !== false;
+  }
   async invokeTaskControlCommandWithFallback(session, context, content) {
+    var _a, _b;
+    try {
+      return await this.invokeTaskControlCommandOnce(session, context, content);
+    } catch (err) {
+      if (!this.isDeviceOfflineError(err)) {
+        throw err;
+      }
+      const now = Date.now();
+      const userDriven = now - ((_a = this.userIntentAt.get(context.key)) != null ? _a : 0) < USER_INTENT_WINDOW_MS;
+      if (!userDriven) {
+        throw err;
+      }
+      const label = context.deviceName || context.iotId;
+      if (now - ((_b = this.lastWakeAt.get(context.key)) != null ? _b : 0) >= WAKE_MIN_INTERVAL_MS) {
+        this.lastWakeAt.set(context.key, now);
+        let accepted = false;
+        try {
+          accepted = await this.wakeDevice(session, context);
+        } catch (wakeErr) {
+          this.log.warn(`[WAKE] Waking ${label} failed: ${this.extractAxiosError(wakeErr)}`);
+        }
+        this.log.info(
+          `[WAKE] ${label} is asleep; wake-up ${accepted ? "requested" : "was not accepted"}, retrying the command.`
+        );
+      }
+      let lastErr = err;
+      for (const delay of WAKE_RETRY_DELAYS_MS) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        try {
+          return await this.invokeTaskControlCommandOnce(session, context, content);
+        } catch (retryErr) {
+          lastErr = retryErr;
+          if (!this.isDeviceOfflineError(retryErr)) {
+            throw retryErr;
+          }
+        }
+      }
+      throw lastErr;
+    }
+  }
+  async invokeTaskControlCommandOnce(session, context, content) {
     var _a, _b;
     const backoffUntil = (_a = this.rateLimitBackoffUntil.get(context.key)) != null ? _a : 0;
     const now = Date.now();
@@ -3743,9 +3828,15 @@ ${url}`;
     }
     this.mapAutoFetchedAt.set(deviceKey, now);
     this.log.info(`[MAP] Map of ${ctx.deviceName || deviceKey} changed or not loaded yet, loading it.`);
+    await new Promise((resolve) => setTimeout(resolve, MAP_AUTO_FETCH_DELAY_MS));
     try {
       await this.fetchMap(ctx);
     } catch (err) {
+      if (this.isDeviceOfflineError(err)) {
+        this.mapAutoFetchedAt.set(deviceKey, Date.now() - MAP_AUTO_FETCH_MIN_INTERVAL_MS + MAP_AUTO_FETCH_RETRY_MS);
+        this.log.info(`[MAP] ${ctx.deviceName || deviceKey} went offline while loading the map, will retry.`);
+        return;
+      }
       this.log.warn(
         `[MAP] Automatic map load failed for ${ctx.deviceName || deviceKey}: ${this.extractAxiosError(err)}`
       );
