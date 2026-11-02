@@ -1870,10 +1870,16 @@ class Mammotion extends utils.Adapter {
       const { locationVo: _location, ...rest } = o;
       return JSON.stringify(rest);
     };
-    this.log.info(`[DEVICES] iotDomain=${session.iotDomain} country=${session.countryCode} userAccount=${session.userAccount}`);
+    this.log.info(
+      `[DEVICES] iotDomain=${session.iotDomain} country=${session.countryCode} userAccount=${session.userAccount}`
+    );
     this.log.info(`[DEVICES] device list (${devices.length}): ${devices.map(strip).join(" | ") || "-"}`);
-    this.log.info(`[DEVICES] device page (${modernRecords.length}): ${modernRecords.map(strip).join(" | ") || "-"}`);
-    this.log.info(`[DEVICES] aliyun bindings (${legacyRecords.length}): ${legacyRecords.map(strip).join(" | ") || "-"}`);
+    this.log.info(
+      `[DEVICES] device page (${modernRecords.length}): ${modernRecords.map(strip).join(" | ") || "-"}`
+    );
+    this.log.info(
+      `[DEVICES] aliyun bindings (${legacyRecords.length}): ${legacyRecords.map(strip).join(" | ") || "-"}`
+    );
   }
   async refreshSessionAndDeviceCache() {
     const session = await this.ensureValidSession(true);

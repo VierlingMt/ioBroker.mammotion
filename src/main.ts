@@ -2174,14 +2174,14 @@ class Mammotion extends utils.Adapter {
         };
         this.log.info(
             `[DEVICES] iotDomain=${session.iotDomain} country=${session.countryCode} userAccount=${session.userAccount}`,
-        ));
+        );
         this.log.info(`[DEVICES] device list (${devices.length}): ${devices.map(strip).join(' | ') || '-'}`);
         this.log.info(
             `[DEVICES] device page (${modernRecords.length}): ${modernRecords.map(strip).join(' | ') || '-'}`,
-        ));
+        );
         this.log.info(
             `[DEVICES] aliyun bindings (${legacyRecords.length}): ${legacyRecords.map(strip).join(' | ') || '-'}`,
-        ));
+        );
     }
 
     private async refreshSessionAndDeviceCache(): Promise<void> {
