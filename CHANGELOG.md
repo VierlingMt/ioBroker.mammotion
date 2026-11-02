@@ -36,7 +36,8 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   drop their cloud connection; every command then fails with "The device is offline" although the app
   can still reach the mower. The app wakes it over REST when it is opened. The adapter now does the same
   for commands a user triggers (`commands.*`, `zones.*.start`): on an offline error it calls
-  `device-server/v1/device/wakeup` (at most once a minute) and retries the command for up to 45 seconds.
+  `device-server/v1/device/wakeup` (at most once a minute, waiting up to 60 s for the answer, which the
+  cloud only sends after a while) and retries the command for up to 90 seconds.
   Background requests (status report refresh, automatic map load) never wake the mower.
 - The automatic map load waits 20 seconds after the report that triggered it and retries after 2 minutes
   when the mower went offline again, instead of waiting 30 minutes.

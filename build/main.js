@@ -160,7 +160,8 @@ const MAP_AUTO_FETCH_DELAY_MS = 2e4;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 6e4;
 const USER_INTENT_WINDOW_MS = 5 * 6e4;
 const WAKE_MIN_INTERVAL_MS = 6e4;
-const WAKE_RETRY_DELAYS_MS = [5e3, 5e3, 1e4, 1e4, 15e3];
+const WAKE_RETRY_DELAYS_MS = [5e3, 5e3, 1e4, 1e4, 15e3, 15e3, 15e3, 15e3];
+const WAKE_REQUEST_TIMEOUT_MS = 6e4;
 const DEVICE_OFFLINE_CODES = ["6205", "6221", "50103", "50104"];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
@@ -1654,10 +1655,10 @@ class Mammotion extends utils.Adapter {
           "Client-Id": session.clientId,
           "Client-Type": "1"
         },
-        timeout: 1e4
+        timeout: WAKE_REQUEST_TIMEOUT_MS
       }
     );
-    this.log.debug(`[WAKE] ${name}: ${JSON.stringify(response.data)}`);
+    this.log.info(`[WAKE] ${name}: cloud answered ${JSON.stringify(response.data)}`);
     return ((_a = response.data) == null ? void 0 : _a.code) === 0 && response.data.data !== false;
   }
   async invokeTaskControlCommandWithFallback(session, context, content) {
@@ -1676,15 +1677,14 @@ class Mammotion extends utils.Adapter {
       const label = context.deviceName || context.iotId;
       if (now - ((_b = this.lastWakeAt.get(context.key)) != null ? _b : 0) >= WAKE_MIN_INTERVAL_MS) {
         this.lastWakeAt.set(context.key, now);
-        let accepted = false;
+        this.log.info(`[WAKE] ${label} is asleep, sending wake-up request.`);
+        let result = "was not accepted";
         try {
-          accepted = await this.wakeDevice(session, context);
+          result = await this.wakeDevice(session, context) ? "accepted" : "was not accepted";
         } catch (wakeErr) {
-          this.log.warn(`[WAKE] Waking ${label} failed: ${this.extractAxiosError(wakeErr)}`);
+          result = `got no clear answer (${this.extractAxiosError(wakeErr)})`;
         }
-        this.log.info(
-          `[WAKE] ${label} is asleep; wake-up ${accepted ? "requested" : "was not accepted"}, retrying the command.`
-        );
+        this.log.info(`[WAKE] Wake-up for ${label} ${result}, retrying the command for up to 90 s.`);
       }
       let lastErr = err;
       for (const delay of WAKE_RETRY_DELAYS_MS) {

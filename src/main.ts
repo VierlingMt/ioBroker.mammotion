@@ -179,7 +179,9 @@ const MAP_AUTO_FETCH_RETRY_MS = 2 * 60_000;
  */
 const USER_INTENT_WINDOW_MS = 5 * 60_000;
 const WAKE_MIN_INTERVAL_MS = 60_000;
-const WAKE_RETRY_DELAYS_MS = [5_000, 5_000, 10_000, 10_000, 15_000];
+const WAKE_RETRY_DELAYS_MS = [5_000, 5_000, 10_000, 10_000, 15_000, 15_000, 15_000, 15_000];
+/** The cloud answers the wake-up request only after a while (seen: more than 10 s). */
+const WAKE_REQUEST_TIMEOUT_MS = 60_000;
 /** Aliyun / Mammotion codes for "device offline". */
 const DEVICE_OFFLINE_CODES = ['6205', '6221', '50103', '50104'];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
@@ -1894,10 +1896,10 @@ class Mammotion extends utils.Adapter {
                     'Client-Id': session.clientId,
                     'Client-Type': '1',
                 },
-                timeout: 10000,
+                timeout: WAKE_REQUEST_TIMEOUT_MS,
             },
         );
-        this.log.debug(`[WAKE] ${name}: ${JSON.stringify(response.data)}`);
+        this.log.info(`[WAKE] ${name}: cloud answered ${JSON.stringify(response.data)}`);
         return response.data?.code === 0 && response.data.data !== false;
     }
 
@@ -1920,15 +1922,15 @@ class Mammotion extends utils.Adapter {
             const label = context.deviceName || context.iotId;
             if (now - (this.lastWakeAt.get(context.key) ?? 0) >= WAKE_MIN_INTERVAL_MS) {
                 this.lastWakeAt.set(context.key, now);
-                let accepted = false;
+                this.log.info(`[WAKE] ${label} is asleep, sending wake-up request.`);
+                let result = 'was not accepted';
                 try {
-                    accepted = await this.wakeDevice(session, context);
+                    result = (await this.wakeDevice(session, context)) ? 'accepted' : 'was not accepted';
                 } catch (wakeErr) {
-                    this.log.warn(`[WAKE] Waking ${label} failed: ${this.extractAxiosError(wakeErr)}`);
+                    // No answer is not a refusal: the mower may still wake up, so keep retrying.
+                    result = `got no clear answer (${this.extractAxiosError(wakeErr)})`;
                 }
-                this.log.info(
-                    `[WAKE] ${label} is asleep; wake-up ${accepted ? 'requested' : 'was not accepted'}, retrying the command.`,
-                );
+                this.log.info(`[WAKE] Wake-up for ${label} ${result}, retrying the command for up to 90 s.`);
             }
             let lastErr: unknown = err;
             for (const delay of WAKE_RETRY_DELAYS_MS) {
