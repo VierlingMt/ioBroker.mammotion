@@ -195,6 +195,7 @@ class Mammotion extends utils.Adapter {
   userIntentAt = /* @__PURE__ */ new Map();
   /** Last wake-up request per device key (unix ms). */
   lastWakeAt = /* @__PURE__ */ new Map();
+  deviceSourcesLogged = false;
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
   deviceHealthSnapshots = /* @__PURE__ */ new Map();
   // Per-device current health-problem flag, used to log only on transitions.
@@ -1258,6 +1259,9 @@ class Mammotion extends utils.Adapter {
       this.setJwtMqttConnected(false);
     }
     const brokerUrl = mqttAuth.host.includes("://") ? mqttAuth.host : `mqtts://${mqttAuth.host}`;
+    this.log.info(
+      `[DEVICES] JWT MQTT broker=${mqttAuth.host} clientId=${mqttAuth.clientId} username=${mqttAuth.username}`
+    );
     const client = mqtt.connect(brokerUrl, {
       clientId: mqttAuth.clientId,
       username: mqttAuth.username,
@@ -1854,6 +1858,23 @@ class Mammotion extends utils.Adapter {
       return this.invokeTaskControlCommandWithFallback(retrySession, refreshedContext, retryContent);
     }
   }
+  // Once per adapter start: which cloud list knows which device under which id. Needed to
+  // diagnose shared devices that moved from Aliyun to the Mammotion platform. No tokens,
+  // no location.
+  logDeviceSources(session, devices, modernRecords, legacyRecords) {
+    if (this.deviceSourcesLogged) {
+      return;
+    }
+    this.deviceSourcesLogged = true;
+    const strip = (o) => {
+      const { locationVo: _location, ...rest } = o;
+      return JSON.stringify(rest);
+    };
+    this.log.info(`[DEVICES] iotDomain=${session.iotDomain} country=${session.countryCode} userAccount=${session.userAccount}`);
+    this.log.info(`[DEVICES] device list (${devices.length}): ${devices.map(strip).join(" | ") || "-"}`);
+    this.log.info(`[DEVICES] device page (${modernRecords.length}): ${modernRecords.map(strip).join(" | ") || "-"}`);
+    this.log.info(`[DEVICES] aliyun bindings (${legacyRecords.length}): ${legacyRecords.map(strip).join(" | ") || "-"}`);
+  }
   async refreshSessionAndDeviceCache() {
     const session = await this.ensureValidSession(true);
     const fetchErrors = [];
@@ -1878,6 +1899,7 @@ class Mammotion extends utils.Adapter {
       fetchErrors.push("legacy bindings");
     }
     const records = (0, import_device_list.mergeDeviceRecords)(modernRecords, legacyRecords != null ? legacyRecords : []);
+    this.logDeviceSources(session, devices, modernRecords, legacyRecords != null ? legacyRecords : []);
     const decision = (0, import_device_list.resolveDeviceListRefresh)({
       recordCount: records.length,
       fetchFailed: fetchErrors.length > 0,

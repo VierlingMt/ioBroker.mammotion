@@ -217,6 +217,7 @@ class Mammotion extends utils.Adapter {
     private readonly userIntentAt = new Map<string, number>();
     /** Last wake-up request per device key (unix ms). */
     private readonly lastWakeAt = new Map<string, number>();
+    private deviceSourcesLogged = false;
     // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
     private deviceHealthSnapshots = new Map<string, { fingerprint: string; lastChangeAt: number }>();
     // Per-device current health-problem flag, used to log only on transitions.
@@ -1418,6 +1419,9 @@ class Mammotion extends utils.Adapter {
         }
 
         const brokerUrl = mqttAuth.host.includes('://') ? mqttAuth.host : `mqtts://${mqttAuth.host}`;
+        this.log.info(
+            `[DEVICES] JWT MQTT broker=${mqttAuth.host} clientId=${mqttAuth.clientId} username=${mqttAuth.username}`,
+        );
         const client = mqtt.connect(brokerUrl, {
             clientId: mqttAuth.clientId,
             username: mqttAuth.username,
@@ -2151,6 +2155,29 @@ class Mammotion extends utils.Adapter {
         }
     }
 
+    // Once per adapter start: which cloud list knows which device under which id. Needed to
+    // diagnose shared devices that moved from Aliyun to the Mammotion platform. No tokens,
+    // no location.
+    private logDeviceSources(
+        session: AuthSession,
+        devices: MammotionDevice[],
+        modernRecords: DeviceRecord[],
+        legacyRecords: DeviceRecord[],
+    ): void {
+        if (this.deviceSourcesLogged) {
+            return;
+        }
+        this.deviceSourcesLogged = true;
+        const strip = (o: object): string => {
+            const { locationVo: _location, ...rest } = o as Record<string, unknown>;
+            return JSON.stringify(rest);
+        };
+        this.log.info(`[DEVICES] iotDomain=${session.iotDomain} country=${session.countryCode} userAccount=${session.userAccount}`);
+        this.log.info(`[DEVICES] device list (${devices.length}): ${devices.map(strip).join(' | ') || '-'}`);
+        this.log.info(`[DEVICES] device page (${modernRecords.length}): ${modernRecords.map(strip).join(' | ') || '-'}`);
+        this.log.info(`[DEVICES] aliyun bindings (${legacyRecords.length}): ${legacyRecords.map(strip).join(' | ') || '-'}`);
+    }
+
     private async refreshSessionAndDeviceCache(): Promise<void> {
         const session = await this.ensureValidSession(true);
 
@@ -2184,6 +2211,7 @@ class Mammotion extends utils.Adapter {
 
         // Merge: modern records first, add legacy entries not already covered
         const records = mergeDeviceRecords(modernRecords, legacyRecords ?? []);
+        this.logDeviceSources(session, devices, modernRecords, legacyRecords ?? []);
 
         const decision = resolveDeviceListRefresh({
             recordCount: records.length,
