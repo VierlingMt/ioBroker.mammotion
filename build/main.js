@@ -163,6 +163,12 @@ const WAKE_MIN_INTERVAL_MS = 6e4;
 const WAKE_RETRY_DELAYS_MS = [5e3, 5e3, 1e4, 1e4, 15e3, 15e3, 15e3, 15e3];
 const WAKE_REQUEST_TIMEOUT_MS = 6e4;
 const INVOKE_MIN_GAP_MS = 1500;
+const ALIYUN_SEND_WINDOW_MS = 12 * 60 * 6e4;
+const ALIYUN_BACKGROUND_SEND_LIMIT = 400;
+const RATE_LIMIT_BACKOFF_MIN_MS = 6e4;
+const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 6e4;
+const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 6e4;
+const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 6e4;
 const DEVICE_OFFLINE_CODES = ["6205", "6221", "50103", "50104"];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
@@ -200,6 +206,10 @@ class Mammotion extends utils.Adapter {
   /** Serialises invokes per device key and keeps INVOKE_MIN_GAP_MS between them. */
   invokeQueue = /* @__PURE__ */ new Map();
   lastInvokeAt = /* @__PURE__ */ new Map();
+  /** Background sends per device key within ALIYUN_SEND_WINDOW_MS (unix ms). */
+  backgroundSends = /* @__PURE__ */ new Map();
+  /** Consecutive 429 answers per device key; resets on the next successful invoke. */
+  rateLimitStrikes = /* @__PURE__ */ new Map();
   /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
   aliyunOnlyDevices = /* @__PURE__ */ new Set();
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
@@ -226,7 +236,6 @@ class Mammotion extends utils.Adapter {
   // Maps deviceKey → unix-ms timestamp until which all invokes for this device fast-fail
   // without an HTTP call. Independent of legacyOnlyDevices (which is about routing).
   rateLimitBackoffUntil = /* @__PURE__ */ new Map();
-  RATE_LIMIT_BACKOFF_MS = 3e4;
   lastRealtimeMqttMessageAt = 0;
   aliyunEnsureInFlight = false;
   lastAliyunEnsureAt = 0;
@@ -341,6 +350,8 @@ class Mammotion extends utils.Adapter {
       this.rateLimitBackoffUntil.clear();
       this.invokeQueue.clear();
       this.lastInvokeAt.clear();
+      this.backgroundSends.clear();
+      this.rateLimitStrikes.clear();
       this.lastAreaNameRequestAt.clear();
       this.jwtMqttRecentShortLifetimes = [];
       this.jwtMqttDisabledUntil = 0;
@@ -1676,13 +1687,27 @@ class Mammotion extends utils.Adapter {
     var _a;
     const previous = (_a = this.invokeQueue.get(key)) != null ? _a : Promise.resolve();
     const run = previous.catch(() => void 0).then(async () => {
-      var _a2;
-      const wait = INVOKE_MIN_GAP_MS - (Date.now() - ((_a2 = this.lastInvokeAt.get(key)) != null ? _a2 : 0));
+      var _a2, _b, _c;
+      const userDriven = Date.now() - ((_a2 = this.userIntentAt.get(key)) != null ? _a2 : 0) < USER_INTENT_WINDOW_MS;
+      if (this.aliyunOnlyDevices.has(key) && !userDriven) {
+        const cutoff = Date.now() - ALIYUN_SEND_WINDOW_MS;
+        const sends = ((_b = this.backgroundSends.get(key)) != null ? _b : []).filter((t) => t >= cutoff);
+        this.backgroundSends.set(key, sends);
+        if (sends.length >= ALIYUN_BACKGROUND_SEND_LIMIT) {
+          throw new Error(
+            `Own send budget for background requests used up (${ALIYUN_BACKGROUND_SEND_LIMIT} per 12 h, protects the cloud quota).`
+          );
+        }
+        sends.push(Date.now());
+      }
+      const wait = INVOKE_MIN_GAP_MS - (Date.now() - ((_c = this.lastInvokeAt.get(key)) != null ? _c : 0));
       if (wait > 0) {
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
       try {
-        return await fn();
+        const result = await fn();
+        this.rateLimitStrikes.delete(key);
+        return result;
       } finally {
         this.lastInvokeAt.set(key, Date.now());
       }
@@ -1795,7 +1820,7 @@ class Mammotion extends utils.Adapter {
     }
   }
   armRateLimitBackoffIfNeeded(context, err) {
-    var _a, _b;
+    var _a, _b, _c;
     const status = import_axios.default.isAxiosError(err) ? (_a = err.response) == null ? void 0 : _a.status : void 0;
     const msg = this.extractAxiosError(err);
     const is429 = status === 429 || /status code 429/.test(msg);
@@ -1803,10 +1828,15 @@ class Mammotion extends utils.Adapter {
       return;
     }
     const existingUntil = (_b = this.rateLimitBackoffUntil.get(context.key)) != null ? _b : 0;
-    const newUntil = Date.now() + this.RATE_LIMIT_BACKOFF_MS;
+    const strikes = ((_c = this.rateLimitStrikes.get(context.key)) != null ? _c : 0) + 1;
+    this.rateLimitStrikes.set(context.key, strikes);
+    const backoffMs = Math.min(RATE_LIMIT_BACKOFF_MAX_MS, RATE_LIMIT_BACKOFF_MIN_MS * 2 ** (strikes - 1));
+    const newUntil = Date.now() + backoffMs;
     if (existingUntil <= Date.now()) {
       this.log.warn(
-        `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${this.RATE_LIMIT_BACKOFF_MS / 1e3}s.`
+        `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${Math.round(
+          backoffMs / 1e3
+        )}s (cloud send quota).`
       );
     }
     this.rateLimitBackoffUntil.set(context.key, Math.max(existingUntil, newUntil));
@@ -2474,7 +2504,8 @@ class Mammotion extends utils.Adapter {
       return;
     }
     const stateVal = (_a = await this.getStateAsync(`devices.${ctx.key}.telemetry.deviceState`)) == null ? void 0 : _a.val;
-    const interval = REPORT_ACTIVE_STATES.has(Number(stateVal)) ? REPORT_REFRESH_ACTIVE_MS : REPORT_REFRESH_IDLE_MS;
+    const active = REPORT_ACTIVE_STATES.has(Number(stateVal));
+    const interval = this.aliyunOnlyDevices.has(ctx.key) ? active ? REPORT_REFRESH_ACTIVE_ALIYUN_MS : REPORT_REFRESH_IDLE_ALIYUN_MS : active ? REPORT_REFRESH_ACTIVE_MS : REPORT_REFRESH_IDLE_MS;
     const now = Date.now();
     if (now - ((_b = this.reportRequestedAt.get(ctx.key)) != null ? _b : 0) < interval) {
       return;
@@ -4013,6 +4044,7 @@ ${url}`;
       }
     };
     const send = async (commandLabel, build) => {
+      var _a;
       for (let attempt = 0; ; attempt++) {
         try {
           const result = await this.executeEncodedContentCommand(ctx, commandLabel, (session) => build(session));
@@ -4022,11 +4054,13 @@ ${url}`;
           return;
         } catch (err) {
           const msg = this.extractAxiosError(err);
-          if (attempt >= 2 || !(msg.includes("429") || msg.includes("rate-limited"))) {
+          const until = (_a = this.rateLimitBackoffUntil.get(ctx.key)) != null ? _a : 0;
+          const waitMs = until - Date.now() + 2e3;
+          if (attempt >= 1 || !(msg.includes("429") || msg.includes("rate-limited")) || waitMs > 2 * 6e4) {
             throw err;
           }
-          this.log.debug(`[MAP] ${label}: rate limited, pausing before ${commandLabel}.`);
-          await new Promise((resolve) => setTimeout(resolve, this.RATE_LIMIT_BACKOFF_MS + 2e3));
+          this.log.debug(`[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1e3)}s before ${commandLabel}.`);
+          await new Promise((resolve) => setTimeout(resolve, Math.max(waitMs, 0)));
         }
       }
     };

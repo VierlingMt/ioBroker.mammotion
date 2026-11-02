@@ -187,6 +187,19 @@ const WAKE_REQUEST_TIMEOUT_MS = 60_000;
  * bursts (seen: the second call 0.35 s after the first), e.g. during map loading.
  */
 const INVOKE_MIN_GAP_MS = 1_500;
+/**
+ * Aliyun-era firmware (< 1.30.25.1) has a cloud send quota; exceeding it gets 429 and a long
+ * ban. Background requests of Aliyun-only devices keep to an own budget per 12 hours, as
+ * PyMammotion does (600). Commands a user triggers are not counted against it.
+ */
+const ALIYUN_SEND_WINDOW_MS = 12 * 60 * 60_000;
+const ALIYUN_BACKGROUND_SEND_LIMIT = 400;
+/** 429 back-off: starts at 1 minute and doubles per consecutive 429, up to 1 hour. */
+const RATE_LIMIT_BACKOFF_MIN_MS = 60_000;
+const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 60_000;
+/** Status report refresh for Aliyun-only devices (each request costs quota). */
+const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 60_000;
+const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 60_000;
 /** Aliyun / Mammotion codes for "device offline". */
 const DEVICE_OFFLINE_CODES = ['6205', '6221', '50103', '50104'];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
@@ -226,6 +239,10 @@ class Mammotion extends utils.Adapter {
     /** Serialises invokes per device key and keeps INVOKE_MIN_GAP_MS between them. */
     private readonly invokeQueue = new Map<string, Promise<unknown>>();
     private readonly lastInvokeAt = new Map<string, number>();
+    /** Background sends per device key within ALIYUN_SEND_WINDOW_MS (unix ms). */
+    private readonly backgroundSends = new Map<string, number[]>();
+    /** Consecutive 429 answers per device key; resets on the next successful invoke. */
+    private readonly rateLimitStrikes = new Map<string, number>();
     /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
     private readonly aliyunOnlyDevices = new Set<string>();
     // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
@@ -252,7 +269,6 @@ class Mammotion extends utils.Adapter {
     // Maps deviceKey → unix-ms timestamp until which all invokes for this device fast-fail
     // without an HTTP call. Independent of legacyOnlyDevices (which is about routing).
     private rateLimitBackoffUntil = new Map<string, number>();
-    private readonly RATE_LIMIT_BACKOFF_MS = 30_000;
     private lastRealtimeMqttMessageAt = 0;
     private aliyunEnsureInFlight = false;
     private lastAliyunEnsureAt = 0;
@@ -374,6 +390,8 @@ class Mammotion extends utils.Adapter {
             this.rateLimitBackoffUntil.clear();
             this.invokeQueue.clear();
             this.lastInvokeAt.clear();
+            this.backgroundSends.clear();
+            this.rateLimitStrikes.clear();
             this.lastAreaNameRequestAt.clear();
             this.jwtMqttRecentShortLifetimes = [];
             this.jwtMqttDisabledUntil = 0;
@@ -1932,12 +1950,26 @@ class Mammotion extends utils.Adapter {
         const run = previous
             .catch(() => undefined)
             .then(async () => {
+                const userDriven = Date.now() - (this.userIntentAt.get(key) ?? 0) < USER_INTENT_WINDOW_MS;
+                if (this.aliyunOnlyDevices.has(key) && !userDriven) {
+                    const cutoff = Date.now() - ALIYUN_SEND_WINDOW_MS;
+                    const sends = (this.backgroundSends.get(key) ?? []).filter(t => t >= cutoff);
+                    this.backgroundSends.set(key, sends);
+                    if (sends.length >= ALIYUN_BACKGROUND_SEND_LIMIT) {
+                        throw new Error(
+                            `Own send budget for background requests used up (${ALIYUN_BACKGROUND_SEND_LIMIT} per 12 h, protects the cloud quota).`,
+                        );
+                    }
+                    sends.push(Date.now());
+                }
                 const wait = INVOKE_MIN_GAP_MS - (Date.now() - (this.lastInvokeAt.get(key) ?? 0));
                 if (wait > 0) {
                     await new Promise(resolve => setTimeout(resolve, wait));
                 }
                 try {
-                    return await fn();
+                    const result = await fn();
+                    this.rateLimitStrikes.delete(key);
+                    return result;
                 } finally {
                     this.lastInvokeAt.set(key, Date.now());
                 }
@@ -1999,7 +2031,7 @@ class Mammotion extends utils.Adapter {
         content: string,
     ): Promise<string> {
         // Per-device 429 circuit breaker: if the cloud told us to slow down within the last
-        // RATE_LIMIT_BACKOFF_MS window, fail fast WITHOUT making an HTTP call. This breaks
+        // back-off window, fail fast WITHOUT making an HTTP call. This breaks
         // the retry loop that would otherwise pile refreshSessionAndDeviceCache traffic on
         // top of an already throttled account.
         const backoffUntil = this.rateLimitBackoffUntil.get(context.key) ?? 0;
@@ -2091,13 +2123,16 @@ class Mammotion extends utils.Adapter {
             return;
         }
         const existingUntil = this.rateLimitBackoffUntil.get(context.key) ?? 0;
-        const newUntil = Date.now() + this.RATE_LIMIT_BACKOFF_MS;
+        const strikes = (this.rateLimitStrikes.get(context.key) ?? 0) + 1;
+        this.rateLimitStrikes.set(context.key, strikes);
+        const backoffMs = Math.min(RATE_LIMIT_BACKOFF_MAX_MS, RATE_LIMIT_BACKOFF_MIN_MS * 2 ** (strikes - 1));
+        const newUntil = Date.now() + backoffMs;
         // Only log the first arm in a window; refreshing the window from a follow-up 429 is silent.
         if (existingUntil <= Date.now()) {
             this.log.warn(
-                `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${
-                    this.RATE_LIMIT_BACKOFF_MS / 1000
-                }s.`,
+                `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${Math.round(
+                    backoffMs / 1000,
+                )}s (cloud send quota).`,
             );
         }
         this.rateLimitBackoffUntil.set(context.key, Math.max(existingUntil, newUntil));
@@ -2914,7 +2949,14 @@ class Mammotion extends utils.Adapter {
             return;
         }
         const stateVal = (await this.getStateAsync(`devices.${ctx.key}.telemetry.deviceState`))?.val;
-        const interval = REPORT_ACTIVE_STATES.has(Number(stateVal)) ? REPORT_REFRESH_ACTIVE_MS : REPORT_REFRESH_IDLE_MS;
+        const active = REPORT_ACTIVE_STATES.has(Number(stateVal));
+        const interval = this.aliyunOnlyDevices.has(ctx.key)
+            ? active
+                ? REPORT_REFRESH_ACTIVE_ALIYUN_MS
+                : REPORT_REFRESH_IDLE_ALIYUN_MS
+            : active
+              ? REPORT_REFRESH_ACTIVE_MS
+              : REPORT_REFRESH_IDLE_MS;
         const now = Date.now();
         if (now - (this.reportRequestedAt.get(ctx.key) ?? 0) < interval) {
             return;
@@ -4676,12 +4718,14 @@ class Mammotion extends utils.Adapter {
                     return;
                 } catch (err) {
                     const msg = this.extractAxiosError(err);
-                    if (attempt >= 2 || !(msg.includes('429') || msg.includes('rate-limited'))) {
+                    const until = this.rateLimitBackoffUntil.get(ctx.key) ?? 0;
+                    const waitMs = until - Date.now() + 2_000;
+                    // Ride out a short back-off once; a long one means the cloud quota is used up.
+                    if (attempt >= 1 || !(msg.includes('429') || msg.includes('rate-limited')) || waitMs > 2 * 60_000) {
                         throw err;
                     }
-                    // Rate limited: wait until the per-device back-off is over, then continue.
-                    this.log.debug(`[MAP] ${label}: rate limited, pausing before ${commandLabel}.`);
-                    await new Promise(resolve => setTimeout(resolve, this.RATE_LIMIT_BACKOFF_MS + 2_000));
+                    this.log.debug(`[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1000)}s before ${commandLabel}.`);
+                    await new Promise(resolve => setTimeout(resolve, Math.max(waitMs, 0)));
                 }
             }
         };

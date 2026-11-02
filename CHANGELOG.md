@@ -18,6 +18,13 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   bindings list are now sent to the Aliyun path directly (logged once at start), and a Mammotion
   `50103/50104` answer falls back to Aliyun for that command. The wake-up request is only used for
   Mammotion-platform devices.
+- **Respect the cloud send quota of Aliyun-era mowers.** Firmware below 1.30.25.1 has a cloud send quota;
+  after many requests the cloud answers 429 for hours (live: the quota of a Luba 2 AWD on 1.11.1.16 was
+  used up after a day of testing). The 429 back-off now starts at 1 minute and doubles per consecutive 429
+  up to 1 hour instead of a flat 30 s, which only kept knocking. Background requests of Aliyun-only
+  devices keep to an own budget of 400 per 12 hours (PyMammotion uses 600); commands a user triggers are
+  not counted. The status report of such devices is refreshed every 5 minutes while working and every
+  60 minutes otherwise. Map loading no longer waits out long back-offs.
 - **No more 429 bursts.** Invokes to the same device are now queued with at least 1.5 s between them (the
   Aliyun invoke answered 429 to a second call 0.35 s after the first). Map loading waits out a 429
   back-off and continues instead of failing.
