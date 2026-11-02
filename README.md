@@ -144,7 +144,27 @@ mammotion.0
     │   ├── totalWorkTimeSec, totalMileageM, taskAreaM2
     │   ├── lastTopic, lastPayload, lastEventId, lastProtoContent (debug)
     │   ├── lastUpdate
-    │   └── areasJson
+    │   ├── areasJson
+    │   ├── chargeState, lastStatus, sensorStatus, selfCheckStatus, lockState   (status report)
+    │   ├── headlampOn, batteryHeating                                         (status report)
+    │   ├── rtkStatus, rtkStatusText, positionLevel                            (status report)
+    │   ├── gpsSatellites, gpsSatellitesL2, coViewSatellites                   (status report)
+    │   ├── posX, posY (m, local map), headingRaw, positionType                (status report)
+    │   ├── currentZoneHash, mapHash                                           (status report)
+    │   ├── mowProgressPct, mowedArea, jobTotalMin, jobRemainingMin            (status report)
+    │   ├── jobProgressRaw, jobKnifeHeightMm, jobBreakpointReason, navRunMode  (status report)
+    │   └── connectType, bleRssi, mobileRssi                                   (status report)
+    ├── maintenance.*
+    │   └── mileageM, workTimeSec, batteryCycles, bladeUsedHours, bladeWarnHours
+    ├── basestation.*
+    │   └── version, status
+    ├── errors.*
+    │   ├── code, time, listJson                (last ten errors reported by the mower)
+    │   ├── lastWarningCode, lastWarningTime    (device_warning_event)
+    │   └── lastNotificationCode, lastNotificationType, lastNotificationTime
+    ├── map.*
+    │   ├── baseLatitude, baseLongitude, baseYawDeg   (origin of the local map)
+    │   └── dockX, dockY, dockHeadingRaw              (charging station, local metres)
     ├── commands.*
     │   ├── start, pause, resume, stop, dock, cancelJob, cancelDock     (button)
     │   ├── applyTaskSettings, applyNonWorkHours, applyBladeControl     (button)

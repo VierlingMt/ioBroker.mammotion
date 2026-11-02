@@ -9,7 +9,31 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- **Status report is now decoded.** The adapter has always subscribed to the mower's status report
+  (`MctlSys.todev_report_cfg`, sys field 38) but ignored the answer (`toapp_report_data`, sys field 39).
+  It is now decoded into new read-only states: charging state, lock state, headlamp, battery heating,
+  RTK fix status and satellites, local map position, current zone, job progress / mowed area / job time,
+  connectivity, maintenance counters (mileage, work time, battery cycles, blade hours) and the RTK base
+  station version. See README "Object tree" for the full list.
+- **Error codes.** `errors.code`, `errors.time` and `errors.listJson` hold the ten most recent error codes
+  the mower pushes in its update buffer (sys field 27, type 2), as positive numbers, newest first.
+  `device_warning_event` and the notification events (`device_notification_event`,
+  `device_warning_code_event`, `device_information_event`) fill `errors.lastWarning*` and
+  `errors.lastNotification*`. Only the numbers are exposed; the adapter ships no error texts.
+- **Map anchor.** `map.baseLatitude/baseLongitude/baseYawDeg` (origin and rotation of the local map) and
+  `map.dockX/dockY` (charging station) from the update buffer (type 1), or from the RTK info for models
+  without a base station. Groundwork for drawing zones on a map.
+- **Periodic report refresh.** The report only flows for a short time after each request, so the adapter
+  re-requests it every 2 minutes while the mower is working, returning or paused, and every 10 minutes
+  otherwise, only while `telemetry.connected` is true.
+- Decoder logic lives in `src/lib/mower-report.ts` with unit tests on hand-built protobuf frames.
+
+### Notes
+- `jobTotalMin` / `jobRemainingMin` split the packed `work.progress` field (low/high 16 bits). This
+  interpretation is not yet verified on a live device; `jobProgressRaw` keeps the raw value.
+- `headingRaw` is the raw heading divided by 10000; the unit (degrees or radians) still has to be
+  confirmed live.
 
 ## [0.0.17] – 2026-09-06
 

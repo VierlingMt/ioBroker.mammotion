@@ -25,6 +25,7 @@ var utils = __toESM(require("@iobroker/adapter-core"));
 var import_axios = __toESM(require("axios"));
 var import_node_crypto = require("node:crypto");
 var import_device_list = require("./lib/device-list");
+var import_mower_report = require("./lib/mower-report");
 var import_product_keys = require("./lib/product-keys");
 const mqtt = require("mqtt");
 const MAMMOTION_DOMAIN = "https://id.mammotion.com";
@@ -146,6 +147,9 @@ const IDLE_DEVICE_STATES = /* @__PURE__ */ new Set([0, 1, 2, 8, 10, 11, 12, 15, 
 const HEALTH_BENIGN_IDLE_STATES = /* @__PURE__ */ new Set([0, 1, 10, 11, 15, 16, 22, 39]);
 const HEALTH_FAULT_STATES = /* @__PURE__ */ new Set([2, 8, 12, 23, 37]);
 const HEALTH_CHECK_INTERVAL_MS = 6e4;
+const REPORT_REFRESH_ACTIVE_MS = 2 * 6e4;
+const REPORT_REFRESH_IDLE_MS = 10 * 6e4;
+const REPORT_ACTIVE_STATES = /* @__PURE__ */ new Set([13, 14, 19, 20]);
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
 const AREA_NAME_RETRY_DELAYS_MS = [5e3, 1e4, 2e4, 3e4, 6e4];
@@ -168,6 +172,8 @@ class Mammotion extends utils.Adapter {
   reconnectTimer = null;
   legacyPollTimer = null;
   healthCheckTimer = null;
+  /** Last periodic status-report request per device key (unix ms). */
+  reportRequestedAt = /* @__PURE__ */ new Map();
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
   deviceHealthSnapshots = /* @__PURE__ */ new Map();
   // Per-device current health-problem flag, used to log only on transitions.
@@ -975,6 +981,9 @@ class Mammotion extends utils.Adapter {
     }
   }
   async requestIotSync(context, stop = false) {
+    if (!stop) {
+      this.reportRequestedAt.set(context.key, Date.now());
+    }
     try {
       await this.executeEncodedContentCommand(
         context,
@@ -1419,6 +1428,11 @@ class Mammotion extends utils.Adapter {
     const params = data.params;
     if (params == null ? void 0 : params.identifier) {
       await this.setStateChangedAsync(`${channelId}.telemetry.lastEventId`, `${params.identifier}`, true);
+      const eventUpdates = (0, import_mower_report.decodeDeviceEvent)(params, Date.now());
+      if (eventUpdates) {
+        this.log.debug(`[EVENT] ${deviceKey}: ${params.identifier} ${JSON.stringify(eventUpdates)}`);
+        await this.applyStateUpdates(deviceKey, eventUpdates);
+      }
     }
     const payloadPk = typeof (params == null ? void 0 : params.productKey) === "string" ? params.productKey : "";
     const payloadDn = typeof (params == null ? void 0 : params.deviceName) === "string" ? params.deviceName : "";
@@ -2261,7 +2275,26 @@ class Mammotion extends utils.Adapter {
       } catch (err) {
         this.log.debug(`[HEALTH] Evaluation failed for ${ctx.key}: ${err.message}`);
       }
+      try {
+        await this.refreshStatusReportIfDue(ctx);
+      } catch (err) {
+        this.log.debug(`[REPORT] Refresh failed for ${ctx.key}: ${err.message}`);
+      }
     }
+  }
+  async refreshStatusReportIfDue(ctx) {
+    var _a, _b;
+    const connected = await this.getStateAsync(`devices.${ctx.key}.telemetry.connected`);
+    if ((connected == null ? void 0 : connected.val) !== true) {
+      return;
+    }
+    const stateVal = (_a = await this.getStateAsync(`devices.${ctx.key}.telemetry.deviceState`)) == null ? void 0 : _a.val;
+    const interval = REPORT_ACTIVE_STATES.has(Number(stateVal)) ? REPORT_REFRESH_ACTIVE_MS : REPORT_REFRESH_IDLE_MS;
+    const now = Date.now();
+    if (now - ((_b = this.reportRequestedAt.get(ctx.key)) != null ? _b : 0) < interval) {
+      return;
+    }
+    await this.requestIotSync(ctx);
   }
   /**
    * Robust problem detection that does NOT rely on telemetry.connected / telemetry.lastUpdate,
@@ -3436,6 +3469,15 @@ ${url}`;
       }
     } catch {
     }
+    try {
+      const updates = (0, import_mower_report.decodeLubaReports)(protoBase64);
+      if (updates.length > 0) {
+        this.log.debug(`[REPORT] ${deviceKey}: ${updates.length} values from status report`);
+        await this.applyStateUpdates(deviceKey, updates);
+      }
+    } catch (err) {
+      this.log.debug(`[REPORT] ${deviceKey}: decode failed: ${err.message}`);
+    }
   }
   resolveCommDataAck(deviceKey, protoBase64) {
     var _a, _b, _c, _d;
@@ -4485,6 +4527,33 @@ ${url}`;
     await this.setObjectNotExistsAsync("account.userAccount", this.createReadonlyState("Account user account", "string", "text"));
     await this.setObjectNotExistsAsync("account.iotDomain", this.createReadonlyState("IoT API domain", "string", "text"));
   }
+  // States filled by the status report, the update buffer and warning events (see lib/mower-report).
+  async ensureReportStateObjects(channelId) {
+    const channels = {
+      maintenance: "Maintenance",
+      basestation: "RTK base station",
+      errors: "Errors and warnings",
+      map: "Map anchor"
+    };
+    for (const [id, name] of Object.entries(channels)) {
+      await this.extendObjectAsync(`${channelId}.${id}`, { type: "channel", common: { name }, native: {} });
+    }
+    for (const def of import_mower_report.REPORT_STATE_DEFS) {
+      const obj = this.createReadonlyState(def.name, def.type, def.role, def.states);
+      if (def.unit) {
+        obj.common.unit = def.unit;
+      }
+      await this.setObjectNotExistsAsync(`${channelId}.${def.id}`, obj);
+    }
+  }
+  async applyStateUpdates(deviceKey, updates) {
+    for (const update of updates) {
+      await this.setStateChangedAsync(`devices.${deviceKey}.${update.id}`, update.value, true);
+      if (update.id === "telemetry.deviceState" && typeof update.value === "number") {
+        this.triggerStartSettingsEnforceIfDeviceActive(deviceKey, update.value);
+      }
+    }
+  }
   createReadonlyState(name, type, role, states, expert = false) {
     return {
       type: "state",
@@ -4562,6 +4631,7 @@ ${url}`;
     await this.setObjectNotExistsAsync(`${channelId}.telemetry.totalWorkTimeSec`, this.createReadonlyState("Total work time (seconds)", "number", "value.interval"));
     await this.setObjectNotExistsAsync(`${channelId}.telemetry.totalMileageM`, this.createReadonlyState("Total mileage (meters)", "number", "value.distance"));
     await this.setObjectNotExistsAsync(`${channelId}.telemetry.taskAreaM2`, this.createReadonlyState("Current task area (m\xB2)", "number", "value"));
+    await this.ensureReportStateObjects(channelId);
     await this.extendObjectAsync(`${channelId}.commands`, { type: "channel", common: { name: "Commands" }, native: {} });
     await this.setObjectNotExistsAsync(`${channelId}.commands.start`, this.createCommandState("Start mowing"));
     await this.setObjectNotExistsAsync(`${channelId}.commands.pause`, this.createCommandState("Pause mowing"));
