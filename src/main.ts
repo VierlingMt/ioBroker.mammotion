@@ -218,6 +218,8 @@ class Mammotion extends utils.Adapter {
     /** Last wake-up request per device key (unix ms). */
     private readonly lastWakeAt = new Map<string, number>();
     private deviceSourcesLogged = false;
+    /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
+    private readonly aliyunOnlyDevices = new Set<string>();
     // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
     private deviceHealthSnapshots = new Map<string, { fingerprint: string; lastChangeAt: number }>();
     // Per-device current health-problem flag, used to log only on transitions.
@@ -1928,7 +1930,7 @@ class Mammotion extends utils.Adapter {
             }
             const now = Date.now();
             const userDriven = now - (this.userIntentAt.get(context.key) ?? 0) < USER_INTENT_WINDOW_MS;
-            if (!userDriven) {
+            if (!userDriven || this.aliyunOnlyDevices.has(context.key)) {
                 throw err;
             }
             const label = context.deviceName || context.iotId;
@@ -1990,6 +1992,7 @@ class Mammotion extends utils.Adapter {
 
         let modernFailureWasRateLimit = false;
         let modernFailureWasServerError = false;
+        let modernOffline = false;
         try {
             return await this.invokeTaskControlCommandModern(session, context, content);
         } catch (err) {
@@ -2002,8 +2005,10 @@ class Mammotion extends utils.Adapter {
             // "Access to this resource requires authentication" (shared-account devices),
             // 429 (account-level rate limit on the modern endpoint - legacy uses a different
             // endpoint with separate quota), and 5xx (transient cloud problems).
+            modernOffline = msg.includes('mammotion code 50104') || msg.includes('mammotion code 50103');
             const shouldFallback =
-                msg.includes('invalid device')
+                modernOffline
+                || msg.includes('invalid device')
                 || msg.includes('access to this resource')
                 || modernFailureWasRateLimit
                 || modernFailureWasServerError;
@@ -2017,7 +2022,9 @@ class Mammotion extends utils.Adapter {
         // Only "structural" refusals (invalid device / access denied) prove the device permanently
         // belongs on the legacy path. 429 and 5xx are transient, so do not cache the routing
         // decision - the next command should retry modern first.
-        const cacheLegacyOnly = !modernFailureWasRateLimit && !modernFailureWasServerError;
+        // A Mammotion "offline" answer can also mean a sleeping Mammotion-platform device:
+        // try Aliyun for this command, but do not pin the device to Aliyun.
+        const cacheLegacyOnly = !modernFailureWasRateLimit && !modernFailureWasServerError && !modernOffline;
         if (cacheLegacyOnly) {
             this.legacyOnlyDevices.add(context.key);
         }
@@ -2250,16 +2257,38 @@ class Mammotion extends utils.Adapter {
         await this.syncDevices(devices, records);
         await this.setStateChangedAsync('info.deviceCount', this.deviceContexts.size, true);
 
+        // Devices the Mammotion platform does not list (device list / device page) live on
+        // Aliyun only. The Mammotion invoke answers 50104 "offline" for them and its broker
+        // drops subscriptions to their topics, so they go straight to the Aliyun path.
+        const modernIotIds = new Set(
+            [...devices.map(d => d.iotId), ...modernRecords.map(r => r.iotId)].filter((id): id is string => !!id),
+        );
+        this.aliyunOnlyDevices.clear();
+        for (const ctx of this.deviceContexts.values()) {
+            if (!modernIotIds.has(ctx.iotId)) {
+                this.aliyunOnlyDevices.add(ctx.key);
+                this.legacyOnlyDevices.add(ctx.key);
+            }
+        }
+        if (this.aliyunOnlyDevices.size) {
+            this.log.info(
+                `${this.aliyunOnlyDevices.size} device(s) are known to the Aliyun cloud only; commands use the Aliyun path.`,
+            );
+        }
+
         // Try JWT MQTT for ALL records (modern or legacy/shared).
         // With owner credentias this grants ACL to physical device topics (thing/event/+/post)
         // which carries both proactive telemetry AND command responses like NavGetCommDataAck.
         // Skip while we are within a reconnect-storm backoff window – the Aliyun channel covers
         // shared devices in this case and re-creating JWT MQTT would only restart the loop.
+        // The Mammotion broker only serves devices of the Mammotion platform (device page),
+        // as in the app; subscribing Aliyun devices there gets the connection closed.
+        const jwtRecords = modernRecords;
         const jwtSuspended = Date.now() < this.jwtMqttDisabledUntil;
-        if (records.length && !jwtSuspended && (!this.mqttClient || !this.mqttClient.connected)) {
+        if (jwtRecords.length && !jwtSuspended && (!this.mqttClient || !this.mqttClient.connected)) {
             try {
                 const mqttAuth = await this.fetchMqttCredentias(session);
-                await this.connectMqtt(mqttAuth, records);
+                await this.connectMqtt(mqttAuth, jwtRecords);
             } catch (err) {
                 this.log.debug(`JWT MQTT credentias unavailable (${this.extractAxiosError(err)}), AEP fallback remains active.`);
                 if (this.mqttClient) {
@@ -2269,7 +2298,7 @@ class Mammotion extends utils.Adapter {
                 }
                 this.setJwtMqttConnected(false);
             }
-        } else if (records.length && jwtSuspended) {
+        } else if (jwtRecords.length && jwtSuspended) {
             this.log.debug(
                 `JWT MQTT suspended for another ${Math.max(
                     0,
@@ -2278,13 +2307,17 @@ class Mammotion extends utils.Adapter {
             );
             await this.ensureAliyunMqttRunning('jwt-suspended-refresh').catch(() => {});
         }
-        if (!records.length) {
+        if (!jwtRecords.length) {
             if (this.mqttClient) {
                 this.mqttClient.removeAllListeners();
                 this.mqttClient.end(true);
                 this.mqttClient = null;
             }
             this.setJwtMqttConnected(false);
+        }
+
+        if (!jwtRecords.length && this.deviceContexts.size) {
+            await this.ensureAliyunMqttRunning('aliyun-only-devices').catch(() => {});
         }
 
         if (this.deviceContexts.size) {

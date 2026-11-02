@@ -10,6 +10,18 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 ## [Unreleased]
 
 ### Fixed
+- **Commands for shared Aliyun devices work again.** Live diagnosis on a shared Luba 2 AWD (Aliyun product
+  key, firmware 1.11): the Mammotion platform lists the device in neither the device list nor the device
+  page for the shared account, only the Aliyun bindings do. The Mammotion invoke now answers
+  `50104 "The device is offline"` for such devices instead of the former "Invalid device", and the adapter
+  did not fall back to Aliyun on that answer, so every command failed. Devices that only the Aliyun
+  bindings list are now sent to the Aliyun path directly (logged once at start), and a Mammotion
+  `50103/50104` answer falls back to Aliyun for that command. The wake-up request is only used for
+  Mammotion-platform devices.
+- **JWT MQTT is only used for Mammotion-platform devices** (the device page), as in the app. Subscribing an
+  Aliyun device's topics on the Mammotion broker made it close the connection, which was the real cause of
+  the "keeps disconnecting" loop on shared accounts. Without such devices the adapter uses the Aliyun MQTT
+  channel only.
 - **JWT MQTT no longer drops every few seconds.** The adapter subscribed nine topics per device on the
   Mammotion broker; the app subscribes exactly three (`/sys/<pk>/<dn>/thing/event/+/post`,
   `/sys/proto/<pk>/<dn>/thing/event/+/post`, `/sys/<pk>/<dn>/app/down/thing/status`). The broker

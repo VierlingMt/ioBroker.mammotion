@@ -196,6 +196,8 @@ class Mammotion extends utils.Adapter {
   /** Last wake-up request per device key (unix ms). */
   lastWakeAt = /* @__PURE__ */ new Map();
   deviceSourcesLogged = false;
+  /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
+  aliyunOnlyDevices = /* @__PURE__ */ new Set();
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
   deviceHealthSnapshots = /* @__PURE__ */ new Map();
   // Per-device current health-problem flag, used to log only on transitions.
@@ -1674,7 +1676,7 @@ class Mammotion extends utils.Adapter {
       }
       const now = Date.now();
       const userDriven = now - ((_a = this.userIntentAt.get(context.key)) != null ? _a : 0) < USER_INTENT_WINDOW_MS;
-      if (!userDriven) {
+      if (!userDriven || this.aliyunOnlyDevices.has(context.key)) {
         throw err;
       }
       const label = context.deviceName || context.iotId;
@@ -1722,6 +1724,7 @@ class Mammotion extends utils.Adapter {
     }
     let modernFailureWasRateLimit = false;
     let modernFailureWasServerError = false;
+    let modernOffline = false;
     try {
       return await this.invokeTaskControlCommandModern(session, context, content);
     } catch (err) {
@@ -1729,14 +1732,15 @@ class Mammotion extends utils.Adapter {
       const status = import_axios.default.isAxiosError(err) ? (_b = err.response) == null ? void 0 : _b.status : void 0;
       modernFailureWasRateLimit = status === 429 || msg.includes("status code 429");
       modernFailureWasServerError = status !== void 0 && status >= 500 && status <= 599 || /status code 5\d\d/.test(msg);
-      const shouldFallback = msg.includes("invalid device") || msg.includes("access to this resource") || modernFailureWasRateLimit || modernFailureWasServerError;
+      modernOffline = msg.includes("mammotion code 50104") || msg.includes("mammotion code 50103");
+      const shouldFallback = modernOffline || msg.includes("invalid device") || msg.includes("access to this resource") || modernFailureWasRateLimit || modernFailureWasServerError;
       if (!shouldFallback) {
         this.armRateLimitBackoffIfNeeded(context, err);
         throw err;
       }
     }
     const wasKnown = this.legacyOnlyDevices.has(context.key);
-    const cacheLegacyOnly = !modernFailureWasRateLimit && !modernFailureWasServerError;
+    const cacheLegacyOnly = !modernFailureWasRateLimit && !modernFailureWasServerError && !modernOffline;
     if (cacheLegacyOnly) {
       this.legacyOnlyDevices.add(context.key);
     }
@@ -1926,11 +1930,27 @@ class Mammotion extends utils.Adapter {
     }
     await this.syncDevices(devices, records);
     await this.setStateChangedAsync("info.deviceCount", this.deviceContexts.size, true);
+    const modernIotIds = new Set(
+      [...devices.map((d) => d.iotId), ...modernRecords.map((r) => r.iotId)].filter((id) => !!id)
+    );
+    this.aliyunOnlyDevices.clear();
+    for (const ctx of this.deviceContexts.values()) {
+      if (!modernIotIds.has(ctx.iotId)) {
+        this.aliyunOnlyDevices.add(ctx.key);
+        this.legacyOnlyDevices.add(ctx.key);
+      }
+    }
+    if (this.aliyunOnlyDevices.size) {
+      this.log.info(
+        `${this.aliyunOnlyDevices.size} device(s) are known to the Aliyun cloud only; commands use the Aliyun path.`
+      );
+    }
+    const jwtRecords = modernRecords;
     const jwtSuspended = Date.now() < this.jwtMqttDisabledUntil;
-    if (records.length && !jwtSuspended && (!this.mqttClient || !this.mqttClient.connected)) {
+    if (jwtRecords.length && !jwtSuspended && (!this.mqttClient || !this.mqttClient.connected)) {
       try {
         const mqttAuth = await this.fetchMqttCredentias(session);
-        await this.connectMqtt(mqttAuth, records);
+        await this.connectMqtt(mqttAuth, jwtRecords);
       } catch (err) {
         this.log.debug(`JWT MQTT credentias unavailable (${this.extractAxiosError(err)}), AEP fallback remains active.`);
         if (this.mqttClient) {
@@ -1940,7 +1960,7 @@ class Mammotion extends utils.Adapter {
         }
         this.setJwtMqttConnected(false);
       }
-    } else if (records.length && jwtSuspended) {
+    } else if (jwtRecords.length && jwtSuspended) {
       this.log.debug(
         `JWT MQTT suspended for another ${Math.max(
           0,
@@ -1950,13 +1970,17 @@ class Mammotion extends utils.Adapter {
       await this.ensureAliyunMqttRunning("jwt-suspended-refresh").catch(() => {
       });
     }
-    if (!records.length) {
+    if (!jwtRecords.length) {
       if (this.mqttClient) {
         this.mqttClient.removeAllListeners();
         this.mqttClient.end(true);
         this.mqttClient = null;
       }
       this.setJwtMqttConnected(false);
+    }
+    if (!jwtRecords.length && this.deviceContexts.size) {
+      await this.ensureAliyunMqttRunning("aliyun-only-devices").catch(() => {
+      });
     }
     if (this.deviceContexts.size) {
       this.startLegacyPolling();
