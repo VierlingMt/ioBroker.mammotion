@@ -297,7 +297,7 @@ class Mammotion extends utils.Adapter {
       await this.subscribeStatesAsync("devices.*.commands.*");
       await this.subscribeStatesAsync("devices.*.zones.*.start");
       await this.requestIotSyncForAllDevices();
-      await this.requestAreaNamesForAllDevices();
+      await this.requestAreaNamesForMissingDevices();
       this.log.info(
         `Initialization successful: ${this.deviceContexts.size} device(s), telemetry via ${this.mqttClient ? "MQTT" : this.legacySession ? "Aliyun Polling" : "no active channel"}.`
       );
@@ -1648,7 +1648,9 @@ class Mammotion extends utils.Adapter {
       response = await invoke("", "");
     }
     if (response.code !== 0) {
-      this.log.debug(`[MODERN-INVOKE] ${context.deviceName || context.iotId}: code=${response.code} msg=${response.msg}`);
+      this.log.debug(
+        `[MODERN-INVOKE] ${context.deviceName || context.iotId}: code=${response.code} msg=${response.msg}`
+      );
       throw new Error(`${response.msg || "Command invoke failed"} [mammotion code ${response.code}]`);
     }
     this.log.debug(`[MODERN-INVOKE] result len=${(_c = (_b = (_a = response.data) == null ? void 0 : _a.result) == null ? void 0 : _b.length) != null ? _c : 0}`);
@@ -3719,16 +3721,6 @@ ${url}`;
     } catch {
     }
   }
-  async requestAreaNamesForAllDevices() {
-    for (const ctx of this.deviceContexts.values()) {
-      try {
-        await this.sendAreaNameListRequest(ctx);
-        this.startAreaNameRetry(ctx.key);
-      } catch (err) {
-        this.log.debug(`Area-name request failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
-      }
-    }
-  }
   async requestAreaNamesForMissingDevices() {
     const now = Date.now();
     for (const ctx of this.deviceContexts.values()) {
@@ -3945,7 +3937,10 @@ ${url}`;
       await this.fetchMap(ctx);
     } catch (err) {
       if (this.isDeviceOfflineError(err)) {
-        this.mapAutoFetchedAt.set(deviceKey, Date.now() - MAP_AUTO_FETCH_MIN_INTERVAL_MS + MAP_AUTO_FETCH_RETRY_MS);
+        this.mapAutoFetchedAt.set(
+          deviceKey,
+          Date.now() - MAP_AUTO_FETCH_MIN_INTERVAL_MS + MAP_AUTO_FETCH_RETRY_MS
+        );
         this.log.info(`[MAP] ${ctx.deviceName || deviceKey} went offline while loading the map, will retry.`);
         return;
       }
@@ -4047,7 +4042,11 @@ ${url}`;
       var _a;
       for (let attempt = 0; ; attempt++) {
         try {
-          const result = await this.executeEncodedContentCommand(ctx, commandLabel, (session) => build(session));
+          const result = await this.executeEncodedContentCommand(
+            ctx,
+            commandLabel,
+            (session) => build(session)
+          );
           if (result && result !== "ok" && result.length > 20) {
             accept(result);
           }
@@ -4059,7 +4058,9 @@ ${url}`;
           if (attempt >= 1 || !(msg.includes("429") || msg.includes("rate-limited")) || waitMs > 2 * 6e4) {
             throw err;
           }
-          this.log.debug(`[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1e3)}s before ${commandLabel}.`);
+          this.log.debug(
+            `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1e3)}s before ${commandLabel}.`
+          );
           await new Promise((resolve) => setTimeout(resolve, Math.max(waitMs, 0)));
         }
       }

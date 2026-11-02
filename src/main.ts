@@ -335,7 +335,10 @@ class Mammotion extends utils.Adapter {
             await this.subscribeStatesAsync('devices.*.commands.*');
             await this.subscribeStatesAsync('devices.*.zones.*.start');
             await this.requestIotSyncForAllDevices();
-            await this.requestAreaNamesForAllDevices();
+            // Zones survive restarts as states; asking again on every start costs one cloud
+            // request per map element, which Aliyun-era mowers pay from a tight send quota.
+            // commands.requestAreaNames still refreshes them on demand.
+            await this.requestAreaNamesForMissingDevices();
 
             this.log.info(
                 `Initialization successful: ${this.deviceContexts.size} device(s), telemetry via ${
@@ -1908,7 +1911,9 @@ class Mammotion extends utils.Adapter {
         }
 
         if (response.code !== 0) {
-            this.log.debug(`[MODERN-INVOKE] ${context.deviceName || context.iotId}: code=${response.code} msg=${response.msg}`);
+            this.log.debug(
+                `[MODERN-INVOKE] ${context.deviceName || context.iotId}: code=${response.code} msg=${response.msg}`,
+            );
             throw new Error(`${response.msg || 'Command invoke failed'} [mammotion code ${response.code}]`);
         }
         this.log.debug(`[MODERN-INVOKE] result len=${response.data?.result?.length ?? 0}`);
@@ -2070,11 +2075,11 @@ class Mammotion extends utils.Adapter {
             // endpoint with separate quota), and 5xx (transient cloud problems).
             modernOffline = msg.includes('mammotion code 50104') || msg.includes('mammotion code 50103');
             const shouldFallback =
-                modernOffline
-                || msg.includes('invalid device')
-                || msg.includes('access to this resource')
-                || modernFailureWasRateLimit
-                || modernFailureWasServerError;
+                modernOffline ||
+                msg.includes('invalid device') ||
+                msg.includes('access to this resource') ||
+                modernFailureWasRateLimit ||
+                modernFailureWasServerError;
             if (!shouldFallback) {
                 this.armRateLimitBackoffIfNeeded(context, err);
                 throw err;
@@ -4349,17 +4354,6 @@ class Mammotion extends utils.Adapter {
     }
 
 
-    private async requestAreaNamesForAllDevices(): Promise<void> {
-        for (const ctx of this.deviceContexts.values()) {
-            try {
-                await this.sendAreaNameListRequest(ctx);
-                this.startAreaNameRetry(ctx.key);
-            } catch (err) {
-                this.log.debug(`Area-name request failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
-            }
-        }
-    }
-
     private async requestAreaNamesForMissingDevices(): Promise<void> {
         const now = Date.now();
         for (const ctx of this.deviceContexts.values()) {
@@ -4603,7 +4597,10 @@ class Mammotion extends utils.Adapter {
         } catch (err) {
             if (this.isDeviceOfflineError(err)) {
                 // Asleep again: try again with the next report instead of waiting the full interval.
-                this.mapAutoFetchedAt.set(deviceKey, Date.now() - MAP_AUTO_FETCH_MIN_INTERVAL_MS + MAP_AUTO_FETCH_RETRY_MS);
+                this.mapAutoFetchedAt.set(
+                    deviceKey,
+                    Date.now() - MAP_AUTO_FETCH_MIN_INTERVAL_MS + MAP_AUTO_FETCH_RETRY_MS,
+                );
                 this.log.info(`[MAP] ${ctx.deviceName || deviceKey} went offline while loading the map, will retry.`);
                 return;
             }
@@ -4711,7 +4708,9 @@ class Mammotion extends utils.Adapter {
         const send = async (commandLabel: string, build: (session: AuthSession) => string): Promise<void> => {
             for (let attempt = 0; ; attempt++) {
                 try {
-                    const result = await this.executeEncodedContentCommand(ctx, commandLabel, session => build(session));
+                    const result = await this.executeEncodedContentCommand(ctx, commandLabel, session =>
+                        build(session),
+                    );
                     if (result && result !== 'ok' && result.length > 20) {
                         accept(result);
                     }
@@ -4724,7 +4723,9 @@ class Mammotion extends utils.Adapter {
                     if (attempt >= 1 || !(msg.includes('429') || msg.includes('rate-limited')) || waitMs > 2 * 60_000) {
                         throw err;
                     }
-                    this.log.debug(`[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1000)}s before ${commandLabel}.`);
+                    this.log.debug(
+                        `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1000)}s before ${commandLabel}.`,
+                    );
                     await new Promise(resolve => setTimeout(resolve, Math.max(waitMs, 0)));
                 }
             }
