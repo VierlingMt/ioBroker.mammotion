@@ -1286,15 +1286,9 @@ class Mammotion extends utils.Adapter {
       const topics = /* @__PURE__ */ new Set();
       for (const record of records) {
         if (record.productKey && record.deviceName) {
-          topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/status`);
           topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/+/post`);
           topics.add(`/sys/proto/${record.productKey}/${record.deviceName}/thing/event/+/post`);
-          topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/properties`);
-          topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/events`);
-          topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/model/down_raw`);
-          topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/_thing/event/notify`);
-          topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/event/property/post_reply`);
-          topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/property/post`);
+          topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/status`);
         }
       }
       const isDeviceTopic = (t) => t.includes("/thing/event/") || t.includes("/thing/event/+/");
@@ -1476,12 +1470,16 @@ class Mammotion extends utils.Adapter {
         this.subscribedDeviceTopics.add(deviceTopicKey);
         const mqttClient = this.aliyunMqttClient || this.mqttClient;
         if (mqttClient == null ? void 0 : mqttClient.connected) {
-          const deviceTopics = [
+          const deviceTopics = mqttClient === this.aliyunMqttClient ? [
             `/sys/${payloadPk}/${payloadDn}/thing/event/+/post`,
             `/sys/proto/${payloadPk}/${payloadDn}/thing/event/+/post`,
             `/sys/${payloadPk}/${payloadDn}/app/down/thing/model/down_raw`,
             `/sys/${payloadPk}/${payloadDn}/app/down/_thing/event/notify`,
             `/sys/${payloadPk}/${payloadDn}/app/down/thing/event/property/post_reply`
+          ] : [
+            `/sys/${payloadPk}/${payloadDn}/thing/event/+/post`,
+            `/sys/proto/${payloadPk}/${payloadDn}/thing/event/+/post`,
+            `/sys/${payloadPk}/${payloadDn}/app/down/thing/status`
           ];
           for (const dt of deviceTopics) {
             mqttClient.subscribe(dt, { qos: 1 }, (err) => {

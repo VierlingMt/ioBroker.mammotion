@@ -9,6 +9,15 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
+### Fixed
+- **JWT MQTT no longer drops every few seconds.** The adapter subscribed nine topics per device on the
+  Mammotion broker; the app subscribes exactly three (`/sys/<pk>/<dn>/thing/event/+/post`,
+  `/sys/proto/<pk>/<dn>/thing/event/+/post`, `/sys/<pk>/<dn>/app/down/thing/status`). The broker
+  closes the connection on any other topic, which caused the "keeps disconnecting" loop, the 30-minute
+  suspension and the fallback to the Aliyun channel. Mowers that moved to the Mammotion platform
+  (newer firmware) are reported "offline" by Aliyun although they are online, so every command failed.
+  The adapter now subscribes only the app's three topics on the Mammotion broker.
+
 ### Added
 - **Status report is now decoded.** The adapter has always subscribed to the mower's status report
   (`MctlSys.todev_report_cfg`, sys field 38) but ignored the answer (`toapp_report_data`, sys field 39).

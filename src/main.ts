@@ -1447,18 +1447,16 @@ class Mammotion extends utils.Adapter {
             this.authFailureSince = 0;
             this.jwtMqttLastErrorMessage = '';
 
+            // Exactly the three topics the Mammotion app subscribes per device. The broker's ACL
+            // closes the connection on any other topic (the former extra app/down/* and
+            // property topics caused the "keeps disconnecting" loop); property posts arrive as
+            // .../thing/event/property/post, which the first wildcard covers.
             const topics = new Set<string>();
             for (const record of records) {
                 if (record.productKey && record.deviceName) {
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/status`);
                     topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/+/post`);
                     topics.add(`/sys/proto/${record.productKey}/${record.deviceName}/thing/event/+/post`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/properties`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/events`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/model/down_raw`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/_thing/event/notify`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/event/property/post_reply`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/property/post`);
+                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/status`);
                 }
             }
 
@@ -1675,13 +1673,22 @@ class Mammotion extends utils.Adapter {
                 this.subscribedDeviceTopics.add(deviceTopicKey);
                 const mqttClient = this.aliyunMqttClient || this.mqttClient;
                 if (mqttClient?.connected) {
-                    const deviceTopics = [
-                        `/sys/${payloadPk}/${payloadDn}/thing/event/+/post`,
-                        `/sys/proto/${payloadPk}/${payloadDn}/thing/event/+/post`,
-                        `/sys/${payloadPk}/${payloadDn}/app/down/thing/model/down_raw`,
-                        `/sys/${payloadPk}/${payloadDn}/app/down/_thing/event/notify`,
-                        `/sys/${payloadPk}/${payloadDn}/app/down/thing/event/property/post_reply`,
-                    ];
+                    // The Mammotion (JWT) broker only allows the app's three topics; the extra
+                    // app/down/* topics are for the Aliyun broker.
+                    const deviceTopics =
+                        mqttClient === this.aliyunMqttClient
+                            ? [
+                                  `/sys/${payloadPk}/${payloadDn}/thing/event/+/post`,
+                                  `/sys/proto/${payloadPk}/${payloadDn}/thing/event/+/post`,
+                                  `/sys/${payloadPk}/${payloadDn}/app/down/thing/model/down_raw`,
+                                  `/sys/${payloadPk}/${payloadDn}/app/down/_thing/event/notify`,
+                                  `/sys/${payloadPk}/${payloadDn}/app/down/thing/event/property/post_reply`,
+                              ]
+                            : [
+                                  `/sys/${payloadPk}/${payloadDn}/thing/event/+/post`,
+                                  `/sys/proto/${payloadPk}/${payloadDn}/thing/event/+/post`,
+                                  `/sys/${payloadPk}/${payloadDn}/app/down/thing/status`,
+                              ];
                     for (const dt of deviceTopics) {
                         mqttClient.subscribe(dt, { qos: 1 }, (err: Error | null) => {
                             if (err) {
