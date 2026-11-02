@@ -25,7 +25,7 @@ var utils = __toESM(require("@iobroker/adapter-core"));
 var import_axios = __toESM(require("axios"));
 var import_node_crypto = require("node:crypto");
 var import_device_list = require("./lib/device-list");
-var import_mower_report = require("./lib/mower-report");
+var import_mower_protocol = require("./lib/mower-protocol");
 var import_product_keys = require("./lib/product-keys");
 const mqtt = require("mqtt");
 const MAMMOTION_DOMAIN = "https://id.mammotion.com";
@@ -150,6 +150,11 @@ const HEALTH_CHECK_INTERVAL_MS = 6e4;
 const REPORT_REFRESH_ACTIVE_MS = 2 * 6e4;
 const REPORT_REFRESH_IDLE_MS = 10 * 6e4;
 const REPORT_ACTIVE_STATES = /* @__PURE__ */ new Set([13, 14, 19, 20]);
+const MAP_FRAME_TIMEOUT_MS = 8e3;
+const MAP_SYNC_REFRESH_MS = 1e4;
+const MAP_FETCH_MAX_MS = 15 * 6e4;
+const MAP_MAX_ELEMENTS = 300;
+const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 6e4;
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
 const AREA_NAME_RETRY_DELAYS_MS = [5e3, 1e4, 2e4, 3e4, 6e4];
@@ -174,6 +179,10 @@ class Mammotion extends utils.Adapter {
   healthCheckTimer = null;
   /** Last periodic status-report request per device key (unix ms). */
   reportRequestedAt = /* @__PURE__ */ new Map();
+  /** Receives every protobuf message of a device while its map is loading. */
+  mapFrameListeners = /* @__PURE__ */ new Map();
+  /** Last automatic map load per device key (unix ms). */
+  mapAutoFetchedAt = /* @__PURE__ */ new Map();
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
   deviceHealthSnapshots = /* @__PURE__ */ new Map();
   // Per-device current health-problem flag, used to log only on transitions.
@@ -430,6 +439,14 @@ class Mammotion extends utils.Adapter {
       const deviceKey2 = startSingleZoneMatch[1];
       const zoneName = startSingleZoneMatch[2];
       void this.handleStartSingleZone(deviceKey2, zoneName, localId);
+      return;
+    }
+    const requestMapMatch = localId.match(/^devices\.([^.]+)\.commands\.requestMap$/);
+    if (requestMapMatch) {
+      if (state.val !== true) {
+        return;
+      }
+      void this.handleRequestMap(requestMapMatch[1], localId);
       return;
     }
     const requestAreaNamesMatch = localId.match(/^devices\.([^.]+)\.commands\.requestAreaNames$/);
@@ -1342,7 +1359,7 @@ class Mammotion extends utils.Adapter {
     });
   }
   async handleMqttMessage(topic, payload) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa;
     const topicParts = topic.split("/");
     this.log.debug(`[MQTT] topic=${topic} payloadLen=${payload.length}`);
     if (topicParts.length < 5) {
@@ -1406,6 +1423,7 @@ class Mammotion extends utils.Adapter {
         await this.setStateChangedAsync(`${channelId}.telemetry.lastProtoContent`, rawBase64, true);
       }
       this.resolveCommDataAck(deviceKey, rawBase64);
+      (_e = this.mapFrameListeners.get(deviceKey)) == null ? void 0 : _e(rawBase64);
       void this.parseMctlSysProto(deviceKey, rawBase64);
       const areas = this.tryParseAreaHashNames(rawBase64);
       if (areas && areas.length > 0) {
@@ -1413,7 +1431,7 @@ class Mammotion extends utils.Adapter {
         this.log.debug(`[MQTT] Zone names received (raw): ${areas.length} entries cached`);
       }
       const hashIds = this.tryParseNavGetHashListAck(rawBase64, deviceKey);
-      if (hashIds && hashIds.length > 0 && ctx) {
+      if (hashIds && hashIds.length > 0 && ctx && !this.mapFrameListeners.has(deviceKey)) {
         this.log.debug(`[MQTT] NavGetHashListAck (raw): ${hashIds.length} Hashes, requesting names`);
         await this.requestAreaNamesForHashes(ctx, hashIds);
       } else if (!areas || areas.length === 0) {
@@ -1428,7 +1446,7 @@ class Mammotion extends utils.Adapter {
     const params = data.params;
     if (params == null ? void 0 : params.identifier) {
       await this.setStateChangedAsync(`${channelId}.telemetry.lastEventId`, `${params.identifier}`, true);
-      const eventUpdates = (0, import_mower_report.decodeDeviceEvent)(params, Date.now());
+      const eventUpdates = (0, import_mower_protocol.decodeDeviceEvent)(params, Date.now());
       if (eventUpdates) {
         this.log.debug(`[EVENT] ${deviceKey}: ${params.identifier} ${JSON.stringify(eventUpdates)}`);
         await this.applyStateUpdates(deviceKey, eventUpdates);
@@ -1462,47 +1480,47 @@ class Mammotion extends utils.Adapter {
       }
     }
     const statusValue = this.pickNumber(
-      (_e = params == null ? void 0 : params.status) == null ? void 0 : _e.value,
-      (_g = (_f = params == null ? void 0 : params.items) == null ? void 0 : _f.iotState) == null ? void 0 : _g.value,
+      (_f = params == null ? void 0 : params.status) == null ? void 0 : _f.value,
+      (_h = (_g = params == null ? void 0 : params.items) == null ? void 0 : _g.iotState) == null ? void 0 : _h.value,
       params == null ? void 0 : params.iotState,
-      (_h = data.iotState) == null ? void 0 : _h.value,
+      (_i = data.iotState) == null ? void 0 : _i.value,
       data.iotState
     );
     if (statusValue !== null) {
       await this.setStateChangedAsync(`${channelId}.telemetry.connected`, statusValue === 1, true);
     }
     const batteryValue = this.pickNumber(
-      (_j = (_i = params == null ? void 0 : params.items) == null ? void 0 : _i.batteryPercentage) == null ? void 0 : _j.value,
-      (_k = params == null ? void 0 : params.batteryPercentage) == null ? void 0 : _k.value,
+      (_k = (_j = params == null ? void 0 : params.items) == null ? void 0 : _j.batteryPercentage) == null ? void 0 : _k.value,
+      (_l = params == null ? void 0 : params.batteryPercentage) == null ? void 0 : _l.value,
       params == null ? void 0 : params.batteryPercentage,
-      (_l = data.batteryPercentage) == null ? void 0 : _l.value,
+      (_m = data.batteryPercentage) == null ? void 0 : _m.value,
       data.batteryPercentage
     );
     if (batteryValue !== null) {
       await this.setStateChangedAsync(`${channelId}.telemetry.batteryPercent`, batteryValue, true);
     }
     const knifeHeightValue = this.pickNumber(
-      (_n = (_m = params == null ? void 0 : params.items) == null ? void 0 : _m.knifeHeight) == null ? void 0 : _n.value,
-      (_o = params == null ? void 0 : params.knifeHeight) == null ? void 0 : _o.value,
+      (_o = (_n = params == null ? void 0 : params.items) == null ? void 0 : _n.knifeHeight) == null ? void 0 : _o.value,
+      (_p = params == null ? void 0 : params.knifeHeight) == null ? void 0 : _p.value,
       params == null ? void 0 : params.knifeHeight,
-      (_p = data.knifeHeight) == null ? void 0 : _p.value,
+      (_q = data.knifeHeight) == null ? void 0 : _q.value,
       data.knifeHeight
     );
     if (knifeHeightValue !== null) {
       await this.setStateChangedAsync(`${channelId}.telemetry.bladeHeightMm`, knifeHeightValue, true);
     }
     const deviceStateValue = this.pickNumber(
-      (_r = (_q = params == null ? void 0 : params.items) == null ? void 0 : _q.deviceState) == null ? void 0 : _r.value,
-      (_s = params == null ? void 0 : params.deviceState) == null ? void 0 : _s.value,
+      (_s = (_r = params == null ? void 0 : params.items) == null ? void 0 : _r.deviceState) == null ? void 0 : _s.value,
+      (_t = params == null ? void 0 : params.deviceState) == null ? void 0 : _t.value,
       params == null ? void 0 : params.deviceState,
-      (_t = data.deviceState) == null ? void 0 : _t.value,
+      (_u = data.deviceState) == null ? void 0 : _u.value,
       data.deviceState
     );
     if (deviceStateValue !== null) {
       await this.setStateChangedAsync(`${channelId}.telemetry.deviceState`, deviceStateValue, true);
       this.triggerStartSettingsEnforceIfDeviceActive(deviceKey, deviceStateValue);
     }
-    const coordinateValue = (_B = (_A = (_y = (_x = (_v = (_u = params == null ? void 0 : params.items) == null ? void 0 : _u.coordinate) == null ? void 0 : _v.value) != null ? _x : (_w = params == null ? void 0 : params.coordinate) == null ? void 0 : _w.value) != null ? _y : params == null ? void 0 : params.coordinate) != null ? _A : (_z = data.coordinate) == null ? void 0 : _z.value) != null ? _B : data.coordinate;
+    const coordinateValue = (_C = (_B = (_z = (_y = (_w = (_v = params == null ? void 0 : params.items) == null ? void 0 : _v.coordinate) == null ? void 0 : _w.value) != null ? _y : (_x = params == null ? void 0 : params.coordinate) == null ? void 0 : _x.value) != null ? _z : params == null ? void 0 : params.coordinate) != null ? _B : (_A = data.coordinate) == null ? void 0 : _A.value) != null ? _C : data.coordinate;
     if (coordinateValue) {
       const coordinate = typeof coordinateValue === "string" ? this.safeJsonParse(coordinateValue) : coordinateValue;
       if (coordinate && typeof coordinate === "object") {
@@ -1517,11 +1535,11 @@ class Mammotion extends utils.Adapter {
         }
       }
     }
-    const fwVersionMqtt = (_J = (_I = (_G = (_F = (_D = (_C = params == null ? void 0 : params.items) == null ? void 0 : _C.deviceVersion) == null ? void 0 : _D.value) != null ? _F : (_E = params == null ? void 0 : params.deviceVersion) == null ? void 0 : _E.value) != null ? _G : params == null ? void 0 : params.deviceVersion) != null ? _I : (_H = data.deviceVersion) == null ? void 0 : _H.value) != null ? _J : data.deviceVersion;
+    const fwVersionMqtt = (_K = (_J = (_H = (_G = (_E = (_D = params == null ? void 0 : params.items) == null ? void 0 : _D.deviceVersion) == null ? void 0 : _E.value) != null ? _G : (_F = params == null ? void 0 : params.deviceVersion) == null ? void 0 : _F.value) != null ? _H : params == null ? void 0 : params.deviceVersion) != null ? _J : (_I = data.deviceVersion) == null ? void 0 : _I.value) != null ? _K : data.deviceVersion;
     if (typeof fwVersionMqtt === "string" && fwVersionMqtt) {
       await this.setStateChangedAsync(`${channelId}.telemetry.firmwareVersion`, fwVersionMqtt, true);
     }
-    const networkInfoRawMqtt = (_R = (_Q = (_O = (_N = (_L = (_K = params == null ? void 0 : params.items) == null ? void 0 : _K.networkInfo) == null ? void 0 : _L.value) != null ? _N : (_M = params == null ? void 0 : params.networkInfo) == null ? void 0 : _M.value) != null ? _O : params == null ? void 0 : params.networkInfo) != null ? _Q : (_P = data.networkInfo) == null ? void 0 : _P.value) != null ? _R : data.networkInfo;
+    const networkInfoRawMqtt = (_S = (_R = (_P = (_O = (_M = (_L = params == null ? void 0 : params.items) == null ? void 0 : _L.networkInfo) == null ? void 0 : _M.value) != null ? _O : (_N = params == null ? void 0 : params.networkInfo) == null ? void 0 : _N.value) != null ? _P : params == null ? void 0 : params.networkInfo) != null ? _R : (_Q = data.networkInfo) == null ? void 0 : _Q.value) != null ? _S : data.networkInfo;
     const networkInfoMqtt = typeof networkInfoRawMqtt === "string" ? this.safeJsonParse(networkInfoRawMqtt) : networkInfoRawMqtt;
     if (networkInfoMqtt && typeof networkInfoMqtt === "object") {
       const wifiRssi = this.pickNumber(networkInfoMqtt.wifi_rssi);
@@ -1531,13 +1549,13 @@ class Mammotion extends utils.Adapter {
       const mileage = this.pickNumber(networkInfoMqtt.mileage);
       if (mileage !== null) await this.setStateChangedAsync(`${channelId}.telemetry.totalMileageM`, mileage, true);
     }
-    const deviceOtherInfoRawMqtt = (_Z = (_Y = (_W = (_V = (_T = (_S = params == null ? void 0 : params.items) == null ? void 0 : _S.deviceOtherInfo) == null ? void 0 : _T.value) != null ? _V : (_U = params == null ? void 0 : params.deviceOtherInfo) == null ? void 0 : _U.value) != null ? _W : params == null ? void 0 : params.deviceOtherInfo) != null ? _Y : (_X = data.deviceOtherInfo) == null ? void 0 : _X.value) != null ? _Z : data.deviceOtherInfo;
+    const deviceOtherInfoRawMqtt = (__ = (_Z = (_X = (_W = (_U = (_T = params == null ? void 0 : params.items) == null ? void 0 : _T.deviceOtherInfo) == null ? void 0 : _U.value) != null ? _W : (_V = params == null ? void 0 : params.deviceOtherInfo) == null ? void 0 : _V.value) != null ? _X : params == null ? void 0 : params.deviceOtherInfo) != null ? _Z : (_Y = data.deviceOtherInfo) == null ? void 0 : _Y.value) != null ? __ : data.deviceOtherInfo;
     const deviceOtherInfoMqtt = typeof deviceOtherInfoRawMqtt === "string" ? this.safeJsonParse(deviceOtherInfoRawMqtt) : deviceOtherInfoRawMqtt;
     if (deviceOtherInfoMqtt && typeof deviceOtherInfoMqtt === "object") {
       const taskArea = this.pickNumber(deviceOtherInfoMqtt.task_area);
       if (taskArea !== null) await this.setStateChangedAsync(`${channelId}.telemetry.taskAreaM2`, taskArea, true);
     }
-    const protoContent = (_ma = (_ka = (_ha = (_fa = (_ca = (_ba = (_aa = (__ = params == null ? void 0 : params.value) == null ? void 0 : __.content) != null ? _aa : (_$ = data == null ? void 0 : data.value) == null ? void 0 : _$.content) != null ? _ba : params == null ? void 0 : params.content) != null ? _ca : data == null ? void 0 : data.content) != null ? _fa : (_ea = (_da = params == null ? void 0 : params.items) == null ? void 0 : _da.content) == null ? void 0 : _ea.value) != null ? _ha : (_ga = params == null ? void 0 : params.items) == null ? void 0 : _ga.content) != null ? _ka : (_ja = (_ia = data == null ? void 0 : data.items) == null ? void 0 : _ia.content) == null ? void 0 : _ja.value) != null ? _ma : (_la = data == null ? void 0 : data.items) == null ? void 0 : _la.content;
+    const protoContent = (_na = (_la = (_ia = (_ga = (_da = (_ca = (_ba = (_$ = params == null ? void 0 : params.value) == null ? void 0 : _$.content) != null ? _ba : (_aa = data == null ? void 0 : data.value) == null ? void 0 : _aa.content) != null ? _ca : params == null ? void 0 : params.content) != null ? _da : data == null ? void 0 : data.content) != null ? _ga : (_fa = (_ea = params == null ? void 0 : params.items) == null ? void 0 : _ea.content) == null ? void 0 : _fa.value) != null ? _ia : (_ha = params == null ? void 0 : params.items) == null ? void 0 : _ha.content) != null ? _la : (_ka = (_ja = data == null ? void 0 : data.items) == null ? void 0 : _ja.content) == null ? void 0 : _ka.value) != null ? _na : (_ma = data == null ? void 0 : data.items) == null ? void 0 : _ma.content;
     this.log.debug(`[MQTT] params top-level keys: ${Object.keys(params != null ? params : {}).join(",")}`);
     if (typeof protoContent === "string") {
       this.log.debug(`[MQTT] protoContent found (len=${protoContent.length})`);
@@ -1545,6 +1563,7 @@ class Mammotion extends utils.Adapter {
         await this.setStateChangedAsync(`${channelId}.telemetry.lastProtoContent`, protoContent, true);
       }
       this.resolveCommDataAck(deviceKey, protoContent);
+      (_oa = this.mapFrameListeners.get(deviceKey)) == null ? void 0 : _oa(protoContent);
       void this.parseMctlSysProto(deviceKey, protoContent);
       const areas = this.tryParseAreaHashNames(protoContent);
       if (areas && areas.length > 0) {
@@ -1552,14 +1571,14 @@ class Mammotion extends utils.Adapter {
         this.log.debug(`[MQTT] Zone names received: ${areas.length} entries cached`);
       }
       const hashIds = this.tryParseNavGetHashListAck(protoContent, deviceKey);
-      if (hashIds && hashIds.length > 0 && ctx) {
+      if (hashIds && hashIds.length > 0 && ctx && !this.mapFrameListeners.has(deviceKey)) {
         this.log.debug(`[MQTT] NavGetHashListAck: ${hashIds.length} Hashes, requesting names`);
         await this.requestAreaNamesForHashes(ctx, hashIds);
       } else if (!areas || areas.length === 0) {
         this.log.debug(`[MQTT] protoContent contains no zone names / no HashListAck`);
       }
     } else {
-      this.log.debug(`[MQTT] No protoContent found. params.value=${((_na = JSON.stringify(params == null ? void 0 : params.value)) != null ? _na : "(none)").substring(0, 200)}`);
+      this.log.debug(`[MQTT] No protoContent found. params.value=${((_pa = JSON.stringify(params == null ? void 0 : params.value)) != null ? _pa : "(none)").substring(0, 200)}`);
     }
   }
   async invokeTaskControlCommandModern(session, context, content) {
@@ -3470,7 +3489,7 @@ ${url}`;
     } catch {
     }
     try {
-      const updates = (0, import_mower_report.decodeLubaReports)(protoBase64);
+      const updates = (0, import_mower_protocol.decodeLubaReports)(protoBase64);
       if (updates.length > 0) {
         this.log.debug(`[REPORT] ${deviceKey}: ${updates.length} values from status report`);
         await this.applyStateUpdates(deviceKey, updates);
@@ -3688,6 +3707,277 @@ ${url}`;
       } catch {
       }
     });
+  }
+  async handleRequestMap(deviceKey, localId) {
+    const ctx = this.deviceContexts.get(deviceKey);
+    try {
+      if (!ctx) {
+        throw new Error(`Unknown device: ${deviceKey}`);
+      }
+      await this.fetchMap(ctx);
+    } catch (err) {
+      const msg = this.extractAxiosError(err);
+      await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
+      this.log.warn(`[MAP] Loading the map failed for ${(ctx == null ? void 0 : ctx.deviceName) || deviceKey}: ${msg}`);
+    } finally {
+      await this.setStateChangedAsync(localId, false, true);
+    }
+  }
+  // Loads the map once when the map checksum differs from the one last loaded.
+  async maybeAutoFetchMap(deviceKey, mapHash) {
+    var _a;
+    if (this.mapFrameListeners.has(deviceKey)) {
+      return;
+    }
+    const loaded = await this.getStateAsync(`devices.${deviceKey}.map.loadedMapHash`);
+    if ((loaded == null ? void 0 : loaded.val) === mapHash) {
+      return;
+    }
+    const now = Date.now();
+    if (now - ((_a = this.mapAutoFetchedAt.get(deviceKey)) != null ? _a : 0) < MAP_AUTO_FETCH_MIN_INTERVAL_MS) {
+      return;
+    }
+    const ctx = this.deviceContexts.get(deviceKey);
+    if (!ctx) {
+      return;
+    }
+    this.mapAutoFetchedAt.set(deviceKey, now);
+    this.log.info(`[MAP] Map of ${ctx.deviceName || deviceKey} changed or not loaded yet, loading it.`);
+    try {
+      await this.fetchMap(ctx);
+    } catch (err) {
+      this.log.warn(
+        `[MAP] Automatic map load failed for ${ctx.deviceName || deviceKey}: ${this.extractAxiosError(err)}`
+      );
+    }
+  }
+  buildNavContent(session, receiver, navField, payload) {
+    const subtype = Number.parseInt(session.userAccount, 10);
+    return this.buildLubaMessage({
+      msgType: 240,
+      receiverDevice: receiver,
+      subtype: Number.isNaN(subtype) ? 0 : subtype,
+      subMessageField: 11,
+      subMessagePayload: this.encodeMessage([this.encodeFieldBytes(navField, payload)])
+    }).toString("base64");
+  }
+  // DevNet.todev_ble_sync = 3: marks the app as synchronised, required before map transfers.
+  buildMapSyncContent(session) {
+    const subtype = Number.parseInt(session.userAccount, 10);
+    return this.buildLubaMessage({
+      msgType: 248,
+      receiverDevice: 0,
+      subtype: Number.isNaN(subtype) ? 0 : subtype,
+      subMessageField: 8,
+      subMessagePayload: this.encodeMessage([this.encodeFieldVarint(1, 3)])
+    }).toString("base64");
+  }
+  // NavGetHashList (nav 30): request (subCmd 0) or frame acknowledgement (subCmd 2).
+  buildHashListContent(session, receiver, ack) {
+    const fields = [this.encodeFieldVarint(1, 1), this.encodeFieldVarint(2, ack ? 2 : 0)];
+    if (ack) {
+      fields.push(this.encodeFieldVarint(3, ack.totalFrame), this.encodeFieldVarint(4, ack.currentFrame));
+    }
+    return this.buildNavContent(session, receiver, 30, this.encodeMessage(fields));
+  }
+  // NavGetCommData (nav 32): request an element (subCmd 1) or acknowledge a frame (subCmd 2).
+  buildElementContent(session, receiver, hash, ack) {
+    const fields = ack ? [
+      this.encodeFieldVarint(1, 1),
+      this.encodeFieldVarint(2, 2),
+      this.encodeFieldVarint(3, ack.action),
+      this.encodeFieldVarint(4, ack.type),
+      this.encodeFieldVarint(5, BigInt.asUintN(64, hash)),
+      this.encodeFieldVarint(8, ack.totalFrame),
+      this.encodeFieldVarint(9, ack.currentFrame)
+    ] : [
+      this.encodeFieldVarint(1, 1),
+      this.encodeFieldVarint(2, 1),
+      this.encodeFieldVarint(3, 8),
+      this.encodeFieldVarint(5, BigInt.asUintN(64, hash))
+    ];
+    return this.buildNavContent(session, receiver, 32, this.encodeMessage(fields));
+  }
+  // Loads all map elements (hash list, then the points of every element, each
+  // frame acknowledged) and writes them as GeoJSON to `map.geojson`.
+  // Messages arrive via MQTT; the invoke result is checked as well.
+  async fetchMap(ctx) {
+    const key = ctx.key;
+    const label = ctx.deviceName || ctx.iotId;
+    if (this.mapFrameListeners.has(key)) {
+      this.log.info(`[MAP] Map of ${label} is already loading.`);
+      return;
+    }
+    const statusId = `devices.${key}.map.status`;
+    const hashFrames = [];
+    const commFrames = [];
+    let wake = null;
+    const accept = (protoBase64) => {
+      hashFrames.push(...(0, import_mower_protocol.decodeHashListFrames)(protoBase64).filter((f) => f.subCmd === 0));
+      commFrames.push(...(0, import_mower_protocol.decodeCommDataFrames)(protoBase64));
+      if (hashFrames.length || commFrames.length) {
+        wake == null ? void 0 : wake();
+      }
+    };
+    const take = async (queue, match, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      for (; ; ) {
+        const index = queue.findIndex(match);
+        if (index >= 0) {
+          return queue.splice(index, 1)[0];
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          return null;
+        }
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, remaining);
+          wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        wake = null;
+      }
+    };
+    const send = async (commandLabel, build) => {
+      const result = await this.executeEncodedContentCommand(ctx, commandLabel, (session) => build(session));
+      if (result && result !== "ok" && result.length > 20) {
+        accept(result);
+      }
+    };
+    this.mapFrameListeners.set(key, accept);
+    const startedAt = Date.now();
+    let lastSyncAt = 0;
+    const syncIfDue = async () => {
+      if (Date.now() - lastSyncAt >= MAP_SYNC_REFRESH_MS) {
+        await send("map-sync", (session) => this.buildMapSyncContent(session));
+        lastSyncAt = Date.now();
+      }
+    };
+    try {
+      await this.setStateChangedAsync(statusId, "loading element list", true);
+      const primary = this.getReceiverDevice(ctx);
+      const receivers = [primary, primary === 17 ? 1 : 17];
+      let receiver = primary;
+      const listParts = /* @__PURE__ */ new Map();
+      let listTotal = 0;
+      for (const candidate of receivers) {
+        await syncIfDue();
+        await send("map-hash-list", (session) => this.buildHashListContent(session, candidate));
+        const first = await take(hashFrames, () => true, MAP_FRAME_TIMEOUT_MS);
+        if (!first) {
+          continue;
+        }
+        receiver = candidate;
+        let frame = first;
+        while (frame) {
+          listParts.set(frame.currentFrame, frame.hashes);
+          listTotal = frame.totalFrame;
+          const ackFrame = frame;
+          await send("map-hash-list-ack", (session) => this.buildHashListContent(session, receiver, ackFrame));
+          if (listParts.size >= listTotal) {
+            break;
+          }
+          frame = await take(hashFrames, (f) => !listParts.has(f.currentFrame), MAP_FRAME_TIMEOUT_MS);
+        }
+        break;
+      }
+      const hashes = [...new Set([...listParts.values()].flat())].slice(0, MAP_MAX_ELEMENTS);
+      if (!hashes.length) {
+        throw new Error("The mower did not send its element list (no answer on the map request).");
+      }
+      if (listParts.size < listTotal) {
+        this.log.warn(`[MAP] Element list of ${label} incomplete (${listParts.size}/${listTotal} frames).`);
+      }
+      this.log.info(`[MAP] ${label}: ${hashes.length} map elements, loading geometry (receiver ${receiver}).`);
+      const elements = [];
+      const failed = [];
+      for (const [index, hash] of hashes.entries()) {
+        if (Date.now() - startedAt > MAP_FETCH_MAX_MS) {
+          this.log.warn(`[MAP] ${label}: stopping after ${index} elements, time limit reached.`);
+          break;
+        }
+        await this.setStateChangedAsync(statusId, `loading element ${index + 1}/${hashes.length}`, true);
+        const assembler = new import_mower_protocol.ElementAssembler(hash);
+        let attempts = 0;
+        await syncIfDue();
+        await send("map-element", (session) => this.buildElementContent(session, receiver, hash));
+        while (!assembler.complete) {
+          const frame = await take(commFrames, (f) => f.hash === hash, MAP_FRAME_TIMEOUT_MS);
+          if (!frame) {
+            if (++attempts > 1) {
+              break;
+            }
+            await syncIfDue();
+            await send("map-element", (session) => this.buildElementContent(session, receiver, hash));
+            continue;
+          }
+          assembler.add(frame);
+          await send("map-element-ack", (session) => this.buildElementContent(session, receiver, hash, frame));
+        }
+        if (assembler.complete) {
+          elements.push(assembler.result());
+        } else {
+          failed.push(hash.toString());
+        }
+        commFrames.length = 0;
+      }
+      await this.writeMapGeoJson(ctx, elements);
+      const summary = `${elements.length}/${hashes.length} elements loaded${failed.length ? `, ${failed.length} without answer` : ""}`;
+      await this.setStateChangedAsync(statusId, summary, true);
+      this.log.info(`[MAP] ${label}: ${summary}.`);
+    } catch (err) {
+      await this.setStateChangedAsync(statusId, `failed: ${this.extractAxiosError(err)}`, true);
+      throw err;
+    } finally {
+      this.mapFrameListeners.delete(key);
+      wake = null;
+    }
+  }
+  async readNumberState(id) {
+    var _a;
+    const val = (_a = await this.getStateAsync(id)) == null ? void 0 : _a.val;
+    const n = typeof val === "number" ? val : Number(val);
+    return val === null || val === void 0 || val === "" || !Number.isFinite(n) ? null : n;
+  }
+  // Converts the elements to GeoJSON using the best available map origin.
+  async writeMapGeoJson(ctx, elements) {
+    var _a;
+    const base = `devices.${ctx.key}`;
+    const [baseLat, baseLon, yaw, robotLat, robotLon, posX, posY, dockX, dockY] = await Promise.all(
+      [
+        "map.baseLatitude",
+        "map.baseLongitude",
+        "map.baseYawDeg",
+        "telemetry.latitude",
+        "telemetry.longitude",
+        "telemetry.posX",
+        "telemetry.posY",
+        "map.dockX",
+        "map.dockY"
+      ].map((id) => this.readNumberState(`${base}.${id}`))
+    );
+    let anchor = null;
+    let anchorSource = "none";
+    if (baseLat !== null && baseLon !== null && (baseLat !== 0 || baseLon !== 0)) {
+      anchor = { lat: baseLat, lon: baseLon, yawDeg: yaw != null ? yaw : 0 };
+      anchorSource = "basestation";
+    } else if (robotLat !== null && robotLon !== null && posX !== null && posY !== null) {
+      anchor = (0, import_mower_protocol.anchorFromRobot)(robotLat, robotLon, { x: posX, y: posY }, yaw != null ? yaw : 0);
+      anchorSource = "robot";
+    }
+    const names = new Map((await this.getKnownAreas(ctx.key)).map((area) => [area.hash.toString(), area.name]));
+    const dock = dockX !== null && dockY !== null && (dockX !== 0 || dockY !== 0) ? { x: dockX, y: dockY } : void 0;
+    const geo = (0, import_mower_protocol.buildMapGeoJson)(elements, anchor != null ? anchor : { lat: 0, lon: 0, yawDeg: 0 }, names, dock);
+    await this.setStateChangedAsync(`${base}.map.geojson`, JSON.stringify(geo), true);
+    await this.setStateChangedAsync(`${base}.map.elementCount`, geo.features.length, true);
+    await this.setStateChangedAsync(`${base}.map.anchorSource`, anchorSource, true);
+    await this.setStateAsync(`${base}.map.updatedAt`, Date.now(), true);
+    const mapHash = (_a = await this.getStateAsync(`${base}.telemetry.mapHash`)) == null ? void 0 : _a.val;
+    if (typeof mapHash === "string" && mapHash) {
+      await this.setStateChangedAsync(`${base}.map.loadedMapHash`, mapHash, true);
+    }
   }
   async handleRequestAreaNames(deviceKey, localId) {
     const ctx = this.deviceContexts.get(deviceKey);
@@ -4527,7 +4817,7 @@ ${url}`;
     await this.setObjectNotExistsAsync("account.userAccount", this.createReadonlyState("Account user account", "string", "text"));
     await this.setObjectNotExistsAsync("account.iotDomain", this.createReadonlyState("IoT API domain", "string", "text"));
   }
-  // States filled by the status report, the update buffer and warning events (see lib/mower-report).
+  // States filled by the status report, the update buffer and warning events (see lib/mower-protocol).
   async ensureReportStateObjects(channelId) {
     const channels = {
       maintenance: "Maintenance",
@@ -4538,7 +4828,7 @@ ${url}`;
     for (const [id, name] of Object.entries(channels)) {
       await this.extendObjectAsync(`${channelId}.${id}`, { type: "channel", common: { name }, native: {} });
     }
-    for (const def of import_mower_report.REPORT_STATE_DEFS) {
+    for (const def of import_mower_protocol.REPORT_STATE_DEFS) {
       const obj = this.createReadonlyState(def.name, def.type, def.role, def.states);
       if (def.unit) {
         obj.common.unit = def.unit;
@@ -4551,6 +4841,9 @@ ${url}`;
       await this.setStateChangedAsync(`devices.${deviceKey}.${update.id}`, update.value, true);
       if (update.id === "telemetry.deviceState" && typeof update.value === "number") {
         this.triggerStartSettingsEnforceIfDeviceActive(deviceKey, update.value);
+      }
+      if (update.id === "telemetry.mapHash" && typeof update.value === "string" && update.value) {
+        void this.maybeAutoFetchMap(deviceKey, update.value);
       }
     }
   }
@@ -4752,6 +5045,10 @@ ${url}`;
     await this.setObjectNotExistsAsync(`${channelId}.commands.startZones`, this.createCommandState("Start mowing enabled zones"));
     await this.setObjectNotExistsAsync(`${channelId}.commands.startAllZones`, this.createCommandState("Start mowing all known zones"));
     await this.setObjectNotExistsAsync(`${channelId}.commands.requestAreaNames`, this.createCommandState("Request area name list from device"));
+    await this.setObjectNotExistsAsync(
+      `${channelId}.commands.requestMap`,
+      this.createCommandState("Load the map (zones, obstacles, no-go areas) as GeoJSON")
+    );
     await this.setObjectNotExistsAsync(
       `${channelId}.commands.payload`,
       this.createWritableStringState("Command payload JSON (execute + persist)", "json", "")

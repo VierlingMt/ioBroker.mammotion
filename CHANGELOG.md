@@ -27,11 +27,18 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 - **Periodic report refresh.** The report only flows for a short time after each request, so the adapter
   re-requests it every 2 minutes while the mower is working, returning or paused, and every 10 minutes
   otherwise, only while `telemetry.connected` is true.
-- Decoder logic lives in `src/lib/mower-report.ts` with unit tests on hand-built protobuf frames.
+- **Map as GeoJSON.** New button `commands.requestMap` loads all map elements (hash list, then the points
+  of every element; every data frame is acknowledged, as the mower expects) and writes `map.geojson`:
+  zones with their names, obstacles, no-go areas, paths, virtual walls and the charging station, in WGS84.
+  Loads automatically when `telemetry.mapHash` changes (at most every 30 minutes). Progress in `map.status`.
+  Zone classification is paused while the map loads, so both do not query the mower at the same time.
+- Decoder logic lives in `src/lib/mower-protocol.ts` with unit tests on hand-built protobuf frames.
 
 ### Notes
 - `jobTotalMin` / `jobRemainingMin` split the packed `work.progress` field (low/high 16 bits). This
   interpretation is not yet verified on a live device; `jobProgressRaw` keeps the raw value.
+- Map loading uses receiver 17 (navigation) first on newer models and falls back to receiver 1, and sends
+  `todev_ble_sync = 3` before the transfers. Both follow the app's behaviour but are not yet verified live.
 - `headingRaw` is the raw heading divided by 10000; the unit (degrees or radians) still has to be
   confirmed live.
 

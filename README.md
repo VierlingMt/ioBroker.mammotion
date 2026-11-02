@@ -25,6 +25,7 @@ ioBroker adapter to control and monitor **Mammotion Luba / Yuka / Spino / RTK / 
 - [Object tree](#object-tree)
 - [Command behaviour](#command-behaviour)
 - [Zone / area workflow](#zone--area-workflow)
+- [Map](#map)
 - [Custom JSON payloads](#custom-json-payloads)
 - [Architecture](#architecture)
 - [Troubleshooting](#troubleshooting)
@@ -164,12 +165,15 @@ mammotion.0
     │   └── lastNotificationCode, lastNotificationType, lastNotificationTime
     ├── map.*
     │   ├── baseLatitude, baseLongitude, baseYawDeg   (origin of the local map)
-    │   └── dockX, dockY, dockHeadingRaw              (charging station, local metres)
+    │   ├── dockX, dockY, dockHeadingRaw              (charging station, local metres)
+    │   ├── geojson                                   (zones, obstacles, no-go areas, paths, dock)
+    │   └── updatedAt, elementCount, anchorSource, status, loadedMapHash
     ├── commands.*
     │   ├── start, pause, resume, stop, dock, cancelJob, cancelDock     (button)
     │   ├── applyTaskSettings, applyNonWorkHours, applyBladeControl     (button)
     │   ├── generateRoute, modifyRoute, queryRoute                      (button)
     │   ├── startZones, startAllZones, requestAreaNames                 (button)
+    │   ├── requestMap                                                  (button)
     │   ├── targetMowSpeedMs, bladeHeightMm, bladeMaxSpeedMs            (writable)
     │   ├── routeAreaIds, routeJobMode, routeJobVersion, routeJobId     (writable)
     │   ├── routeUltraWave, routeChannelMode, routeChannelWidthCm       (writable)
@@ -231,6 +235,23 @@ Press `commands.startAllZones`. The adapter takes every zone from `telemetry.are
 ### Option D – manual hash entry
 
 Write a comma-separated list of zone hashes into `commands.routeAreaIds` and trigger any of the above buttons – useful when MQTT discovery is unavailable.
+
+## Map
+
+`commands.requestMap` loads the mower's map and writes it to `map.geojson` as a GeoJSON
+`FeatureCollection`. Each feature carries `properties.kind` (`zone`, `obstacle`, `path`, `noGo`,
+`virtualWall`, `dumpZone`, `safeZone`, `obstacleZone`, `dock`), the element `hash` and, for zones,
+the `name` from the zone list. The hash matches `zones.<name>.hash`, so a UI can start a zone by
+writing `zones.<name>.start`.
+
+The map is loaded automatically when the mower reports a map checksum (`telemetry.mapHash`) that
+differs from the one last loaded (`map.loadedMapHash`), at most every 30 minutes. Loading sends one
+request per element plus one acknowledgement per data frame, so a large map takes a minute or two;
+`map.status` shows the progress.
+
+Coordinates are WGS84. The origin comes from the RTK base station (`map.anchorSource = basestation`);
+if the mower has not sent it yet, it is derived from the current GPS position and the local position
+(`robot`). With neither, the coordinates are local metres around 0/0 (`none`).
 
 ## Custom JSON payloads
 

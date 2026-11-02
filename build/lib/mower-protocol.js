@@ -16,11 +16,17 @@ var __copyProps = (to, from, except, desc) => {
   return to;
 };
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
-var mower_report_exports = {};
-__export(mower_report_exports, {
+var mower_protocol_exports = {};
+__export(mower_protocol_exports, {
+  ElementAssembler: () => ElementAssembler,
+  MAP_ELEMENT_KINDS: () => MAP_ELEMENT_KINDS,
   REPORT_STATE_DEFS: () => REPORT_STATE_DEFS,
+  anchorFromRobot: () => anchorFromRobot,
+  buildMapGeoJson: () => buildMapGeoJson,
+  decodeCommDataFrames: () => decodeCommDataFrames,
   decodeDeviceEvent: () => decodeDeviceEvent,
   decodeFields: () => decodeFields,
+  decodeHashListFrames: () => decodeHashListFrames,
   decodeLubaReports: () => decodeLubaReports,
   decodeReportInfoData: () => decodeReportInfoData,
   decodeSysReports: () => decodeSysReports,
@@ -34,10 +40,11 @@ __export(mower_report_exports, {
   getMessages: () => getMessages,
   getRepeatedInt64: () => getRepeatedInt64,
   getUint32: () => getUint32,
+  localToLonLat: () => localToLonLat,
   readVarint: () => readVarint,
   toMillis: () => toMillis
 });
-module.exports = __toCommonJS(mower_report_exports);
+module.exports = __toCommonJS(mower_protocol_exports);
 function readVarint(buf, pos) {
   let result = 0n;
   let shift = 0n;
@@ -292,7 +299,24 @@ const REPORT_STATE_DEFS = [
   { id: "map.baseYawDeg", name: "Rotation of the map axes", type: "number", role: "value", unit: "\xB0" },
   { id: "map.dockX", name: "Charging station x (local)", type: "number", role: "value", unit: "m" },
   { id: "map.dockY", name: "Charging station y (local)", type: "number", role: "value", unit: "m" },
-  { id: "map.dockHeadingRaw", name: "Charging station heading (raw)", type: "number", role: "value" }
+  { id: "map.dockHeadingRaw", name: "Charging station heading (raw)", type: "number", role: "value" },
+  // Map geometry (filled by commands.requestMap)
+  {
+    id: "map.geojson",
+    name: "Map as GeoJSON (zones, obstacles, no-go areas, paths, dock)",
+    type: "string",
+    role: "json"
+  },
+  { id: "map.updatedAt", name: "Time the map was last loaded", type: "number", role: "value.time" },
+  { id: "map.elementCount", name: "Number of map elements loaded", type: "number", role: "value" },
+  {
+    id: "map.anchorSource",
+    name: "Source of the map origin (basestation / robot / none)",
+    type: "string",
+    role: "text"
+  },
+  { id: "map.status", name: "Map loading status", type: "string", role: "text" },
+  { id: "map.loadedMapHash", name: "Map checksum of the loaded map", type: "string", role: "text" }
 ];
 const SYS_FIELD_REPORT_DATA = 39;
 const SYS_FIELD_UPDATE_BUF = 27;
@@ -569,11 +593,198 @@ function decodeDeviceEvent(params, now) {
   }
   return null;
 }
+const LUBA_FIELD_NAV = 11;
+const NAV_FIELD_HASH_LIST_ACK = 31;
+const NAV_FIELD_COMM_DATA_ACK = 33;
+function navMessages(protoBase64) {
+  try {
+    return getMessages(decodeFields(Buffer.from(protoBase64, "base64")), LUBA_FIELD_NAV);
+  } catch {
+    return [];
+  }
+}
+function getUint64(fields, field) {
+  var _a;
+  const values = (_a = fields.get(field)) != null ? _a : [];
+  const v = values.find((x) => typeof x === "bigint");
+  return v === void 0 ? 0n : BigInt.asUintN(64, v);
+}
+function frameCount(fields, field) {
+  const v = getInt32(fields, field);
+  return v === void 0 || v < 1 ? 1 : v;
+}
+function decodeHashListFrames(protoBase64) {
+  var _a;
+  const out = [];
+  for (const nav of navMessages(protoBase64)) {
+    for (const ack of getMessages(nav, NAV_FIELD_HASH_LIST_ACK)) {
+      out.push({
+        subCmd: (_a = getInt32(ack, 2)) != null ? _a : 0,
+        totalFrame: frameCount(ack, 3),
+        currentFrame: frameCount(ack, 4),
+        hashes: getRepeatedInt64(ack, 13).map((h) => BigInt.asUintN(64, h)).filter((h) => h !== 0n)
+      });
+    }
+  }
+  return out;
+}
+function decodeCommDataFrames(protoBase64) {
+  var _a, _b, _c, _d, _e;
+  const out = [];
+  for (const nav of navMessages(protoBase64)) {
+    for (const ack of getMessages(nav, NAV_FIELD_COMM_DATA_ACK)) {
+      const points = [];
+      for (const couple of getMessages(ack, 13)) {
+        const x = (_a = getFloat(couple, 1)) != null ? _a : 0;
+        const y = (_b = getFloat(couple, 2)) != null ? _b : 0;
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          points.push({ x, y });
+        }
+      }
+      const nameTime = getMessage(ack, 15);
+      const nameBuf = (_c = nameTime == null ? void 0 : nameTime.get(1)) == null ? void 0 : _c.find((v) => v instanceof Buffer);
+      out.push({
+        action: (_d = getInt32(ack, 4)) != null ? _d : 0,
+        type: (_e = getInt32(ack, 5)) != null ? _e : 0,
+        hash: getUint64(ack, 6),
+        paternalHashA: getUint64(ack, 7),
+        totalFrame: frameCount(ack, 9),
+        currentFrame: frameCount(ack, 10),
+        points,
+        name: nameBuf ? nameBuf.toString("utf8") : ""
+      });
+    }
+  }
+  return out;
+}
+class ElementAssembler {
+  parts = /* @__PURE__ */ new Map();
+  total = 0;
+  type = 0;
+  name = "";
+  hash;
+  constructor(hash) {
+    this.hash = hash;
+  }
+  /**
+   * Returns true when the frame belonged to this element and was new.
+   *
+   * @param frame
+   */
+  add(frame) {
+    if (frame.hash !== this.hash || this.parts.has(frame.currentFrame)) {
+      return false;
+    }
+    this.total = frame.totalFrame;
+    this.type = frame.type;
+    if (frame.name) {
+      this.name = frame.name;
+    }
+    this.parts.set(frame.currentFrame, frame.points);
+    return true;
+  }
+  get complete() {
+    if (this.total === 0) {
+      return false;
+    }
+    for (let i = 1; i <= this.total; i++) {
+      if (!this.parts.has(i)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  result() {
+    var _a;
+    const points = [];
+    for (let i = 1; i <= this.total; i++) {
+      points.push(...(_a = this.parts.get(i)) != null ? _a : []);
+    }
+    return { hash: this.hash, type: this.type, name: this.name, points };
+  }
+}
+const MAP_ELEMENT_KINDS = {
+  0: { kind: "zone", geometry: "Polygon" },
+  1: { kind: "obstacle", geometry: "Polygon" },
+  2: { kind: "path", geometry: "LineString" },
+  12: { kind: "dumpZone", geometry: "Polygon" },
+  21: { kind: "virtualWall", geometry: "LineString" },
+  22: { kind: "noGo", geometry: "Polygon" },
+  23: { kind: "noGo", geometry: "Polygon" },
+  25: { kind: "safeZone", geometry: "Polygon" },
+  26: { kind: "obstacleZone", geometry: "Polygon" }
+};
+const METRES_PER_DEG_LAT = 111320;
+const DEG = Math.PI / 180;
+function localToLonLat(point, anchor) {
+  const yaw = anchor.yawDeg * DEG;
+  const east = Math.cos(yaw) * point.x - Math.sin(yaw) * point.y;
+  const north = Math.sin(yaw) * point.x + Math.cos(yaw) * point.y;
+  const lat = anchor.lat + north / METRES_PER_DEG_LAT;
+  const lon = anchor.lon + east / (METRES_PER_DEG_LAT * Math.cos(anchor.lat * DEG));
+  return [round(lon, 8), round(lat, 8)];
+}
+function anchorFromRobot(robotLat, robotLon, robot, yawDeg) {
+  const yaw = yawDeg * DEG;
+  const east = Math.cos(yaw) * robot.x - Math.sin(yaw) * robot.y;
+  const north = Math.sin(yaw) * robot.x + Math.cos(yaw) * robot.y;
+  const lat = robotLat - north / METRES_PER_DEG_LAT;
+  const lon = robotLon - east / (METRES_PER_DEG_LAT * Math.cos(lat * DEG));
+  return { lat, lon, yawDeg };
+}
+function buildMapGeoJson(elements, anchor, names = /* @__PURE__ */ new Map(), dock) {
+  var _a;
+  const features = [];
+  for (const element of elements) {
+    const spec = MAP_ELEMENT_KINDS[element.type];
+    if (!spec) {
+      continue;
+    }
+    const coords = element.points.map((p) => localToLonLat(p, anchor));
+    const hash = element.hash.toString();
+    const properties = {
+      kind: spec.kind,
+      type: element.type,
+      hash,
+      name: (_a = names.get(hash)) != null ? _a : element.name
+    };
+    if (spec.geometry === "Polygon") {
+      if (coords.length < 3) {
+        continue;
+      }
+      const [first] = coords;
+      const last = coords[coords.length - 1];
+      const ring = first[0] === last[0] && first[1] === last[1] ? coords : [...coords, first];
+      features.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [ring] }, properties });
+    } else {
+      if (coords.length < 2) {
+        continue;
+      }
+      features.push({ type: "Feature", geometry: { type: "LineString", coordinates: coords }, properties });
+    }
+  }
+  if (dock) {
+    features.push({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: localToLonLat(dock, anchor) },
+      properties: { kind: "dock", type: -1, hash: "", name: "" }
+    });
+  }
+  const order = (f) => f.properties.kind === "zone" ? 0 : f.properties.kind === "dock" ? 2 : 1;
+  features.sort((a, b) => order(a) - order(b));
+  return { type: "FeatureCollection", features };
+}
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  ElementAssembler,
+  MAP_ELEMENT_KINDS,
   REPORT_STATE_DEFS,
+  anchorFromRobot,
+  buildMapGeoJson,
+  decodeCommDataFrames,
   decodeDeviceEvent,
   decodeFields,
+  decodeHashListFrames,
   decodeLubaReports,
   decodeReportInfoData,
   decodeSysReports,
@@ -587,7 +798,8 @@ function decodeDeviceEvent(params, now) {
   getMessages,
   getRepeatedInt64,
   getUint32,
+  localToLonLat,
   readVarint,
   toMillis
 });
-//# sourceMappingURL=mower-report.js.map
+//# sourceMappingURL=mower-protocol.js.map

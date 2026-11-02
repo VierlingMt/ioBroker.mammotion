@@ -1,7 +1,10 @@
 /**
- * Decodes the mower's status report (`MctlSys.toapp_report_data`, sys field 39),
- * the system update buffer (`MctlSys.systemUpdateBuf`, sys field 27) and the
- * JSON warning/notification events into flat ioBroker state updates.
+ * Mower protocol helpers (pure functions, unit-tested):
+ *
+ * - status report (`MctlSys.toapp_report_data`, sys field 39), system update
+ *   buffer (`MctlSys.systemUpdateBuf`, sys field 27) and the JSON
+ *   warning/notification events → flat ioBroker state updates;
+ * - map geometry (hash list nav 31, element data nav 33) → GeoJSON.
  *
  * Field numbers follow the public mctrl_sys message layout (facts only, no
  * third-party code). State ids are relative to `devices.<deviceKey>`.
@@ -374,6 +377,23 @@ export const REPORT_STATE_DEFS: ReportStateDef[] = [
     { id: 'map.dockX', name: 'Charging station x (local)', type: 'number', role: 'value', unit: 'm' },
     { id: 'map.dockY', name: 'Charging station y (local)', type: 'number', role: 'value', unit: 'm' },
     { id: 'map.dockHeadingRaw', name: 'Charging station heading (raw)', type: 'number', role: 'value' },
+    // Map geometry (filled by commands.requestMap)
+    {
+        id: 'map.geojson',
+        name: 'Map as GeoJSON (zones, obstacles, no-go areas, paths, dock)',
+        type: 'string',
+        role: 'json',
+    },
+    { id: 'map.updatedAt', name: 'Time the map was last loaded', type: 'number', role: 'value.time' },
+    { id: 'map.elementCount', name: 'Number of map elements loaded', type: 'number', role: 'value' },
+    {
+        id: 'map.anchorSource',
+        name: 'Source of the map origin (basestation / robot / none)',
+        type: 'string',
+        role: 'text',
+    },
+    { id: 'map.status', name: 'Map loading status', type: 'string', role: 'text' },
+    { id: 'map.loadedMapHash', name: 'Map checksum of the loaded map', type: 'string', role: 'text' },
 ];
 
 const SYS_FIELD_REPORT_DATA = 39;
@@ -716,4 +736,323 @@ export function decodeDeviceEvent(params: Record<string, unknown> | undefined, n
         ];
     }
     return null;
+}
+
+// --- map geometry -------------------------------------------------------------
+//
+// The mower stores its map as elements (zones, obstacles, paths, no-go areas),
+// each identified by a 64-bit hash. The app first asks for the hash list
+// (MctlNav.todev_gethash = nav 30, answer nav 31) and then for each hash its
+// points (MctlNav.todev_get_commondata = nav 32, answer nav 33). Answers can
+// span several frames; every frame must be acknowledged, otherwise the device
+// repeats it. Points are local metres relative to the RTK base station.
+
+const LUBA_FIELD_NAV = 11;
+const NAV_FIELD_HASH_LIST_ACK = 31;
+const NAV_FIELD_COMM_DATA_ACK = 33;
+
+export interface MapPoint {
+    x: number;
+    y: number;
+}
+
+/** One frame of `NavGetHashListAck` (nav 31). */
+export interface HashListFrame {
+    subCmd: number;
+    totalFrame: number;
+    currentFrame: number;
+    /** All hashes of this frame, unsigned. */
+    hashes: bigint[];
+}
+
+/** One frame of `NavGetCommDataAck` (nav 33). */
+export interface CommDataFrame {
+    action: number;
+    type: number;
+    /** Unsigned 64-bit hash. */
+    hash: bigint;
+    paternalHashA: bigint;
+    totalFrame: number;
+    currentFrame: number;
+    points: MapPoint[];
+    name: string;
+}
+
+function navMessages(protoBase64: string): ProtoFields[] {
+    try {
+        return getMessages(decodeFields(Buffer.from(protoBase64, 'base64')), LUBA_FIELD_NAV);
+    } catch {
+        return [];
+    }
+}
+
+function getUint64(fields: ProtoFields, field: number): bigint {
+    const values = fields.get(field) ?? [];
+    const v = values.find((x): x is bigint => typeof x === 'bigint');
+    return v === undefined ? 0n : BigInt.asUintN(64, v);
+}
+
+function frameCount(fields: ProtoFields, field: number): number {
+    const v = getInt32(fields, field);
+    return v === undefined || v < 1 ? 1 : v;
+}
+
+/**
+ * Extracts `NavGetHashListAck` frames from a base64 LubaMsg.
+ *
+ * @param protoBase64
+ */
+export function decodeHashListFrames(protoBase64: string): HashListFrame[] {
+    const out: HashListFrame[] = [];
+    for (const nav of navMessages(protoBase64)) {
+        for (const ack of getMessages(nav, NAV_FIELD_HASH_LIST_ACK)) {
+            out.push({
+                subCmd: getInt32(ack, 2) ?? 0,
+                totalFrame: frameCount(ack, 3),
+                currentFrame: frameCount(ack, 4),
+                hashes: getRepeatedInt64(ack, 13)
+                    .map(h => BigInt.asUintN(64, h))
+                    .filter(h => h !== 0n),
+            });
+        }
+    }
+    return out;
+}
+
+/**
+ * Extracts `NavGetCommDataAck` frames (element geometry) from a base64 LubaMsg.
+ *
+ * @param protoBase64
+ */
+export function decodeCommDataFrames(protoBase64: string): CommDataFrame[] {
+    const out: CommDataFrame[] = [];
+    for (const nav of navMessages(protoBase64)) {
+        for (const ack of getMessages(nav, NAV_FIELD_COMM_DATA_ACK)) {
+            const points: MapPoint[] = [];
+            for (const couple of getMessages(ack, 13)) {
+                const x = getFloat(couple, 1) ?? 0;
+                const y = getFloat(couple, 2) ?? 0;
+                if (Number.isFinite(x) && Number.isFinite(y)) {
+                    points.push({ x, y });
+                }
+            }
+            const nameTime = getMessage(ack, 15);
+            const nameBuf = nameTime?.get(1)?.find((v): v is Buffer => v instanceof Buffer);
+            out.push({
+                action: getInt32(ack, 4) ?? 0,
+                type: getInt32(ack, 5) ?? 0,
+                hash: getUint64(ack, 6),
+                paternalHashA: getUint64(ack, 7),
+                totalFrame: frameCount(ack, 9),
+                currentFrame: frameCount(ack, 10),
+                points,
+                name: nameBuf ? nameBuf.toString('utf8') : '',
+            });
+        }
+    }
+    return out;
+}
+
+/** A complete map element after all frames arrived. */
+export interface MapElement {
+    hash: bigint;
+    type: number;
+    name: string;
+    points: MapPoint[];
+}
+
+/** Collects the frames of one element; frames may arrive repeated or out of order. */
+export class ElementAssembler {
+    private readonly parts = new Map<number, MapPoint[]>();
+    private total = 0;
+    private type = 0;
+    private name = '';
+
+    readonly hash: bigint;
+
+    constructor(hash: bigint) {
+        this.hash = hash;
+    }
+
+    /**
+     * Returns true when the frame belonged to this element and was new.
+     *
+     * @param frame
+     */
+    add(frame: CommDataFrame): boolean {
+        if (frame.hash !== this.hash || this.parts.has(frame.currentFrame)) {
+            return false;
+        }
+        this.total = frame.totalFrame;
+        this.type = frame.type;
+        if (frame.name) {
+            this.name = frame.name;
+        }
+        this.parts.set(frame.currentFrame, frame.points);
+        return true;
+    }
+
+    get complete(): boolean {
+        if (this.total === 0) {
+            return false;
+        }
+        for (let i = 1; i <= this.total; i++) {
+            if (!this.parts.has(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    result(): MapElement {
+        const points: MapPoint[] = [];
+        for (let i = 1; i <= this.total; i++) {
+            points.push(...(this.parts.get(i) ?? []));
+        }
+        return { hash: this.hash, type: this.type, name: this.name, points };
+    }
+}
+
+/** Element types (`PathType`) the map shows, with their geometry. */
+export const MAP_ELEMENT_KINDS: Record<number, { kind: string; geometry: 'Polygon' | 'LineString' }> = {
+    0: { kind: 'zone', geometry: 'Polygon' },
+    1: { kind: 'obstacle', geometry: 'Polygon' },
+    2: { kind: 'path', geometry: 'LineString' },
+    12: { kind: 'dumpZone', geometry: 'Polygon' },
+    21: { kind: 'virtualWall', geometry: 'LineString' },
+    22: { kind: 'noGo', geometry: 'Polygon' },
+    23: { kind: 'noGo', geometry: 'Polygon' },
+    25: { kind: 'safeZone', geometry: 'Polygon' },
+    26: { kind: 'obstacleZone', geometry: 'Polygon' },
+};
+
+/** Origin and rotation of the local map in WGS84. */
+export interface MapAnchor {
+    lat: number;
+    lon: number;
+    /** Rotation of the local axes against east/north. */
+    yawDeg: number;
+}
+
+const METRES_PER_DEG_LAT = 111_320;
+const DEG = Math.PI / 180;
+
+/**
+ * Local metres → [longitude, latitude] (flat-earth approximation, fine for a garden).
+ *
+ * @param point
+ * @param anchor
+ */
+export function localToLonLat(point: MapPoint, anchor: MapAnchor): [number, number] {
+    const yaw = anchor.yawDeg * DEG;
+    const east = Math.cos(yaw) * point.x - Math.sin(yaw) * point.y;
+    const north = Math.sin(yaw) * point.x + Math.cos(yaw) * point.y;
+    const lat = anchor.lat + north / METRES_PER_DEG_LAT;
+    const lon = anchor.lon + east / (METRES_PER_DEG_LAT * Math.cos(anchor.lat * DEG));
+    return [round(lon, 8), round(lat, 8)];
+}
+
+/**
+ * Derives the anchor from a known robot position when the device did not send
+ * its base-station origin: origin = robot position minus its local offset.
+ *
+ * @param robotLat
+ * @param robotLon
+ * @param robot
+ * @param yawDeg
+ */
+export function anchorFromRobot(robotLat: number, robotLon: number, robot: MapPoint, yawDeg: number): MapAnchor {
+    const yaw = yawDeg * DEG;
+    const east = Math.cos(yaw) * robot.x - Math.sin(yaw) * robot.y;
+    const north = Math.sin(yaw) * robot.x + Math.cos(yaw) * robot.y;
+    const lat = robotLat - north / METRES_PER_DEG_LAT;
+    const lon = robotLon - east / (METRES_PER_DEG_LAT * Math.cos(lat * DEG));
+    return { lat, lon, yawDeg };
+}
+
+export interface MapFeatureProperties {
+    kind: string;
+    type: number;
+    hash: string;
+    name: string;
+}
+
+export interface MapFeature {
+    type: 'Feature';
+    geometry:
+        | {
+              type: 'Polygon';
+              coordinates: Array<Array<[number, number]>>;
+          }
+        | {
+              type: 'LineString';
+              coordinates: Array<[number, number]>;
+          }
+        | {
+              type: 'Point';
+              coordinates: [number, number];
+          };
+    properties: MapFeatureProperties;
+}
+
+export interface MapFeatureCollection {
+    type: 'FeatureCollection';
+    features: MapFeature[];
+}
+
+/**
+ * Builds a GeoJSON FeatureCollection of the map elements. `names` overrides the
+ * element name by hash (zone names known from the zone list).
+ *
+ * @param elements
+ * @param anchor
+ * @param names
+ * @param dock
+ */
+export function buildMapGeoJson(
+    elements: MapElement[],
+    anchor: MapAnchor,
+    names: Map<string, string> = new Map(),
+    dock?: MapPoint,
+): MapFeatureCollection {
+    const features: MapFeature[] = [];
+    for (const element of elements) {
+        const spec = MAP_ELEMENT_KINDS[element.type];
+        if (!spec) {
+            continue;
+        }
+        const coords = element.points.map(p => localToLonLat(p, anchor));
+        const hash = element.hash.toString();
+        const properties: MapFeatureProperties = {
+            kind: spec.kind,
+            type: element.type,
+            hash,
+            name: names.get(hash) ?? element.name,
+        };
+        if (spec.geometry === 'Polygon') {
+            if (coords.length < 3) {
+                continue;
+            }
+            const [first] = coords;
+            const last = coords[coords.length - 1];
+            const ring = first[0] === last[0] && first[1] === last[1] ? coords : [...coords, first];
+            features.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] }, properties });
+        } else {
+            if (coords.length < 2) {
+                continue;
+            }
+            features.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties });
+        }
+    }
+    if (dock) {
+        features.push({
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: localToLonLat(dock, anchor) },
+            properties: { kind: 'dock', type: -1, hash: '', name: '' },
+        });
+    }
+    // Zones first, so a map draws obstacles and no-go areas on top.
+    const order = (f: MapFeature): number => (f.properties.kind === 'zone' ? 0 : f.properties.kind === 'dock' ? 2 : 1);
+    features.sort((a, b) => order(a) - order(b));
+    return { type: 'FeatureCollection', features };
 }

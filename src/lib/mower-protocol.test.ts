@@ -1,5 +1,11 @@
 import { expect } from 'chai';
 import {
+    anchorFromRobot,
+    buildMapGeoJson,
+    decodeCommDataFrames,
+    decodeHashListFrames,
+    ElementAssembler,
+    localToLonLat,
     decodeDeviceEvent,
     decodeFields,
     getDouble,
@@ -10,7 +16,7 @@ import {
     REPORT_STATE_DEFS,
     type StateUpdate,
     toMillis,
-} from './mower-report.ts';
+} from './mower-protocol.ts';
 
 // --- tiny protobuf writer for test fixtures -------------------------------
 
@@ -50,6 +56,22 @@ function luba(sys: Buffer): string {
     return msg(fVarint(1, 244), fVarint(2, 1), fVarint(3, 7), fBytes(10, sys)).toString('base64');
 }
 
+function fFloat(field: number, value: number): Buffer {
+    const b = Buffer.alloc(4);
+    b.writeFloatLE(value);
+    return Buffer.concat([varint((field << 3) | 5), b]);
+}
+
+function fFixed64(field: number, value: bigint): Buffer {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64LE(BigInt.asUintN(64, value));
+    return Buffer.concat([varint((field << 3) | 1), b]);
+}
+
+function lubaNav(nav: Buffer): string {
+    return msg(fVarint(1, 240), fVarint(2, 17), fVarint(3, 7), fBytes(11, nav)).toString('base64');
+}
+
 function asMap(updates: StateUpdate[]): Record<string, unknown> {
     return Object.fromEntries(updates.map(u => [u.id, u.value]));
 }
@@ -81,7 +103,7 @@ describe('lib/proto-decode', () => {
 
 // --- report_info_data -----------------------------------------------------
 
-describe('lib/mower-report => decodeLubaReports (sys 39)', () => {
+describe('lib/mower-protocol => decodeLubaReports (sys 39)', () => {
     const report = msg(
         fBytes(1, msg(fVarint(1, 1), fVarint(2, -60), fVarint(3, -55))),
         fBytes(
@@ -194,7 +216,7 @@ describe('lib/mower-report => decodeLubaReports (sys 39)', () => {
 
 // --- systemUpdateBuf ------------------------------------------------------
 
-describe('lib/mower-report => decodeSystemUpdateBuf (sys 27)', () => {
+describe('lib/mower-protocol => decodeSystemUpdateBuf (sys 27)', () => {
     it('reads the error list, newest first, as positive codes', () => {
         const data = [2n, 0n, 0n, -1005n, 1_725_159_492n, -1411n, 1_725_150_000n];
         while (data.length < 23) {
@@ -251,7 +273,7 @@ describe('lib/mower-report => decodeSystemUpdateBuf (sys 27)', () => {
 
 // --- events ----------------------------------------------------------------
 
-describe('lib/mower-report => decodeDeviceEvent', () => {
+describe('lib/mower-protocol => decodeDeviceEvent', () => {
     const now = 1_700_000_000_000;
 
     it('reads device_warning_event', () => {
@@ -285,5 +307,129 @@ describe('lib/mower-report => decodeDeviceEvent', () => {
         expect(toMillis(1_725_159_492)).to.equal(1_725_159_492_000);
         expect(toMillis(1_725_159_492_000)).to.equal(1_725_159_492_000);
         expect(toMillis(0)).to.equal(0);
+    });
+});
+
+// --- map geometry ------------------------------------------------------------
+
+describe('lib/mower-protocol => map frames', () => {
+    const bigHash = 0xf234_5678_9abc_def0n; // above 2^63: must stay unsigned
+
+    it('decodes a hash list frame with packed hashes', () => {
+        const ack = msg(
+            fVarint(1, 1),
+            fVarint(3, 2),
+            fVarint(4, 1),
+            fVarint(6, 2),
+            fBytes(13, msg(varint(11n), varint(bigHash), varint(0n))),
+        );
+        const [frame] = decodeHashListFrames(lubaNav(fBytes(31, ack)));
+        expect(frame).to.deep.equal({ subCmd: 0, totalFrame: 2, currentFrame: 1, hashes: [11n, bigHash] });
+    });
+
+    it('decodes element frames with float points, type and name', () => {
+        const ack = msg(
+            fVarint(1, 1),
+            fVarint(4, 8),
+            fFixed64(6, bigHash),
+            fVarint(9, 2),
+            fVarint(10, 2),
+            fBytes(13, msg(fFloat(1, 1.5), fFloat(2, -2.25))),
+            fBytes(13, msg(fFloat(1, 3), fFloat(2, 0))),
+            fBytes(15, fBytes(1, Buffer.from('Vorgarten', 'utf8'))),
+        );
+        const [frame] = decodeCommDataFrames(lubaNav(fBytes(33, ack)));
+        expect(frame.type).to.equal(0);
+        expect(frame.hash).to.equal(bigHash);
+        expect(frame.totalFrame).to.equal(2);
+        expect(frame.currentFrame).to.equal(2);
+        expect(frame.points).to.deep.equal([
+            { x: 1.5, y: -2.25 },
+            { x: 3, y: 0 },
+        ]);
+        expect(frame.name).to.equal('Vorgarten');
+    });
+
+    it('ignores non-nav messages', () => {
+        expect(decodeCommDataFrames(luba(fBytes(39, Buffer.alloc(0))))).to.deep.equal([]);
+        expect(decodeHashListFrames('not base64 at all')).to.deep.equal([]);
+    });
+
+    it('assembles frames in order, ignoring repeats and foreign hashes', () => {
+        const a = new ElementAssembler(5n);
+        const frame = (current: number, x: number, hash = 5n): Parameters<ElementAssembler['add']>[0] => ({
+            action: 8,
+            type: 1,
+            hash,
+            paternalHashA: 0n,
+            totalFrame: 2,
+            currentFrame: current,
+            points: [{ x, y: 0 }],
+            name: '',
+        });
+        expect(a.add(frame(2, 20))).to.equal(true);
+        expect(a.complete).to.equal(false);
+        expect(a.add(frame(2, 99))).to.equal(false);
+        expect(a.add(frame(1, 10, 6n))).to.equal(false);
+        expect(a.add(frame(1, 10))).to.equal(true);
+        expect(a.complete).to.equal(true);
+        expect(a.result().points.map(p => p.x)).to.deep.equal([10, 20]);
+        expect(a.result().type).to.equal(1);
+    });
+});
+
+describe('lib/mower-protocol => map coordinates and GeoJSON', () => {
+    const anchor = { lat: 49.7731, lon: 11.1893, yawDeg: 0 };
+
+    it('maps local metres to lon/lat', () => {
+        const [lon, lat] = localToLonLat({ x: 0, y: 111.32 }, anchor);
+        expect(lat).to.be.closeTo(49.7741, 1e-7);
+        expect(lon).to.be.closeTo(11.1893, 1e-9);
+        const [lon2] = localToLonLat({ x: 100, y: 0 }, anchor);
+        expect(lon2).to.be.greaterThan(11.1893);
+    });
+
+    it('rotates by the yaw of the base station', () => {
+        const rotated = localToLonLat({ x: 10, y: 0 }, { ...anchor, yawDeg: 90 });
+        // x axis turned to north: latitude grows, longitude stays
+        expect(rotated[1]).to.be.greaterThan(anchor.lat);
+        expect(rotated[0]).to.be.closeTo(anchor.lon, 1e-8);
+    });
+
+    it('derives the anchor back from a robot position', () => {
+        const robot = { x: 12, y: -7 };
+        const [lon, lat] = localToLonLat(robot, { ...anchor, yawDeg: 30 });
+        const derived = anchorFromRobot(lat, lon, robot, 30);
+        expect(derived.lat).to.be.closeTo(anchor.lat, 1e-7);
+        expect(derived.lon).to.be.closeTo(anchor.lon, 1e-7);
+    });
+
+    it('builds closed polygons, lines, names and the dock', () => {
+        const square = [
+            { x: 0, y: 0 },
+            { x: 10, y: 0 },
+            { x: 10, y: 10 },
+            { x: 0, y: 10 },
+        ];
+        const geo = buildMapGeoJson(
+            [
+                { hash: 7n, type: 1, name: '', points: square },
+                { hash: 1n, type: 0, name: 'area', points: square },
+                { hash: 2n, type: 2, name: '', points: square.slice(0, 2) },
+                { hash: 3n, type: 18, name: '', points: square },
+                { hash: 4n, type: 0, name: '', points: square.slice(0, 2) },
+            ],
+            anchor,
+            new Map([['1', 'Garten hinten']]),
+            { x: 1, y: 1 },
+        );
+        expect(geo.features.map(f => f.properties.kind)).to.deep.equal(['zone', 'obstacle', 'path', 'dock']);
+        const zone = geo.features[0];
+        expect(zone.properties.name).to.equal('Garten hinten');
+        expect(zone.geometry.type).to.equal('Polygon');
+        const ring = (zone.geometry as { coordinates: Array<Array<[number, number]>> }).coordinates[0];
+        expect(ring.length).to.equal(5);
+        expect(ring[0]).to.deep.equal(ring[4]);
+        expect(geo.features[2].geometry.type).to.equal('LineString');
     });
 });
