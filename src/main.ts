@@ -1874,7 +1874,8 @@ class Mammotion extends utils.Adapter {
         }
 
         if (response.code !== 0) {
-            throw new Error(response.msg || 'Command invoke failed');
+            this.log.debug(`[MODERN-INVOKE] ${context.deviceName || context.iotId}: code=${response.code} msg=${response.msg}`);
+            throw new Error(`${response.msg || 'Command invoke failed'} [mammotion code ${response.code}]`);
         }
         this.log.debug(`[MODERN-INVOKE] result len=${response.data?.result?.length ?? 0}`);
         return response.data?.result || 'ok';
@@ -2411,7 +2412,10 @@ class Mammotion extends utils.Adapter {
                 legacy.iotToken,
             );
             if (response.code !== 200) {
-                throw new Error(this.extractLegacyApiMessage(response, 'Legacy invoke failed'));
+                this.log.debug(`[LEGACY-INVOKE] ${context.deviceName || context.iotId}: code=${response.code}`);
+                throw new Error(
+                    `${this.extractLegacyApiMessage(response, 'Legacy invoke failed')} [aliyun code ${response.code}]`,
+                );
             }
             return response.data || null;
         };
