@@ -25,6 +25,10 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   devices keep to an own budget of 400 per 12 hours (PyMammotion uses 600); commands a user triggers are
   not counted. The status report of such devices is refreshed every 5 minutes while working and every
   60 minutes otherwise. Map loading no longer waits out long back-offs.
+- **Aliyun-era mowers: send slowly from the start, sit out bans.** Live: once a 429 came, every request
+  failed for hours, single requests 10 minutes apart included, so slowing down after the first 429 is too
+  late. Aliyun-only devices now get at most one message every 10 s at all times, a 429 back-off of 15
+  minutes doubling up to 6 hours, and no automatic map load while a back-off runs.
 - **Map loading copes with the cloud quota.** Live: the element list (29 elements) arrived, then the cloud
   answered 429 after about 25 messages. After the first 429 the map load now continues slowly (one message
   every 10 s), waits out back-offs of up to 5 minutes, keeps the elements loaded so far and continues with

@@ -203,6 +203,14 @@ const ALIYUN_BACKGROUND_SEND_LIMIT = 400;
 /** 429 back-off: starts at 1 minute and doubles per consecutive 429, up to 1 hour. */
 const RATE_LIMIT_BACKOFF_MIN_MS = 60_000;
 const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 60_000;
+/**
+ * Aliyun-era mowers: a 429 starts a ban of hours (live: every request failed for hours, single
+ * requests 10 minutes apart included). Back off long and never burst in the first place.
+ */
+const ALIYUN_BACKOFF_MIN_MS = 15 * 60_000;
+const ALIYUN_BACKOFF_MAX_MS = 6 * 60 * 60_000;
+/** Aliyun-era mowers: at most one message every 10 s (the cloud reports iotMsgHz 10000). */
+const ALIYUN_INVOKE_MIN_GAP_MS = 10_000;
 /** Status report refresh for Aliyun-only devices (each request costs quota). */
 const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 60_000;
 const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 60_000;
@@ -1982,7 +1990,9 @@ class Mammotion extends utils.Adapter {
                     }
                     sends.push(Date.now());
                 }
-                const gap = this.invokeGapOverride.get(key) ?? INVOKE_MIN_GAP_MS;
+                const gap =
+                    this.invokeGapOverride.get(key) ??
+                    (this.aliyunOnlyDevices.has(key) ? ALIYUN_INVOKE_MIN_GAP_MS : INVOKE_MIN_GAP_MS);
                 const wait = gap - (Date.now() - (this.lastInvokeAt.get(key) ?? 0));
                 if (wait > 0) {
                     await new Promise(resolve => setTimeout(resolve, wait));
@@ -2146,7 +2156,11 @@ class Mammotion extends utils.Adapter {
         const existingUntil = this.rateLimitBackoffUntil.get(context.key) ?? 0;
         const strikes = (this.rateLimitStrikes.get(context.key) ?? 0) + 1;
         this.rateLimitStrikes.set(context.key, strikes);
-        const backoffMs = Math.min(RATE_LIMIT_BACKOFF_MAX_MS, RATE_LIMIT_BACKOFF_MIN_MS * 2 ** (strikes - 1));
+        const aliyun = this.aliyunOnlyDevices.has(context.key);
+        const backoffMs = Math.min(
+            aliyun ? ALIYUN_BACKOFF_MAX_MS : RATE_LIMIT_BACKOFF_MAX_MS,
+            (aliyun ? ALIYUN_BACKOFF_MIN_MS : RATE_LIMIT_BACKOFF_MIN_MS) * 2 ** (strikes - 1),
+        );
         const newUntil = Date.now() + backoffMs;
         // Only log the first arm in a window; refreshing the window from a follow-up 429 is silent.
         if (existingUntil <= Date.now()) {
@@ -4598,6 +4612,10 @@ class Mammotion extends utils.Adapter {
         }
         const now = Date.now();
         if (now - (this.mapAutoFetchedAt.get(deviceKey) ?? 0) < MAP_AUTO_FETCH_MIN_INTERVAL_MS) {
+            return;
+        }
+        // During a cloud ban every request would fail at once; wait until it is over.
+        if ((this.rateLimitBackoffUntil.get(deviceKey) ?? 0) > now) {
             return;
         }
         const ctx = this.deviceContexts.get(deviceKey);

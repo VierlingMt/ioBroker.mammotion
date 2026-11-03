@@ -170,6 +170,9 @@ const ALIYUN_SEND_WINDOW_MS = 12 * 60 * 6e4;
 const ALIYUN_BACKGROUND_SEND_LIMIT = 400;
 const RATE_LIMIT_BACKOFF_MIN_MS = 6e4;
 const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 6e4;
+const ALIYUN_BACKOFF_MIN_MS = 15 * 6e4;
+const ALIYUN_BACKOFF_MAX_MS = 6 * 60 * 6e4;
+const ALIYUN_INVOKE_MIN_GAP_MS = 1e4;
 const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 6e4;
 const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 6e4;
 const DEVICE_OFFLINE_CODES = ["6205", "6221", "50103", "50104"];
@@ -1711,7 +1714,7 @@ class Mammotion extends utils.Adapter {
         }
         sends.push(Date.now());
       }
-      const gap = (_c = this.invokeGapOverride.get(key)) != null ? _c : INVOKE_MIN_GAP_MS;
+      const gap = (_c = this.invokeGapOverride.get(key)) != null ? _c : this.aliyunOnlyDevices.has(key) ? ALIYUN_INVOKE_MIN_GAP_MS : INVOKE_MIN_GAP_MS;
       const wait = gap - (Date.now() - ((_d = this.lastInvokeAt.get(key)) != null ? _d : 0));
       if (wait > 0) {
         await new Promise((resolve) => setTimeout(resolve, wait));
@@ -1842,7 +1845,11 @@ class Mammotion extends utils.Adapter {
     const existingUntil = (_b = this.rateLimitBackoffUntil.get(context.key)) != null ? _b : 0;
     const strikes = ((_c = this.rateLimitStrikes.get(context.key)) != null ? _c : 0) + 1;
     this.rateLimitStrikes.set(context.key, strikes);
-    const backoffMs = Math.min(RATE_LIMIT_BACKOFF_MAX_MS, RATE_LIMIT_BACKOFF_MIN_MS * 2 ** (strikes - 1));
+    const aliyun = this.aliyunOnlyDevices.has(context.key);
+    const backoffMs = Math.min(
+      aliyun ? ALIYUN_BACKOFF_MAX_MS : RATE_LIMIT_BACKOFF_MAX_MS,
+      (aliyun ? ALIYUN_BACKOFF_MIN_MS : RATE_LIMIT_BACKOFF_MIN_MS) * 2 ** (strikes - 1)
+    );
     const newUntil = Date.now() + backoffMs;
     if (existingUntil <= Date.now()) {
       this.log.warn(
@@ -3924,7 +3931,7 @@ ${url}`;
   }
   // Loads the map once when the map checksum differs from the one last loaded.
   async maybeAutoFetchMap(deviceKey, mapHash) {
-    var _a;
+    var _a, _b;
     if (this.mapFrameListeners.has(deviceKey)) {
       return;
     }
@@ -3934,6 +3941,9 @@ ${url}`;
     }
     const now = Date.now();
     if (now - ((_a = this.mapAutoFetchedAt.get(deviceKey)) != null ? _a : 0) < MAP_AUTO_FETCH_MIN_INTERVAL_MS) {
+      return;
+    }
+    if (((_b = this.rateLimitBackoffUntil.get(deviceKey)) != null ? _b : 0) > now) {
       return;
     }
     const ctx = this.deviceContexts.get(deviceKey);
