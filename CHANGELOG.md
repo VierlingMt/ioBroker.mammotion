@@ -25,6 +25,13 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   devices keep to an own budget of 400 per 12 hours (PyMammotion uses 600); commands a user triggers are
   not counted. The status report of such devices is refreshed every 5 minutes while working and every
   60 minutes otherwise. Map loading no longer waits out long back-offs.
+- **Map loading copes with the cloud quota.** Live: the element list (29 elements) arrived, then the cloud
+  answered 429 after about 25 messages. After the first 429 the map load now continues slowly (one message
+  every 10 s), waits out back-offs of up to 5 minutes, keeps the elements loaded so far and continues with
+  the remaining ones on the next attempt (manual or automatic every 30 minutes) instead of starting over.
+  The partial map is written every 5 elements; `map.status` reads `paused: x/n elements loaded …`. For
+  Aliyun-only mowers the sync message is sent once at the start and again only when the mower stops
+  answering, to save quota.
 - **No zone re-discovery on every start.** The adapter asked the mower for all zones on every start
   (one cloud request per map element), which used up a large part of the send quota during restarts.
   It now only asks when no zones are known; `commands.requestAreaNames` still refreshes them on demand.

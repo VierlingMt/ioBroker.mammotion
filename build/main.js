@@ -157,6 +157,9 @@ const MAP_FETCH_MAX_MS = 15 * 6e4;
 const MAP_MAX_ELEMENTS = 300;
 const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 6e4;
 const MAP_AUTO_FETCH_DELAY_MS = 2e4;
+const MAP_SLOW_GAP_MS = 1e4;
+const MAP_MAX_BACKOFF_WAIT_MS = 5 * 6e4;
+const MAP_PARTIAL_WRITE_EVERY = 5;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 6e4;
 const USER_INTENT_WINDOW_MS = 5 * 6e4;
 const WAKE_MIN_INTERVAL_MS = 6e4;
@@ -208,6 +211,10 @@ class Mammotion extends utils.Adapter {
   lastInvokeAt = /* @__PURE__ */ new Map();
   /** Background sends per device key within ALIYUN_SEND_WINDOW_MS (unix ms). */
   backgroundSends = /* @__PURE__ */ new Map();
+  /** Larger invoke gap per device key while map loading runs in slow mode. */
+  invokeGapOverride = /* @__PURE__ */ new Map();
+  /** Map loading progress per device key, so an interrupted load continues instead of restarting. */
+  mapProgress = /* @__PURE__ */ new Map();
   /** Consecutive 429 answers per device key; resets on the next successful invoke. */
   rateLimitStrikes = /* @__PURE__ */ new Map();
   /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
@@ -351,6 +358,8 @@ class Mammotion extends utils.Adapter {
       this.invokeQueue.clear();
       this.lastInvokeAt.clear();
       this.backgroundSends.clear();
+      this.invokeGapOverride.clear();
+      this.mapProgress.clear();
       this.rateLimitStrikes.clear();
       this.lastAreaNameRequestAt.clear();
       this.jwtMqttRecentShortLifetimes = [];
@@ -1689,7 +1698,7 @@ class Mammotion extends utils.Adapter {
     var _a;
     const previous = (_a = this.invokeQueue.get(key)) != null ? _a : Promise.resolve();
     const run = previous.catch(() => void 0).then(async () => {
-      var _a2, _b, _c;
+      var _a2, _b, _c, _d;
       const userDriven = Date.now() - ((_a2 = this.userIntentAt.get(key)) != null ? _a2 : 0) < USER_INTENT_WINDOW_MS;
       if (this.aliyunOnlyDevices.has(key) && !userDriven) {
         const cutoff = Date.now() - ALIYUN_SEND_WINDOW_MS;
@@ -1702,7 +1711,8 @@ class Mammotion extends utils.Adapter {
         }
         sends.push(Date.now());
       }
-      const wait = INVOKE_MIN_GAP_MS - (Date.now() - ((_c = this.lastInvokeAt.get(key)) != null ? _c : 0));
+      const gap = (_c = this.invokeGapOverride.get(key)) != null ? _c : INVOKE_MIN_GAP_MS;
+      const wait = gap - (Date.now() - ((_d = this.lastInvokeAt.get(key)) != null ? _d : 0));
       if (wait > 0) {
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
@@ -4000,6 +4010,7 @@ ${url}`;
   // frame acknowledged) and writes them as GeoJSON to `map.geojson`.
   // Messages arrive via MQTT; the invoke result is checked as well.
   async fetchMap(ctx) {
+    var _a, _b, _c, _d, _e;
     const key = ctx.key;
     const label = ctx.deviceName || ctx.iotId;
     if (this.mapFrameListeners.has(key)) {
@@ -4038,8 +4049,9 @@ ${url}`;
         wake = null;
       }
     };
+    let rateLimitHit = false;
     const send = async (commandLabel, build) => {
-      var _a;
+      var _a2;
       for (let attempt = 0; ; attempt++) {
         try {
           const result = await this.executeEncodedContentCommand(
@@ -4053,11 +4065,19 @@ ${url}`;
           return;
         } catch (err) {
           const msg = this.extractAxiosError(err);
-          const until = (_a = this.rateLimitBackoffUntil.get(ctx.key)) != null ? _a : 0;
+          const rateLimited = msg.includes("429") || msg.includes("rate-limited");
+          const until = (_a2 = this.rateLimitBackoffUntil.get(ctx.key)) != null ? _a2 : 0;
           const waitMs = until - Date.now() + 2e3;
-          if (attempt >= 1 || !(msg.includes("429") || msg.includes("rate-limited")) || waitMs > 2 * 6e4) {
+          if (!rateLimited || attempt >= 4 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
+            if (rateLimited) {
+              rateLimitHit = true;
+            }
             throw err;
           }
+          if (!this.invokeGapOverride.has(ctx.key)) {
+            this.log.info(`[MAP] ${label}: cloud rate limit, continuing slowly (one message per 10 s).`);
+          }
+          this.invokeGapOverride.set(ctx.key, MAP_SLOW_GAP_MS);
           this.log.debug(
             `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1e3)}s before ${commandLabel}.`
           );
@@ -4068,20 +4088,29 @@ ${url}`;
     this.mapFrameListeners.set(key, accept);
     const startedAt = Date.now();
     let lastSyncAt = 0;
-    const syncIfDue = async () => {
-      if (Date.now() - lastSyncAt >= MAP_SYNC_REFRESH_MS) {
+    const syncInterval = this.aliyunOnlyDevices.has(key) ? Number.POSITIVE_INFINITY : MAP_SYNC_REFRESH_MS;
+    const syncIfDue = async (force = false) => {
+      if (force || Date.now() - lastSyncAt >= syncInterval) {
         await send("map-sync", (session) => this.buildMapSyncContent(session));
         lastSyncAt = Date.now();
       }
     };
+    const currentMapHash = String((_b = (_a = await this.getStateAsync(`devices.${key}.telemetry.mapHash`)) == null ? void 0 : _a.val) != null ? _b : "");
+    let progress = this.mapProgress.get(key);
+    if (progress && currentMapHash && progress.mapHash && progress.mapHash !== currentMapHash) {
+      progress = void 0;
+    }
+    let hashes = (_c = progress == null ? void 0 : progress.hashes) != null ? _c : [];
+    const loaded = (_d = progress == null ? void 0 : progress.elements) != null ? _d : /* @__PURE__ */ new Map();
     try {
       await this.setStateChangedAsync(statusId, "loading element list", true);
-      const primary = this.getReceiverDevice(ctx);
+      await syncIfDue(true);
+      const primary = (_e = progress == null ? void 0 : progress.receiver) != null ? _e : this.getReceiverDevice(ctx);
       const receivers = [primary, primary === 17 ? 1 : 17];
       let receiver = primary;
       const listParts = /* @__PURE__ */ new Map();
       let listTotal = 0;
-      for (const candidate of receivers) {
+      for (const candidate of hashes.length ? [] : receivers) {
         await syncIfDue();
         await send("map-hash-list", (session) => this.buildHashListContent(session, candidate));
         const first = await take(hashFrames, () => true, MAP_FRAME_TIMEOUT_MS);
@@ -4102,19 +4131,27 @@ ${url}`;
         }
         break;
       }
-      const hashes = [...new Set([...listParts.values()].flat())].slice(0, MAP_MAX_ELEMENTS);
+      if (!hashes.length) {
+        hashes = [...new Set([...listParts.values()].flat())].slice(0, MAP_MAX_ELEMENTS);
+      }
       if (!hashes.length) {
         throw new Error("The mower did not send its element list (no answer on the map request).");
       }
+      this.mapProgress.set(key, { mapHash: currentMapHash, hashes, receiver, elements: loaded });
       if (listParts.size < listTotal) {
         this.log.warn(`[MAP] Element list of ${label} incomplete (${listParts.size}/${listTotal} frames).`);
       }
-      this.log.info(`[MAP] ${label}: ${hashes.length} map elements, loading geometry (receiver ${receiver}).`);
-      const elements = [];
+      this.log.info(
+        `[MAP] ${label}: ${hashes.length} map elements, ${loaded.size} already loaded, loading geometry (receiver ${receiver}).`
+      );
       const failed = [];
+      let newSinceWrite = 0;
       for (const [index, hash] of hashes.entries()) {
+        if (loaded.has(hash.toString())) {
+          continue;
+        }
         if (Date.now() - startedAt > MAP_FETCH_MAX_MS) {
-          this.log.warn(`[MAP] ${label}: stopping after ${index} elements, time limit reached.`);
+          this.log.warn(`[MAP] ${label}: pausing after ${loaded.size} elements, time limit reached.`);
           break;
         }
         await this.setStateChangedAsync(statusId, `loading element ${index + 1}/${hashes.length}`, true);
@@ -4128,7 +4165,7 @@ ${url}`;
             if (++attempts > 1) {
               break;
             }
-            await syncIfDue();
+            await syncIfDue(true);
             await send("map-element", (session) => this.buildElementContent(session, receiver, hash));
             continue;
           }
@@ -4136,21 +4173,34 @@ ${url}`;
           await send("map-element-ack", (session) => this.buildElementContent(session, receiver, hash, frame));
         }
         if (assembler.complete) {
-          elements.push(assembler.result());
+          loaded.set(hash.toString(), assembler.result());
+          if (++newSinceWrite >= MAP_PARTIAL_WRITE_EVERY) {
+            newSinceWrite = 0;
+            await this.writeMapGeoJson(ctx, [...loaded.values()], false);
+          }
         } else {
           failed.push(hash.toString());
         }
         commFrames.length = 0;
       }
-      await this.writeMapGeoJson(ctx, elements);
-      const summary = `${elements.length}/${hashes.length} elements loaded${failed.length ? `, ${failed.length} without answer` : ""}`;
+      const complete = hashes.every((h) => loaded.has(h.toString()));
+      await this.writeMapGeoJson(ctx, [...loaded.values()], complete);
+      if (complete) {
+        this.mapProgress.delete(key);
+      }
+      const summary = `${loaded.size}/${hashes.length} elements loaded${failed.length ? `, ${failed.length} without answer` : ""}`;
       await this.setStateChangedAsync(statusId, summary, true);
       this.log.info(`[MAP] ${label}: ${summary}.`);
     } catch (err) {
-      await this.setStateChangedAsync(statusId, `failed: ${this.extractAxiosError(err)}`, true);
+      if (loaded.size) {
+        await this.writeMapGeoJson(ctx, [...loaded.values()], false);
+      }
+      const status = rateLimitHit && hashes.length ? `paused: ${loaded.size}/${hashes.length} elements loaded (cloud rate limit), continues later` : `failed: ${this.extractAxiosError(err)}`;
+      await this.setStateChangedAsync(statusId, status, true);
       throw err;
     } finally {
       this.mapFrameListeners.delete(key);
+      this.invokeGapOverride.delete(key);
       wake = null;
     }
   }
@@ -4161,7 +4211,7 @@ ${url}`;
     return val === null || val === void 0 || val === "" || !Number.isFinite(n) ? null : n;
   }
   // Converts the elements to GeoJSON using the best available map origin.
-  async writeMapGeoJson(ctx, elements) {
+  async writeMapGeoJson(ctx, elements, complete = true) {
     var _a;
     const base = `devices.${ctx.key}`;
     const [baseLat, baseLon, yaw, robotLat, robotLon, posX, posY, dockX, dockY] = await Promise.all(
@@ -4194,7 +4244,7 @@ ${url}`;
     await this.setStateChangedAsync(`${base}.map.anchorSource`, anchorSource, true);
     await this.setStateAsync(`${base}.map.updatedAt`, Date.now(), true);
     const mapHash = (_a = await this.getStateAsync(`${base}.telemetry.mapHash`)) == null ? void 0 : _a.val;
-    if (typeof mapHash === "string" && mapHash) {
+    if (complete && typeof mapHash === "string" && mapHash) {
       await this.setStateChangedAsync(`${base}.map.loadedMapHash`, mapHash, true);
     }
   }

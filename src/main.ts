@@ -170,6 +170,12 @@ const MAP_MAX_ELEMENTS = 300;
 /** Minimum time between two automatic map loads of one device. */
 const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 60_000;
 const MAP_AUTO_FETCH_DELAY_MS = 20_000;
+/** After a 429 during map loading: one message every 10 s (the cloud reports iotMsgHz 10000). */
+const MAP_SLOW_GAP_MS = 10_000;
+/** Longest 429 back-off map loading waits out before it pauses and continues on the next attempt. */
+const MAP_MAX_BACKOFF_WAIT_MS = 5 * 60_000;
+/** Write the partial map after this many new elements. */
+const MAP_PARTIAL_WRITE_EVERY = 5;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 60_000;
 /**
  * Sleeping mowers (work mode 48) drop their cloud connection; every invoke then
@@ -241,6 +247,13 @@ class Mammotion extends utils.Adapter {
     private readonly lastInvokeAt = new Map<string, number>();
     /** Background sends per device key within ALIYUN_SEND_WINDOW_MS (unix ms). */
     private readonly backgroundSends = new Map<string, number[]>();
+    /** Larger invoke gap per device key while map loading runs in slow mode. */
+    private readonly invokeGapOverride = new Map<string, number>();
+    /** Map loading progress per device key, so an interrupted load continues instead of restarting. */
+    private readonly mapProgress = new Map<
+        string,
+        { mapHash: string; hashes: bigint[]; receiver: number; elements: Map<string, MapElement> }
+    >();
     /** Consecutive 429 answers per device key; resets on the next successful invoke. */
     private readonly rateLimitStrikes = new Map<string, number>();
     /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
@@ -394,6 +407,8 @@ class Mammotion extends utils.Adapter {
             this.invokeQueue.clear();
             this.lastInvokeAt.clear();
             this.backgroundSends.clear();
+            this.invokeGapOverride.clear();
+            this.mapProgress.clear();
             this.rateLimitStrikes.clear();
             this.lastAreaNameRequestAt.clear();
             this.jwtMqttRecentShortLifetimes = [];
@@ -1967,7 +1982,8 @@ class Mammotion extends utils.Adapter {
                     }
                     sends.push(Date.now());
                 }
-                const wait = INVOKE_MIN_GAP_MS - (Date.now() - (this.lastInvokeAt.get(key) ?? 0));
+                const gap = this.invokeGapOverride.get(key) ?? INVOKE_MIN_GAP_MS;
+                const wait = gap - (Date.now() - (this.lastInvokeAt.get(key) ?? 0));
                 if (wait > 0) {
                     await new Promise(resolve => setTimeout(resolve, wait));
                 }
@@ -4705,6 +4721,7 @@ class Mammotion extends utils.Adapter {
                 wake = null;
             }
         };
+        let rateLimitHit = false;
         const send = async (commandLabel: string, build: (session: AuthSession) => string): Promise<void> => {
             for (let attempt = 0; ; attempt++) {
                 try {
@@ -4717,12 +4734,20 @@ class Mammotion extends utils.Adapter {
                     return;
                 } catch (err) {
                     const msg = this.extractAxiosError(err);
+                    const rateLimited = msg.includes('429') || msg.includes('rate-limited');
                     const until = this.rateLimitBackoffUntil.get(ctx.key) ?? 0;
                     const waitMs = until - Date.now() + 2_000;
-                    // Ride out a short back-off once; a long one means the cloud quota is used up.
-                    if (attempt >= 1 || !(msg.includes('429') || msg.includes('rate-limited')) || waitMs > 2 * 60_000) {
+                    if (!rateLimited || attempt >= 4 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
+                        if (rateLimited) {
+                            rateLimitHit = true;
+                        }
                         throw err;
                     }
+                    // Slow down for the rest of this load, wait out the back-off, then continue.
+                    if (!this.invokeGapOverride.has(ctx.key)) {
+                        this.log.info(`[MAP] ${label}: cloud rate limit, continuing slowly (one message per 10 s).`);
+                    }
+                    this.invokeGapOverride.set(ctx.key, MAP_SLOW_GAP_MS);
                     this.log.debug(
                         `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1000)}s before ${commandLabel}.`,
                     );
@@ -4734,22 +4759,34 @@ class Mammotion extends utils.Adapter {
         this.mapFrameListeners.set(key, accept);
         const startedAt = Date.now();
         let lastSyncAt = 0;
-        const syncIfDue = async (): Promise<void> => {
-            if (Date.now() - lastSyncAt >= MAP_SYNC_REFRESH_MS) {
+        // Aliyun-era mowers pay every message from the cloud quota: sync once at the start and
+        // again only when the mower stops answering; Mammotion-platform mowers as the app does.
+        const syncInterval = this.aliyunOnlyDevices.has(key) ? Number.POSITIVE_INFINITY : MAP_SYNC_REFRESH_MS;
+        const syncIfDue = async (force = false): Promise<void> => {
+            if (force || Date.now() - lastSyncAt >= syncInterval) {
                 await send('map-sync', session => this.buildMapSyncContent(session));
                 lastSyncAt = Date.now();
             }
         };
+        const currentMapHash = String((await this.getStateAsync(`devices.${key}.telemetry.mapHash`))?.val ?? '');
+        let progress = this.mapProgress.get(key);
+        if (progress && currentMapHash && progress.mapHash && progress.mapHash !== currentMapHash) {
+            progress = undefined; // the map changed: start over
+        }
+        let hashes: bigint[] = progress?.hashes ?? [];
+        const loaded = progress?.elements ?? new Map<string, MapElement>();
         try {
             await this.setStateChangedAsync(statusId, 'loading element list', true);
+            await syncIfDue(true);
 
-            // 1) Hash list. Receiver 17 (navigation) on newer models, 1 on older ones: try both.
-            const primary = this.getReceiverDevice(ctx);
+            // 1) Hash list (skipped when an earlier, interrupted load already has it).
+            // Receiver 17 (navigation) on newer models, 1 on older ones: try both.
+            const primary = progress?.receiver ?? this.getReceiverDevice(ctx);
             const receivers = [primary, primary === 17 ? 1 : 17];
             let receiver = primary;
             const listParts = new Map<number, bigint[]>();
             let listTotal = 0;
-            for (const candidate of receivers) {
+            for (const candidate of hashes.length ? [] : receivers) {
                 await syncIfDue();
                 await send('map-hash-list', session => this.buildHashListContent(session, candidate));
                 const first = await take(hashFrames, () => true, MAP_FRAME_TIMEOUT_MS);
@@ -4770,21 +4807,29 @@ class Mammotion extends utils.Adapter {
                 }
                 break;
             }
-            const hashes = [...new Set([...listParts.values()].flat())].slice(0, MAP_MAX_ELEMENTS);
+            if (!hashes.length) {
+                hashes = [...new Set([...listParts.values()].flat())].slice(0, MAP_MAX_ELEMENTS);
+            }
             if (!hashes.length) {
                 throw new Error('The mower did not send its element list (no answer on the map request).');
             }
+            this.mapProgress.set(key, { mapHash: currentMapHash, hashes, receiver, elements: loaded });
             if (listParts.size < listTotal) {
                 this.log.warn(`[MAP] Element list of ${label} incomplete (${listParts.size}/${listTotal} frames).`);
             }
-            this.log.info(`[MAP] ${label}: ${hashes.length} map elements, loading geometry (receiver ${receiver}).`);
+            this.log.info(
+                `[MAP] ${label}: ${hashes.length} map elements, ${loaded.size} already loaded, loading geometry (receiver ${receiver}).`,
+            );
 
-            // 2) Geometry of every element, one at a time.
-            const elements: MapElement[] = [];
+            // 2) Geometry of every element, one at a time; elements of an earlier attempt are kept.
             const failed: string[] = [];
+            let newSinceWrite = 0;
             for (const [index, hash] of hashes.entries()) {
+                if (loaded.has(hash.toString())) {
+                    continue;
+                }
                 if (Date.now() - startedAt > MAP_FETCH_MAX_MS) {
-                    this.log.warn(`[MAP] ${label}: stopping after ${index} elements, time limit reached.`);
+                    this.log.warn(`[MAP] ${label}: pausing after ${loaded.size} elements, time limit reached.`);
                     break;
                 }
                 await this.setStateChangedAsync(statusId, `loading element ${index + 1}/${hashes.length}`, true);
@@ -4799,7 +4844,7 @@ class Mammotion extends utils.Adapter {
                             break;
                         }
                         // Ask again: the device restarts this element at frame 1.
-                        await syncIfDue();
+                        await syncIfDue(true);
                         await send('map-element', session => this.buildElementContent(session, receiver, hash));
                         continue;
                     }
@@ -4807,21 +4852,37 @@ class Mammotion extends utils.Adapter {
                     await send('map-element-ack', session => this.buildElementContent(session, receiver, hash, frame));
                 }
                 if (assembler.complete) {
-                    elements.push(assembler.result());
+                    loaded.set(hash.toString(), assembler.result());
+                    if (++newSinceWrite >= MAP_PARTIAL_WRITE_EVERY) {
+                        newSinceWrite = 0;
+                        await this.writeMapGeoJson(ctx, [...loaded.values()], false);
+                    }
                 } else {
                     failed.push(hash.toString());
                 }
                 commFrames.length = 0;
             }
-            await this.writeMapGeoJson(ctx, elements);
-            const summary = `${elements.length}/${hashes.length} elements loaded${failed.length ? `, ${failed.length} without answer` : ''}`;
+            const complete = hashes.every(h => loaded.has(h.toString()));
+            await this.writeMapGeoJson(ctx, [...loaded.values()], complete);
+            if (complete) {
+                this.mapProgress.delete(key);
+            }
+            const summary = `${loaded.size}/${hashes.length} elements loaded${failed.length ? `, ${failed.length} without answer` : ''}`;
             await this.setStateChangedAsync(statusId, summary, true);
             this.log.info(`[MAP] ${label}: ${summary}.`);
         } catch (err) {
-            await this.setStateChangedAsync(statusId, `failed: ${this.extractAxiosError(err)}`, true);
+            if (loaded.size) {
+                await this.writeMapGeoJson(ctx, [...loaded.values()], false);
+            }
+            const status =
+                rateLimitHit && hashes.length
+                    ? `paused: ${loaded.size}/${hashes.length} elements loaded (cloud rate limit), continues later`
+                    : `failed: ${this.extractAxiosError(err)}`;
+            await this.setStateChangedAsync(statusId, status, true);
             throw err;
         } finally {
             this.mapFrameListeners.delete(key);
+            this.invokeGapOverride.delete(key);
             wake = null;
         }
     }
@@ -4833,7 +4894,7 @@ class Mammotion extends utils.Adapter {
     }
 
     // Converts the elements to GeoJSON using the best available map origin.
-    private async writeMapGeoJson(ctx: DeviceContext, elements: MapElement[]): Promise<void> {
+    private async writeMapGeoJson(ctx: DeviceContext, elements: MapElement[], complete = true): Promise<void> {
         const base = `devices.${ctx.key}`;
         const [baseLat, baseLon, yaw, robotLat, robotLon, posX, posY, dockX, dockY] = await Promise.all(
             [
@@ -4867,7 +4928,8 @@ class Mammotion extends utils.Adapter {
         await this.setStateChangedAsync(`${base}.map.anchorSource`, anchorSource, true);
         await this.setStateAsync(`${base}.map.updatedAt`, Date.now(), true);
         const mapHash = (await this.getStateAsync(`${base}.telemetry.mapHash`))?.val;
-        if (typeof mapHash === 'string' && mapHash) {
+        // Only a complete map counts as loaded; a partial one is continued on the next attempt.
+        if (complete && typeof mapHash === 'string' && mapHash) {
             await this.setStateChangedAsync(`${base}.map.loadedMapHash`, mapHash, true);
         }
     }
