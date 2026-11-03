@@ -394,6 +394,24 @@ export const REPORT_STATE_DEFS: ReportStateDef[] = [
     },
     { id: 'map.status', name: 'Map loading status', type: 'string', role: 'text' },
     { id: 'map.loadedMapHash', name: 'Map checksum of the loaded map', type: 'string', role: 'text' },
+    {
+        id: 'map.progressJson',
+        name: 'Unfinished map load (internal, resumes after restart)',
+        type: 'string',
+        role: 'json',
+    },
+    // Cloud send quota (Aliyun invoke answer; Aliyun-era mowers)
+    { id: 'cloud.msgSurplus', name: 'Cloud messages left (iotMsgSurplus)', type: 'number', role: 'value' },
+    { id: 'cloud.msgTotal', name: 'Cloud message allowance (iotMsgTotal)', type: 'number', role: 'value' },
+    {
+        id: 'cloud.msgResetInSec',
+        name: 'Seconds until the allowance resets (iotMsgTotalCD)',
+        type: 'number',
+        role: 'value',
+        unit: 's',
+    },
+    { id: 'cloud.quotaJson', name: 'All quota fields of the last cloud answer', type: 'string', role: 'json' },
+    { id: 'cloud.lastRateLimitAt', name: 'Time of the last 429 answer', type: 'number', role: 'value.time' },
 ];
 
 const SYS_FIELD_REPORT_DATA = 39;

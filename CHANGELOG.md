@@ -25,6 +25,18 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   devices keep to an own budget of 400 per 12 hours (PyMammotion uses 600); commands a user triggers are
   not counted. The status report of such devices is refreshed every 5 minutes while working and every
   60 minutes otherwise. Map loading no longer waits out long back-offs.
+- **Map loading in small rounds, resumable across restarts.** Live findings of 03.11. (local test
+  session): the cloud allows only a handful of messages before a 429, the ban lifts after about 15
+  minutes, and an incomplete element list (1 of 2 frames) made the loader work with 20 of 29 elements and
+  never fetch the rest. Now:
+  - the element list is only used when complete (longer frame timeout, one repeated acknowledgement);
+  - the last frame of a list or element is no longer acknowledged (its data is already there), which
+    halves the messages for single-frame elements;
+  - Aliyun-era mowers load at most 15 messages per round, then pause 30 minutes and continue
+    (`map.status` = `paused: x/n elements loaded …`); the loaded elements are kept in `map.progressJson`
+    and survive adapter restarts.
+- **Cloud quota states.** `cloud.msgSurplus`, `cloud.msgTotal`, `cloud.msgResetInSec`, `cloud.quotaJson`
+  (counters the Aliyun invoke answer carries) and `cloud.lastRateLimitAt`, to learn how the quota behaves.
 - **Aliyun-era mowers: send slowly from the start, sit out bans.** Live: once a 429 came, every request
   failed for hours, single requests 10 minutes apart included, so slowing down after the first 429 is too
   late. Aliyun-only devices now get at most one message every 10 s at all times, a 429 back-off of 15
