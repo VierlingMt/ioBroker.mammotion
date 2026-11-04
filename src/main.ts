@@ -188,6 +188,13 @@ const MAP_BURST_GAP_MS = 400;
 const MAP_SYNC_MAX_AGE_MS = 3_000;
 /** Aliyun mowers: the official app repeats the IoT sync ("heartbeat") every 20 s, not every few seconds. */
 const MAP_SYNC_MAX_AGE_ALIYUN_MS = 20_000;
+/**
+ * Aliyun mowers: frame acknowledgements cannot wait for the normal 10 s gap. The mower repeats an
+ * unacknowledged frame five times, once a second, and then gives up (live 04.11.: frame 1 at
+ * 19:34:31-35, our ack at 19:34:42 came too late, frame 2 never followed). The app acknowledges at
+ * once. Acks therefore go out after this shorter gap.
+ */
+const MAP_ACK_GAP_ALIYUN_MS = 2_500;
 /** Safety cap of messages per map-loading run. */
 const MAP_SENDS_PER_RUN = 400;
 /** Pause between two map-loading rounds. */
@@ -4606,10 +4613,18 @@ class Mammotion extends utils.Adapter {
         };
         let rateLimitHit = false;
         let sentThisRound = 0;
-        const send = async (commandLabel: string, build: (session: AuthSession) => string): Promise<void> => {
+        const send = async (
+            commandLabel: string,
+            build: (session: AuthSession) => string,
+            ack = false,
+        ): Promise<void> => {
             for (let attempt = 0; ; attempt++) {
+                const shortGap = ack && this.aliyunOnlyDevices.has(key);
                 try {
                     sentThisRound++;
+                    if (shortGap) {
+                        this.invokeGapOverride.set(key, MAP_ACK_GAP_ALIYUN_MS);
+                    }
                     const result = await this.executeEncodedContentCommand(ctx, commandLabel, session =>
                         build(session),
                     );
@@ -4622,6 +4637,12 @@ class Mammotion extends utils.Adapter {
                     const rateLimited = msg.includes('429') || msg.includes('rate-limited');
                     const until = this.rateLimitBackoffUntil.get(ctx.key) ?? 0;
                     const waitMs = until - Date.now() + 2_000;
+                    if (shortGap && rateLimited) {
+                        // A late ack is useless (the mower has given up by then): let the frame wait
+                        // time out and ask for the element again after the back-off.
+                        this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited, not repeated.`);
+                        return;
+                    }
                     if (!rateLimited || attempt >= 4 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
                         if (rateLimited) {
                             rateLimitHit = true;
@@ -4633,6 +4654,10 @@ class Mammotion extends utils.Adapter {
                         `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1000)}s before ${commandLabel}.`,
                     );
                     await new Promise(resolve => setTimeout(resolve, Math.max(waitMs, 0)));
+                } finally {
+                    if (shortGap) {
+                        this.invokeGapOverride.delete(key);
+                    }
                 }
             }
         };
@@ -4697,7 +4722,11 @@ class Mammotion extends utils.Adapter {
                     // by the mower about once a second, which floods the cloud.
                     lastAck = frame;
                     const ackFrame: HashListFrame = frame;
-                    await send('map-hash-list-ack', session => this.buildHashListContent(session, receiver, ackFrame));
+                    await send(
+                        'map-hash-list-ack',
+                        session => this.buildHashListContent(session, receiver, ackFrame),
+                        true,
+                    );
                     if (listParts.size >= listTotal) {
                         break;
                     }
@@ -4706,7 +4735,11 @@ class Mammotion extends utils.Adapter {
                         // The acknowledgement may have been lost: repeat it once.
                         ackResent = true;
                         const again: HashListFrame = lastAck;
-                        await send('map-hash-list-ack', session => this.buildHashListContent(session, receiver, again));
+                        await send(
+                            'map-hash-list-ack',
+                            session => this.buildHashListContent(session, receiver, again),
+                            true,
+                        );
                         frame = await take(hashFrames, f => !listParts.has(f.currentFrame), frameTimeout);
                     }
                 }
@@ -4762,7 +4795,11 @@ class Mammotion extends utils.Adapter {
                     }
                     assembler.add(frame);
                     // Acknowledge every frame (the last one too, or the mower repeats it).
-                    await send('map-element-ack', session => this.buildElementContent(session, receiver, hash, frame));
+                    await send(
+                        'map-element-ack',
+                        session => this.buildElementContent(session, receiver, hash, frame),
+                        true,
+                    );
                 }
                 if (assembler.complete) {
                     loaded.set(hash.toString(), assembler.result());

@@ -163,6 +163,7 @@ const MAP_FRAME_TIMEOUT_ALIYUN_MS = 25e3;
 const MAP_BURST_GAP_MS = 400;
 const MAP_SYNC_MAX_AGE_MS = 3e3;
 const MAP_SYNC_MAX_AGE_ALIYUN_MS = 2e4;
+const MAP_ACK_GAP_ALIYUN_MS = 2500;
 const MAP_SENDS_PER_RUN = 400;
 const MAP_ROUND_PAUSE_MS = 30 * 6e4;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 6e4;
@@ -3916,11 +3917,15 @@ ${url}`;
     };
     let rateLimitHit = false;
     let sentThisRound = 0;
-    const send = async (commandLabel, build) => {
+    const send = async (commandLabel, build, ack = false) => {
       var _a2;
       for (let attempt = 0; ; attempt++) {
+        const shortGap = ack && this.aliyunOnlyDevices.has(key);
         try {
           sentThisRound++;
+          if (shortGap) {
+            this.invokeGapOverride.set(key, MAP_ACK_GAP_ALIYUN_MS);
+          }
           const result = await this.executeEncodedContentCommand(
             ctx,
             commandLabel,
@@ -3935,6 +3940,10 @@ ${url}`;
           const rateLimited = msg.includes("429") || msg.includes("rate-limited");
           const until = (_a2 = this.rateLimitBackoffUntil.get(ctx.key)) != null ? _a2 : 0;
           const waitMs = until - Date.now() + 2e3;
+          if (shortGap && rateLimited) {
+            this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited, not repeated.`);
+            return;
+          }
           if (!rateLimited || attempt >= 4 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
             if (rateLimited) {
               rateLimitHit = true;
@@ -3945,6 +3954,10 @@ ${url}`;
             `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1e3)}s before ${commandLabel}.`
           );
           await new Promise((resolve) => setTimeout(resolve, Math.max(waitMs, 0)));
+        } finally {
+          if (shortGap) {
+            this.invokeGapOverride.delete(key);
+          }
         }
       }
     };
@@ -4000,7 +4013,11 @@ ${url}`;
           listTotal = frame.totalFrame;
           lastAck = frame;
           const ackFrame = frame;
-          await send("map-hash-list-ack", (session) => this.buildHashListContent(session, receiver, ackFrame));
+          await send(
+            "map-hash-list-ack",
+            (session) => this.buildHashListContent(session, receiver, ackFrame),
+            true
+          );
           if (listParts.size >= listTotal) {
             break;
           }
@@ -4008,7 +4025,11 @@ ${url}`;
           if (!frame && !ackResent) {
             ackResent = true;
             const again = lastAck;
-            await send("map-hash-list-ack", (session) => this.buildHashListContent(session, receiver, again));
+            await send(
+              "map-hash-list-ack",
+              (session) => this.buildHashListContent(session, receiver, again),
+              true
+            );
             frame = await take(hashFrames, (f) => !listParts.has(f.currentFrame), frameTimeout);
           }
         }
@@ -4059,7 +4080,11 @@ ${url}`;
             continue;
           }
           assembler.add(frame);
-          await send("map-element-ack", (session) => this.buildElementContent(session, receiver, hash, frame));
+          await send(
+            "map-element-ack",
+            (session) => this.buildElementContent(session, receiver, hash, frame),
+            true
+          );
         }
         if (assembler.complete) {
           loaded.set(hash.toString(), assembler.result());

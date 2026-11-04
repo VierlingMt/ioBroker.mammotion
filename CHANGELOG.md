@@ -30,6 +30,11 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   every 20 s. Map loading on Aliyun mowers now keeps the normal gap (cloud `iotMsgHz` plus 1 s) and
   re-sends the sync every 20 s. A plugin 429 backs off 30 s (doubling up to 30 min) instead of 15 min
   to 6 h, since it is an interval limit, not a used-up quota.
+- **Map frames of Aliyun mowers are acknowledged in time.** The mower repeats an unacknowledged frame
+  five times, once a second, and then gives up; the 10 s gap made every acknowledgement late, so the
+  element list stayed at 1 of 2 frames. Frame acknowledgements now go out 2.5 s after the previous
+  invoke, like the app (which acknowledges at once). A rate-limited acknowledgement is not repeated,
+  since the mower has given up by then; the element is requested again instead.
 - **Commands for shared Aliyun devices work again.** Live diagnosis on a shared Luba 2 AWD (Aliyun product
   key, firmware 1.11): the Mammotion platform lists the device in neither the device list nor the device
   page for the shared account, only the Aliyun bindings do. The Mammotion invoke now answers
