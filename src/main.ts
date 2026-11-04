@@ -285,6 +285,9 @@ class Mammotion extends utils.Adapter {
     >();
     /** Consecutive 429 answers per device key; resets on the next successful invoke. */
     private readonly rateLimitStrikes = new Map<string, number>();
+    // Report pacing the cloud hands out with every invoke answer (iotMsgHz / iotSameMsgHz, in ms).
+    // The official app uses these as period and no-change period of the status report request.
+    private readonly cloudReportPacing = new Map<string, { periodMs: number; noChangeMs: number }>();
     /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
     private readonly aliyunOnlyDevices = new Set<string>();
     // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
@@ -1243,6 +1246,7 @@ class Mammotion extends utils.Adapter {
                         session,
                         stop,
                         this.aliyunOnlyDevices.has(context.key) ? ALIYUN_REPORT_COUNT : 0,
+                        this.cloudReportPacing.get(context.key),
                     ),
             );
         } catch (err) {
@@ -2184,6 +2188,9 @@ class Mammotion extends utils.Adapter {
             return;
         }
         void this.setStateChangedAsync(`devices.${context.key}.cloud.lastRateLimitAt`, Date.now(), true);
+        const reason = this.describeGatewayThrottle(err);
+        void this.setStateChangedAsync(`devices.${context.key}.cloud.lastRateLimitReason`, reason, true);
+        this.log.debug(`[RATE-LIMIT] ${context.deviceName || context.iotId}: ${reason}`);
         const existingUntil = this.rateLimitBackoffUntil.get(context.key) ?? 0;
         const strikes = (this.rateLimitStrikes.get(context.key) ?? 0) + 1;
         this.rateLimitStrikes.set(context.key, strikes);
@@ -2198,7 +2205,7 @@ class Mammotion extends utils.Adapter {
             this.log.warn(
                 `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${Math.round(
                     backoffMs / 1000,
-                )}s (cloud send quota).`,
+                )}s (${reason}).`,
             );
         }
         this.rateLimitBackoffUntil.set(context.key, Math.max(existingUntil, newUntil));
@@ -3685,14 +3692,19 @@ class Mammotion extends utils.Adapter {
         ]).toString('base64');
     }
 
-    private buildRequestIotSyncContent(session: AuthSession, stop = false, count = 0): string {
+    private buildRequestIotSyncContent(
+        session: AuthSession,
+        stop = false,
+        count = 0,
+        pacing?: { periodMs: number; noChangeMs: number },
+    ): string {
         const subtype = Number.parseInt(session.userAccount, 10);
         const reportTypes = [1, 3, 4, 6, 10, 8];
         const reportCfgFields: Buffer[] = [
             this.encodeFieldVarint(1, stop ? 1 : 0),
             this.encodeFieldVarint(2, 10_000),
-            this.encodeFieldVarint(3, 3_000),
-            this.encodeFieldVarint(4, 4_000),
+            this.encodeFieldVarint(3, pacing?.periodMs ?? 3_000),
+            this.encodeFieldVarint(4, pacing?.noChangeMs ?? 4_000),
             this.encodeFieldVarint(5, count),
         ];
         for (const type of reportTypes) {
@@ -4790,6 +4802,11 @@ class Mammotion extends utils.Adapter {
         const cd = num(d.iotMsgTotalCD);
         if (cd !== null) {
             await this.setStateChangedAsync(`${base}.msgResetInSec`, cd, true);
+        }
+        const hz = num(d.iotMsgHz);
+        const sameHz = num(d.iotSameMsgHz);
+        if (hz !== null && hz > 0 && sameHz !== null && sameHz > 0) {
+            this.cloudReportPacing.set(context.key, { periodMs: hz, noChangeMs: sameHz });
         }
         const quota = Object.fromEntries(Object.entries(d).filter(([k]) => k.startsWith('iot')));
         await this.setStateChangedAsync(`${base}.quotaJson`, JSON.stringify(quota), true);
@@ -6538,6 +6555,34 @@ class Mammotion extends utils.Adapter {
         const stringToSign = `${OAUTH_APP_KEY}${timestampMs}${TOKEN_ENDPOINT}${payloadJson}`;
         const md5Secret = createHash('md5').update(OAUTH_APP_SECRET, 'utf8').digest('hex');
         return createHmac('sha256', md5Secret).update(stringToSign, 'utf8').digest('hex');
+    }
+
+    /**
+     * The Aliyun API gateway names the throttle that answered 429 in its response headers
+     * (for example "Throttled by APP Flow Control" versus "Throttled by USER Flow Control").
+     * That tells a per-app-key limit apart from a per-account or per-device one.
+     *
+     * @param err error thrown by axios
+     */
+    private describeGatewayThrottle(err: unknown): string {
+        if (!axios.isAxiosError(err) || !err.response) {
+            return 'no gateway response';
+        }
+        const headers = err.response.headers ?? {};
+        const pick = (name: string): string => {
+            const value: unknown = headers[name] ?? headers[name.toLowerCase()];
+            return typeof value === 'string' ? value : Array.isArray(value) ? value.join(',') : '';
+        };
+        const parts = [
+            pick('x-ca-error-message') && `message=${pick('x-ca-error-message')}`,
+            pick('x-ca-error-code') && `code=${pick('x-ca-error-code')}`,
+            pick('x-ca-request-id') && `requestId=${pick('x-ca-request-id')}`,
+        ].filter(Boolean);
+        const body = err.response.data;
+        if (body !== undefined && body !== '') {
+            parts.push(`body=${(typeof body === 'string' ? body : JSON.stringify(body)).substring(0, 300)}`);
+        }
+        return parts.length ? parts.join(' ') : `HTTP ${err.response.status} without gateway headers`;
     }
 
     private extractAxiosError(err: unknown): string {

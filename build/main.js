@@ -227,6 +227,9 @@ class Mammotion extends utils.Adapter {
   mapProgress = /* @__PURE__ */ new Map();
   /** Consecutive 429 answers per device key; resets on the next successful invoke. */
   rateLimitStrikes = /* @__PURE__ */ new Map();
+  // Report pacing the cloud hands out with every invoke answer (iotMsgHz / iotSameMsgHz, in ms).
+  // The official app uses these as period and no-change period of the status report request.
+  cloudReportPacing = /* @__PURE__ */ new Map();
   /** Devices only the Aliyun cloud lists; never woken over the Mammotion API. */
   aliyunOnlyDevices = /* @__PURE__ */ new Set();
   // Per-device fingerprint of the last observed real telemetry values plus the time it last changed.
@@ -1067,7 +1070,8 @@ class Mammotion extends utils.Adapter {
         (session, _context) => this.buildRequestIotSyncContent(
           session,
           stop,
-          this.aliyunOnlyDevices.has(context.key) ? ALIYUN_REPORT_COUNT : 0
+          this.aliyunOnlyDevices.has(context.key) ? ALIYUN_REPORT_COUNT : 0,
+          this.cloudReportPacing.get(context.key)
         )
       );
     } catch (err) {
@@ -1856,6 +1860,9 @@ class Mammotion extends utils.Adapter {
       return;
     }
     void this.setStateChangedAsync(`devices.${context.key}.cloud.lastRateLimitAt`, Date.now(), true);
+    const reason = this.describeGatewayThrottle(err);
+    void this.setStateChangedAsync(`devices.${context.key}.cloud.lastRateLimitReason`, reason, true);
+    this.log.debug(`[RATE-LIMIT] ${context.deviceName || context.iotId}: ${reason}`);
     const existingUntil = (_b = this.rateLimitBackoffUntil.get(context.key)) != null ? _b : 0;
     const strikes = ((_c = this.rateLimitStrikes.get(context.key)) != null ? _c : 0) + 1;
     this.rateLimitStrikes.set(context.key, strikes);
@@ -1869,7 +1876,7 @@ class Mammotion extends utils.Adapter {
       this.log.warn(
         `Cloud rate-limit (429) hit for ${context.deviceName || context.iotId}; suspending invokes for ${Math.round(
           backoffMs / 1e3
-        )}s (cloud send quota).`
+        )}s (${reason}).`
       );
     }
     this.rateLimitBackoffUntil.set(context.key, Math.max(existingUntil, newUntil));
@@ -3103,14 +3110,15 @@ ${url}`;
       this.encodeFieldVarint(15, now)
     ]).toString("base64");
   }
-  buildRequestIotSyncContent(session, stop = false, count = 0) {
+  buildRequestIotSyncContent(session, stop = false, count = 0, pacing) {
+    var _a, _b;
     const subtype = Number.parseInt(session.userAccount, 10);
     const reportTypes = [1, 3, 4, 6, 10, 8];
     const reportCfgFields = [
       this.encodeFieldVarint(1, stop ? 1 : 0),
       this.encodeFieldVarint(2, 1e4),
-      this.encodeFieldVarint(3, 3e3),
-      this.encodeFieldVarint(4, 4e3),
+      this.encodeFieldVarint(3, (_a = pacing == null ? void 0 : pacing.periodMs) != null ? _a : 3e3),
+      this.encodeFieldVarint(4, (_b = pacing == null ? void 0 : pacing.noChangeMs) != null ? _b : 4e3),
       this.encodeFieldVarint(5, count)
     ];
     for (const type of reportTypes) {
@@ -4095,6 +4103,11 @@ ${url}`;
     const cd = num(d.iotMsgTotalCD);
     if (cd !== null) {
       await this.setStateChangedAsync(`${base}.msgResetInSec`, cd, true);
+    }
+    const hz = num(d.iotMsgHz);
+    const sameHz = num(d.iotSameMsgHz);
+    if (hz !== null && hz > 0 && sameHz !== null && sameHz > 0) {
+      this.cloudReportPacing.set(context.key, { periodMs: hz, noChangeMs: sameHz });
     }
     const quota = Object.fromEntries(Object.entries(d).filter(([k]) => k.startsWith("iot")));
     await this.setStateChangedAsync(`${base}.quotaJson`, JSON.stringify(quota), true);
@@ -5670,6 +5683,35 @@ ${url}`;
     const stringToSign = `${OAUTH_APP_KEY}${timestampMs}${TOKEN_ENDPOINT}${payloadJson}`;
     const md5Secret = (0, import_node_crypto.createHash)("md5").update(OAUTH_APP_SECRET, "utf8").digest("hex");
     return (0, import_node_crypto.createHmac)("sha256", md5Secret).update(stringToSign, "utf8").digest("hex");
+  }
+  /**
+   * The Aliyun API gateway names the throttle that answered 429 in its response headers
+   * (for example "Throttled by APP Flow Control" versus "Throttled by USER Flow Control").
+   * That tells a per-app-key limit apart from a per-account or per-device one.
+   *
+   * @param err error thrown by axios
+   */
+  describeGatewayThrottle(err) {
+    var _a;
+    if (!import_axios.default.isAxiosError(err) || !err.response) {
+      return "no gateway response";
+    }
+    const headers = (_a = err.response.headers) != null ? _a : {};
+    const pick = (name) => {
+      var _a2;
+      const value = (_a2 = headers[name]) != null ? _a2 : headers[name.toLowerCase()];
+      return typeof value === "string" ? value : Array.isArray(value) ? value.join(",") : "";
+    };
+    const parts = [
+      pick("x-ca-error-message") && `message=${pick("x-ca-error-message")}`,
+      pick("x-ca-error-code") && `code=${pick("x-ca-error-code")}`,
+      pick("x-ca-request-id") && `requestId=${pick("x-ca-request-id")}`
+    ].filter(Boolean);
+    const body = err.response.data;
+    if (body !== void 0 && body !== "") {
+      parts.push(`body=${(typeof body === "string" ? body : JSON.stringify(body)).substring(0, 300)}`);
+    }
+    return parts.length ? parts.join(" ") : `HTTP ${err.response.status} without gateway headers`;
   }
   extractAxiosError(err) {
     var _a, _b, _c, _d, _e, _f, _g, _h;

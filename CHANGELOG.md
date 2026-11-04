@@ -9,6 +9,19 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
+### Added
+- **Reason of a cloud 429.** The Aliyun API gateway names the throttle that answered 429 in its response
+  headers (`X-Ca-Error-Message`, for example app-key flow control versus user flow control). The adapter
+  dropped them. It now logs them with the back-off warning and keeps them in
+  `devices.<id>.cloud.lastRateLimitReason`, so it becomes visible whether the limit belongs to the app key,
+  the account or the device.
+
+### Changed
+- **Status report paced like the official app.** Every successful Aliyun invoke answer carries
+  `iotMsgHz` and `iotSameMsgHz`. The official app uses them as period and no-change period of the status
+  report request; the adapter asked for a fixed 3 s / 4 s. It now uses the values from the cloud once
+  known (currently 10 s / 30 s), so the mower reports no faster than the cloud allows.
+
 ### Fixed
 - **Commands for shared Aliyun devices work again.** Live diagnosis on a shared Luba 2 AWD (Aliyun product
   key, firmware 1.11): the Mammotion platform lists the device in neither the device list nor the device

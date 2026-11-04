@@ -334,7 +334,13 @@ const REPORT_STATE_DEFS = [
     unit: "s"
   },
   { id: "cloud.quotaJson", name: "All quota fields of the last cloud answer", type: "string", role: "json" },
-  { id: "cloud.lastRateLimitAt", name: "Time of the last 429 answer", type: "number", role: "value.time" }
+  { id: "cloud.lastRateLimitAt", name: "Time of the last 429 answer", type: "number", role: "value.time" },
+  {
+    id: "cloud.lastRateLimitReason",
+    name: "Reason of the last 429 answer (API gateway headers)",
+    type: "string",
+    role: "text"
+  }
 ];
 const SYS_FIELD_REPORT_DATA = 39;
 const SYS_FIELD_UPDATE_BUF = 27;
