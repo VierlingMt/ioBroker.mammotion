@@ -23,6 +23,13 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   known (currently 10 s / 30 s), so the mower reports no faster than the cloud allows.
 
 ### Fixed
+- **Map loading on Aliyun mowers no longer triggers the 429.** With the new 429 reason the cause is
+  known: the API gateway answers `Throttled by PLUGIN Flow Control` (`T429PR`) to a second invoke within
+  about 10 s (live: success, next call 0.4 s later 429; quota 99 % free). The map loader sent every
+  0.4 s because it assumed the mower drops its sync after 3 s. The official app sends that sync only
+  every 20 s. Map loading on Aliyun mowers now keeps the normal gap (cloud `iotMsgHz` plus 1 s) and
+  re-sends the sync every 20 s. A plugin 429 backs off 30 s (doubling up to 30 min) instead of 15 min
+  to 6 h, since it is an interval limit, not a used-up quota.
 - **Commands for shared Aliyun devices work again.** Live diagnosis on a shared Luba 2 AWD (Aliyun product
   key, firmware 1.11): the Mammotion platform lists the device in neither the device list nor the device
   page for the shared account, only the Aliyun bindings do. The Mammotion invoke now answers

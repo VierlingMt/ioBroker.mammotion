@@ -153,6 +153,7 @@ const REPORT_REFRESH_IDLE_MS = 10 * 6e4;
 const REPORT_ACTIVE_STATES = /* @__PURE__ */ new Set([13, 14, 19, 20]);
 const MAP_FRAME_TIMEOUT_MS = 8e3;
 const MAP_FETCH_MAX_MS = 15 * 6e4;
+const MAP_FETCH_MAX_ALIYUN_MS = 45 * 6e4;
 const MAP_MAX_ELEMENTS = 300;
 const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 6e4;
 const MAP_AUTO_FETCH_DELAY_MS = 2e4;
@@ -161,6 +162,7 @@ const MAP_PARTIAL_WRITE_EVERY = 5;
 const MAP_FRAME_TIMEOUT_ALIYUN_MS = 25e3;
 const MAP_BURST_GAP_MS = 400;
 const MAP_SYNC_MAX_AGE_MS = 3e3;
+const MAP_SYNC_MAX_AGE_ALIYUN_MS = 2e4;
 const MAP_SENDS_PER_RUN = 400;
 const MAP_ROUND_PAUSE_MS = 30 * 6e4;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 6e4;
@@ -176,6 +178,9 @@ const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 6e4;
 const ALIYUN_BACKOFF_MIN_MS = 15 * 6e4;
 const ALIYUN_BACKOFF_MAX_MS = 6 * 60 * 6e4;
 const ALIYUN_INVOKE_MIN_GAP_MS = 1e4;
+const ALIYUN_INVOKE_GAP_MARGIN_MS = 1e3;
+const PLUGIN_THROTTLE_BACKOFF_MIN_MS = 3e4;
+const PLUGIN_THROTTLE_BACKOFF_MAX_MS = 30 * 6e4;
 const ALIYUN_REPORT_COUNT = 3;
 const ALIYUN_POLL_WITH_PUSH_SEC = 300;
 const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 6e4;
@@ -1714,6 +1719,19 @@ class Mammotion extends utils.Adapter {
     this.log.info(`[WAKE] ${name}: cloud answered ${JSON.stringify(response.data)}`);
     return ((_a = response.data) == null ? void 0 : _a.code) === 0 && response.data.data !== false;
   }
+  /**
+   * Minimum gap between two invokes of one device. Aliyun mowers follow the cloud's iotMsgHz.
+   *
+   * @param key device key
+   */
+  minInvokeGap(key) {
+    var _a, _b;
+    if (!this.aliyunOnlyDevices.has(key)) {
+      return INVOKE_MIN_GAP_MS;
+    }
+    const cloud = (_b = (_a = this.cloudReportPacing.get(key)) == null ? void 0 : _a.periodMs) != null ? _b : 0;
+    return Math.max(ALIYUN_INVOKE_MIN_GAP_MS, cloud) + ALIYUN_INVOKE_GAP_MARGIN_MS;
+  }
   paced(key, fn) {
     var _a;
     const previous = (_a = this.invokeQueue.get(key)) != null ? _a : Promise.resolve();
@@ -1731,7 +1749,7 @@ class Mammotion extends utils.Adapter {
         }
         sends.push(Date.now());
       }
-      const gap = (_c = this.invokeGapOverride.get(key)) != null ? _c : this.aliyunOnlyDevices.has(key) ? ALIYUN_INVOKE_MIN_GAP_MS : INVOKE_MIN_GAP_MS;
+      const gap = (_c = this.invokeGapOverride.get(key)) != null ? _c : this.minInvokeGap(key);
       const wait = gap - (Date.now() - ((_d = this.lastInvokeAt.get(key)) != null ? _d : 0));
       if (wait > 0) {
         await new Promise((resolve) => setTimeout(resolve, wait));
@@ -1867,10 +1885,9 @@ class Mammotion extends utils.Adapter {
     const strikes = ((_c = this.rateLimitStrikes.get(context.key)) != null ? _c : 0) + 1;
     this.rateLimitStrikes.set(context.key, strikes);
     const aliyun = this.aliyunOnlyDevices.has(context.key);
-    const backoffMs = Math.min(
-      aliyun ? ALIYUN_BACKOFF_MAX_MS : RATE_LIMIT_BACKOFF_MAX_MS,
-      (aliyun ? ALIYUN_BACKOFF_MIN_MS : RATE_LIMIT_BACKOFF_MIN_MS) * 2 ** (strikes - 1)
-    );
+    const plugin = /PLUGIN Flow Control|T429PR/i.test(reason);
+    const [minMs, maxMs] = plugin ? [PLUGIN_THROTTLE_BACKOFF_MIN_MS, PLUGIN_THROTTLE_BACKOFF_MAX_MS] : aliyun ? [ALIYUN_BACKOFF_MIN_MS, ALIYUN_BACKOFF_MAX_MS] : [RATE_LIMIT_BACKOFF_MIN_MS, RATE_LIMIT_BACKOFF_MAX_MS];
+    const backoffMs = Math.min(maxMs, minMs * 2 ** (strikes - 1));
     const newUntil = Date.now() + backoffMs;
     if (existingUntil <= Date.now()) {
       this.log.warn(
@@ -3934,7 +3951,7 @@ ${url}`;
     this.mapFrameListeners.set(key, accept);
     const startedAt = Date.now();
     let lastSyncAt = 0;
-    const syncInterval = MAP_SYNC_MAX_AGE_MS;
+    const syncInterval = this.aliyunOnlyDevices.has(key) ? MAP_SYNC_MAX_AGE_ALIYUN_MS : MAP_SYNC_MAX_AGE_MS;
     const syncIfDue = async (force = false) => {
       if (force || Date.now() - lastSyncAt >= syncInterval) {
         await send("map-sync", (session) => this.buildMapSyncContent(session));
@@ -3945,7 +3962,9 @@ ${url}`;
     const aliyun = this.aliyunOnlyDevices.has(key);
     const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;
     const roundBudget = MAP_SENDS_PER_RUN;
-    this.invokeGapOverride.set(key, MAP_BURST_GAP_MS);
+    if (!aliyun) {
+      this.invokeGapOverride.set(key, MAP_BURST_GAP_MS);
+    }
     const timer = this.mapResumeTimers.get(key);
     if (timer) {
       clearTimeout(timer);
@@ -4016,7 +4035,7 @@ ${url}`;
         if (loaded.has(hash.toString())) {
           continue;
         }
-        if (Date.now() - startedAt > MAP_FETCH_MAX_MS) {
+        if (Date.now() - startedAt > (aliyun ? MAP_FETCH_MAX_ALIYUN_MS : MAP_FETCH_MAX_MS)) {
           this.log.warn(`[MAP] ${label}: pausing after ${loaded.size} elements, time limit reached.`);
           break;
         }

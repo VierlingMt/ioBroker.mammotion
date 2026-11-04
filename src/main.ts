@@ -165,6 +165,8 @@ const REPORT_ACTIVE_STATES = new Set([13, 14, 19, 20]);
 /** Map loading: per-frame wait, sync refresh and overall limits. */
 const MAP_FRAME_TIMEOUT_MS = 8_000;
 const MAP_FETCH_MAX_MS = 15 * 60_000;
+/** Aliyun mowers get one invoke per ~10 s, so a full map takes far longer. */
+const MAP_FETCH_MAX_ALIYUN_MS = 45 * 60_000;
 const MAP_MAX_ELEMENTS = 300;
 /** Minimum time between two automatic map loads of one device. */
 const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 60_000;
@@ -176,13 +178,16 @@ const MAP_PARTIAL_WRITE_EVERY = 5;
 /** Aliyun answers arrive slower; and the mower resends a frame until it is acknowledged. */
 const MAP_FRAME_TIMEOUT_ALIYUN_MS = 25_000;
 /**
- * Map transfers run as a quick burst like the app (live 03.11.: ~7 messages/s, map in ~20 s with the
- * same account and no 429): the mower keeps its "synchronised" state only a few seconds, so a slow
- * transfer loses the sync and the next frame never comes.
+ * Gap between map requests on the Mammotion platform. Aliyun mowers keep their normal gap: the API
+ * gateway answers a second invoke within ~10 s with 429 "Throttled by PLUGIN Flow Control" (live
+ * 04.11.: success, next call 0.4 s later 429). The official app ignores 429 silently, which is why its
+ * own bursts looked unthrottled in the phone capture.
  */
 const MAP_BURST_GAP_MS = 400;
 /** Re-send the sync before a request when the last one is older than this. */
 const MAP_SYNC_MAX_AGE_MS = 3_000;
+/** Aliyun mowers: the official app repeats the IoT sync ("heartbeat") every 20 s, not every few seconds. */
+const MAP_SYNC_MAX_AGE_ALIYUN_MS = 20_000;
 /** Safety cap of messages per map-loading run. */
 const MAP_SENDS_PER_RUN = 400;
 /** Pause between two map-loading rounds. */
@@ -222,6 +227,14 @@ const ALIYUN_BACKOFF_MIN_MS = 15 * 60_000;
 const ALIYUN_BACKOFF_MAX_MS = 6 * 60 * 60_000;
 /** Aliyun-era mowers: at most one message every 10 s (the cloud reports iotMsgHz 10000). */
 const ALIYUN_INVOKE_MIN_GAP_MS = 10_000;
+/** Safety margin on top of the cloud's iotMsgHz so network jitter does not land two calls inside it. */
+const ALIYUN_INVOKE_GAP_MARGIN_MS = 1_000;
+/**
+ * 429 "Throttled by PLUGIN Flow Control" (code T429PR) is a per-interval limit of the API gateway,
+ * not a quota: waiting a few iotMsgHz periods is enough. Doubles per consecutive hit.
+ */
+const PLUGIN_THROTTLE_BACKOFF_MIN_MS = 30_000;
+const PLUGIN_THROTTLE_BACKOFF_MAX_MS = 30 * 60_000;
 /**
  * Aliyun-era mowers: order only a few status reports per request instead of an endless stream.
  * With count 0 the mower reported every 10 s around the clock (each refresh re-arms it), which is
@@ -2007,6 +2020,19 @@ class Mammotion extends utils.Adapter {
         return response.data?.code === 0 && response.data.data !== false;
     }
 
+    /**
+     * Minimum gap between two invokes of one device. Aliyun mowers follow the cloud's iotMsgHz.
+     *
+     * @param key device key
+     */
+    private minInvokeGap(key: string): number {
+        if (!this.aliyunOnlyDevices.has(key)) {
+            return INVOKE_MIN_GAP_MS;
+        }
+        const cloud = this.cloudReportPacing.get(key)?.periodMs ?? 0;
+        return Math.max(ALIYUN_INVOKE_MIN_GAP_MS, cloud) + ALIYUN_INVOKE_GAP_MARGIN_MS;
+    }
+
     private paced<T>(key: string, fn: () => Promise<T>): Promise<T> {
         const previous = this.invokeQueue.get(key) ?? Promise.resolve();
         const run = previous
@@ -2024,9 +2050,7 @@ class Mammotion extends utils.Adapter {
                     }
                     sends.push(Date.now());
                 }
-                const gap =
-                    this.invokeGapOverride.get(key) ??
-                    (this.aliyunOnlyDevices.has(key) ? ALIYUN_INVOKE_MIN_GAP_MS : INVOKE_MIN_GAP_MS);
+                const gap = this.invokeGapOverride.get(key) ?? this.minInvokeGap(key);
                 const wait = gap - (Date.now() - (this.lastInvokeAt.get(key) ?? 0));
                 if (wait > 0) {
                     await new Promise(resolve => setTimeout(resolve, wait));
@@ -2195,10 +2219,13 @@ class Mammotion extends utils.Adapter {
         const strikes = (this.rateLimitStrikes.get(context.key) ?? 0) + 1;
         this.rateLimitStrikes.set(context.key, strikes);
         const aliyun = this.aliyunOnlyDevices.has(context.key);
-        const backoffMs = Math.min(
-            aliyun ? ALIYUN_BACKOFF_MAX_MS : RATE_LIMIT_BACKOFF_MAX_MS,
-            (aliyun ? ALIYUN_BACKOFF_MIN_MS : RATE_LIMIT_BACKOFF_MIN_MS) * 2 ** (strikes - 1),
-        );
+        const plugin = /PLUGIN Flow Control|T429PR/i.test(reason);
+        const [minMs, maxMs] = plugin
+            ? [PLUGIN_THROTTLE_BACKOFF_MIN_MS, PLUGIN_THROTTLE_BACKOFF_MAX_MS]
+            : aliyun
+              ? [ALIYUN_BACKOFF_MIN_MS, ALIYUN_BACKOFF_MAX_MS]
+              : [RATE_LIMIT_BACKOFF_MIN_MS, RATE_LIMIT_BACKOFF_MAX_MS];
+        const backoffMs = Math.min(maxMs, minMs * 2 ** (strikes - 1));
         const newUntil = Date.now() + backoffMs;
         // Only log the first arm in a window; refreshing the window from a follow-up 429 is silent.
         if (existingUntil <= Date.now()) {
@@ -4615,7 +4642,7 @@ class Mammotion extends utils.Adapter {
         let lastSyncAt = 0;
         // The mower answers map requests only while the app counts as "synchronised"; that state
         // lasts a few seconds, so the sync goes out again before requests when it has aged.
-        const syncInterval = MAP_SYNC_MAX_AGE_MS;
+        const syncInterval = this.aliyunOnlyDevices.has(key) ? MAP_SYNC_MAX_AGE_ALIYUN_MS : MAP_SYNC_MAX_AGE_MS;
         const syncIfDue = async (force = false): Promise<void> => {
             if (force || Date.now() - lastSyncAt >= syncInterval) {
                 await send('map-sync', session => this.buildMapSyncContent(session));
@@ -4626,8 +4653,10 @@ class Mammotion extends utils.Adapter {
         const aliyun = this.aliyunOnlyDevices.has(key);
         const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;
         const roundBudget = MAP_SENDS_PER_RUN;
-        // Burst like the app while the transfer runs; the normal gap applies again afterwards.
-        this.invokeGapOverride.set(key, MAP_BURST_GAP_MS);
+        // Quick transfer on the Mammotion platform; Aliyun mowers keep the cloud's minimum gap.
+        if (!aliyun) {
+            this.invokeGapOverride.set(key, MAP_BURST_GAP_MS);
+        }
         const timer = this.mapResumeTimers.get(key);
         if (timer) {
             clearTimeout(timer);
@@ -4707,7 +4736,7 @@ class Mammotion extends utils.Adapter {
                 if (loaded.has(hash.toString())) {
                     continue;
                 }
-                if (Date.now() - startedAt > MAP_FETCH_MAX_MS) {
+                if (Date.now() - startedAt > (aliyun ? MAP_FETCH_MAX_ALIYUN_MS : MAP_FETCH_MAX_MS)) {
                     this.log.warn(`[MAP] ${label}: pausing after ${loaded.size} elements, time limit reached.`);
                     break;
                 }
