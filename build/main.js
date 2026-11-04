@@ -152,16 +152,16 @@ const REPORT_REFRESH_ACTIVE_MS = 2 * 6e4;
 const REPORT_REFRESH_IDLE_MS = 10 * 6e4;
 const REPORT_ACTIVE_STATES = /* @__PURE__ */ new Set([13, 14, 19, 20]);
 const MAP_FRAME_TIMEOUT_MS = 8e3;
-const MAP_SYNC_REFRESH_MS = 1e4;
 const MAP_FETCH_MAX_MS = 15 * 6e4;
 const MAP_MAX_ELEMENTS = 300;
 const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 6e4;
 const MAP_AUTO_FETCH_DELAY_MS = 2e4;
-const MAP_SLOW_GAP_MS = 1e4;
 const MAP_MAX_BACKOFF_WAIT_MS = 5 * 6e4;
 const MAP_PARTIAL_WRITE_EVERY = 5;
 const MAP_FRAME_TIMEOUT_ALIYUN_MS = 25e3;
-const MAP_ALIYUN_SENDS_PER_ROUND = 15;
+const MAP_BURST_GAP_MS = 400;
+const MAP_SYNC_MAX_AGE_MS = 3e3;
+const MAP_SENDS_PER_RUN = 400;
 const MAP_ROUND_PAUSE_MS = 30 * 6e4;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 6e4;
 const USER_INTENT_WINDOW_MS = 5 * 6e4;
@@ -1485,9 +1485,8 @@ class Mammotion extends utils.Adapter {
         this.log.debug(`[MQTT] Zone names received (raw): ${areas.length} entries cached`);
       }
       const hashIds = this.tryParseNavGetHashListAck(rawBase64, deviceKey);
-      if (hashIds && hashIds.length > 0 && ctx && !this.mapFrameListeners.has(deviceKey)) {
-        this.log.debug(`[MQTT] NavGetHashListAck (raw): ${hashIds.length} Hashes, requesting names`);
-        await this.requestAreaNamesForHashes(ctx, hashIds);
+      if (hashIds && hashIds.length > 0) {
+        this.log.debug(`[MQTT] NavGetHashListAck (raw): ${hashIds.length} hashes seen`);
       } else if (!areas || areas.length === 0) {
         this.log.debug(`[MQTT] Raw proto: no zone names / no HashListAck`);
       }
@@ -1629,9 +1628,8 @@ class Mammotion extends utils.Adapter {
         this.log.debug(`[MQTT] Zone names received: ${areas.length} entries cached`);
       }
       const hashIds = this.tryParseNavGetHashListAck(protoContent, deviceKey);
-      if (hashIds && hashIds.length > 0 && ctx && !this.mapFrameListeners.has(deviceKey)) {
-        this.log.debug(`[MQTT] NavGetHashListAck: ${hashIds.length} Hashes, requesting names`);
-        await this.requestAreaNamesForHashes(ctx, hashIds);
+      if (hashIds && hashIds.length > 0) {
+        this.log.debug(`[MQTT] NavGetHashListAck: ${hashIds.length} hashes seen`);
       } else if (!areas || areas.length === 0) {
         this.log.debug(`[MQTT] protoContent contains no zone names / no HashListAck`);
       }
@@ -3415,169 +3413,6 @@ ${url}`;
     ]);
   }
   // ─── Zone / area name support ────────────────────────────────────────────────
-  buildAreaNameListContent(session, context, subCmd = 0, receiverDeviceOverride) {
-    const getHashPayload = this.encodeMessage([
-      this.encodeFieldVarint(1, 1),
-      // pver = 1
-      this.encodeFieldVarint(2, subCmd)
-      // sub_cmd
-    ]);
-    const navPayload = this.encodeMessage([this.encodeFieldBytes(30, getHashPayload)]);
-    const subtype = Number.parseInt(session.userAccount, 10);
-    const lubaMessage = this.buildLubaMessage({
-      msgType: 240,
-      receiverDevice: receiverDeviceOverride != null ? receiverDeviceOverride : this.getReceiverDevice(context),
-      subtype: Number.isNaN(subtype) ? 0 : subtype,
-      subMessageField: 11,
-      subMessagePayload: navPayload
-    });
-    return lubaMessage.toString("base64");
-  }
-  async sendAreaNameListRequest(context) {
-    var _a, _b;
-    const primaryReceiver = this.getReceiverDevice(context);
-    const receivers = /* @__PURE__ */ new Set([primaryReceiver]);
-    if (this.isYukaDevice(context)) {
-      receivers.add(17);
-      receivers.add(1);
-    }
-    for (const receiver of receivers) {
-      this.log.debug(
-        `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`
-      );
-      const result3 = await this.executeEncodedContentCommand(
-        context,
-        "area-name-list-v3",
-        (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 3, receiver)
-      );
-      this.log.debug(
-        `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${(_a = result3 == null ? void 0 : result3.length) != null ? _a : 0}): ${result3 == null ? void 0 : result3.substring(0, 100)}`
-      );
-      if (result3 && result3 !== "ok" && result3.length > 20) {
-        const areas = this.tryParseAreaHashNames(result3);
-        if (areas && areas.length > 0) {
-          this.rememberAreaNames(context.key, areas);
-          this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
-        }
-      }
-    }
-    for (const receiver of receivers) {
-      const result0 = await this.executeEncodedContentCommand(
-        context,
-        "area-name-list",
-        (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 0, receiver)
-      );
-      this.log.debug(
-        `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${(_b = result0 == null ? void 0 : result0.length) != null ? _b : 0}): ${result0 == null ? void 0 : result0.substring(0, 100)}`
-      );
-      if (result0 && result0 !== "ok" && result0.length > 20) {
-        const areas = this.tryParseAreaHashNames(result0);
-        if (areas && areas.length > 0) {
-          this.rememberAreaNames(context.key, areas);
-          this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
-        }
-      }
-    }
-  }
-  buildNavGetCommDataContent(session, context, hash) {
-    const commDataPayload = this.encodeMessage([
-      this.encodeFieldVarint(1, 1),
-      // pver = 1
-      this.encodeFieldVarint(2, 1),
-      // sub_cmd = 1
-      this.encodeFieldVarint(3, 8),
-      // action = 8 (synchronize hash data)
-      this.encodeFieldVarint(5, hash)
-      // hash (int64 varint)
-    ]);
-    const navPayload = this.encodeMessage([this.encodeFieldBytes(32, commDataPayload)]);
-    const subtype = Number.parseInt(session.userAccount, 10);
-    const lubaMessage = this.buildLubaMessage({
-      msgType: 240,
-      receiverDevice: this.getReceiverDevice(context),
-      subtype: Number.isNaN(subtype) ? 0 : subtype,
-      subMessageField: 11,
-      subMessagePayload: navPayload
-    });
-    return lubaMessage.toString("base64");
-  }
-  async requestAreaNamesForHashes(context, hashIds) {
-    var _a, _b;
-    if (this.zoneDiscoveryInFlight.has(context.key)) {
-      this.log.debug(`[ZONE] Discovery already running for ${context.deviceName || context.iotId}, skipping duplicate trigger.`);
-      return;
-    }
-    this.zoneDiscoveryInFlight.add(context.key);
-    try {
-      const hashSetKey = hashIds.map(String).join(",");
-      const prevHashSet = this.lastRequestedHashSetByDevice.get(context.key);
-      if (prevHashSet === hashSetKey && await this.hasKnownAreas(context.key)) {
-        return;
-      }
-      this.lastRequestedHashSetByDevice.set(context.key, hashSetKey);
-      this.log.debug(`[ZONE] ${hashIds.length} hashes received, classifying sequentially via field-32/33`);
-      const areaHashes = [];
-      let unknownHashes = [];
-      const typeHistogram = /* @__PURE__ */ new Map();
-      for (const hash of hashIds) {
-        const type = await this.classifyHashType(context, hash);
-        this.log.debug(`[ZONE] hash=${hash} \u2192 type=${type}`);
-        typeHistogram.set(type, ((_a = typeHistogram.get(type)) != null ? _a : 0) + 1);
-        if (type === 0) areaHashes.push(hash);
-        if (type < 0) unknownHashes.push(hash);
-      }
-      if (unknownHashes.length > 0) {
-        this.log.debug(`[ZONE] Retrying ${unknownHashes.length} unknown hash classifications once.`);
-        const retryUnknown = [];
-        for (const hash of unknownHashes) {
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          const retryType = await this.classifyHashType(context, hash);
-          this.log.debug(`[ZONE] retry hash=${hash} \u2192 type=${retryType}`);
-          typeHistogram.set(retryType, ((_b = typeHistogram.get(retryType)) != null ? _b : 0) + 1);
-          if (retryType === 0 && !areaHashes.some((existing) => existing === hash)) {
-            areaHashes.push(hash);
-            continue;
-          }
-          if (retryType < 0) {
-            retryUnknown.push(hash);
-          }
-        }
-        unknownHashes = retryUnknown;
-      }
-      const histogramText = [...typeHistogram.entries()].sort((a, b) => a[0] - b[0]).map(([type, count]) => `${type}:${count}`).join(", ");
-      this.log.info(
-        `[ZONE] ${areaHashes.length} mowing zones (type=0) detected out of ${hashIds.length} hashes (types: ${histogramText})`
-      );
-      const existingAreas = await this.getKnownAreas(context.key);
-      let finalAreaHashes = areaHashes;
-      if (unknownHashes.length > 0 && existingAreas.length > 0) {
-        const merged = /* @__PURE__ */ new Map();
-        for (const area of existingAreas) {
-          merged.set(area.hash.toString(), area.hash);
-        }
-        for (const hash of areaHashes) {
-          merged.set(hash.toString(), hash);
-        }
-        finalAreaHashes = [...merged.values()];
-        this.log.warn(
-          `[ZONE] Partial classification (${unknownHashes.length} timeout/unknown). Keeping ${existingAreas.length} existing zones; merged result has ${finalAreaHashes.length} zones.`
-        );
-      }
-      if (!finalAreaHashes.length) {
-        this.log.warn(
-          `[ZONE] No mowing zones (type=0) detected - skipping zone update to avoid creating paths/NoGo as zones.`
-        );
-        return;
-      }
-      this.classifiedAreaHashesByDevice.set(context.key, new Set(finalAreaHashes.map((h) => h.toString())));
-      const names = this.pendingAreaNamesByDevice.get(context.key);
-      const existingNames = new Map(existingAreas.map((area) => [area.hash.toString(), area.name]));
-      const areas = this.buildAreaListWithUniqueNames(finalAreaHashes, names, existingNames);
-      await this.updateZoneStates(context.key, areas);
-    } finally {
-      this.zoneDiscoveryInFlight.delete(context.key);
-    }
-  }
   buildAreaListWithUniqueNames(hashes, pendingNames, existingNames) {
     const hasRealNames = !!pendingNames && pendingNames.size > 0;
     const taken = /* @__PURE__ */ new Set();
@@ -3645,32 +3480,6 @@ ${url}`;
    * (NavGetCommDataAck) response, which arrives either in the HTTP sync response or via MQTT.
    * Returns the PathType (0=AREA, 1=OBSTACLE, 2=PATH, …) or -1 on timeout.
    */
-  classifyHashType(context, hash) {
-    return new Promise((resolve) => {
-      const waitKey = `${context.key}:${hash}`;
-      const timer = setTimeout(() => {
-        if (this.classifyWaiters.delete(waitKey)) resolve(-1);
-      }, 8e3);
-      this.classifyWaiters.set(waitKey, (type) => {
-        clearTimeout(timer);
-        resolve(type);
-      });
-      void this.executeEncodedContentCommand(
-        context,
-        "get-comm-data",
-        (_s, ctx) => this.buildNavGetCommDataContent(_s, ctx, hash)
-      ).then((result) => {
-        if (result && result !== "ok" && result.length > 20) {
-          this.resolveCommDataAck(context.key, result);
-        }
-      }).catch(() => {
-        if (this.classifyWaiters.delete(waitKey)) {
-          clearTimeout(timer);
-          resolve(-1);
-        }
-      });
-    });
-  }
   /** Called when a field-33 (NavGetCommDataAck) proto arrives (sync HTTP or async MQTT). */
   async parseMctlSysProto(deviceKey, protoBase64) {
     var _a, _b, _c, _d, _e, _f, _g, _h;
@@ -3767,8 +3576,7 @@ ${url}`;
       }
       this.lastAreaNameRequestAt.set(ctx.key, now);
       try {
-        await this.sendAreaNameListRequest(ctx);
-        this.startAreaNameRetry(ctx.key);
+        await this.discoverZones(ctx);
       } catch (err) {
         this.log.debug(
           `Area-Name-Re-Request (missing) failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`
@@ -4097,10 +3905,6 @@ ${url}`;
             }
             throw err;
           }
-          if (!this.invokeGapOverride.has(ctx.key)) {
-            this.log.info(`[MAP] ${label}: cloud rate limit, continuing slowly (one message per 10 s).`);
-          }
-          this.invokeGapOverride.set(ctx.key, MAP_SLOW_GAP_MS);
           this.log.debug(
             `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1e3)}s before ${commandLabel}.`
           );
@@ -4111,7 +3915,7 @@ ${url}`;
     this.mapFrameListeners.set(key, accept);
     const startedAt = Date.now();
     let lastSyncAt = 0;
-    const syncInterval = this.aliyunOnlyDevices.has(key) ? Number.POSITIVE_INFINITY : MAP_SYNC_REFRESH_MS;
+    const syncInterval = MAP_SYNC_MAX_AGE_MS;
     const syncIfDue = async (force = false) => {
       if (force || Date.now() - lastSyncAt >= syncInterval) {
         await send("map-sync", (session) => this.buildMapSyncContent(session));
@@ -4121,7 +3925,8 @@ ${url}`;
     const currentMapHash = String((_b = (_a = await this.getStateAsync(`devices.${key}.telemetry.mapHash`)) == null ? void 0 : _a.val) != null ? _b : "");
     const aliyun = this.aliyunOnlyDevices.has(key);
     const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;
-    const roundBudget = aliyun ? MAP_ALIYUN_SENDS_PER_ROUND : Number.POSITIVE_INFINITY;
+    const roundBudget = MAP_SENDS_PER_RUN;
+    this.invokeGapOverride.set(key, MAP_BURST_GAP_MS);
     const timer = this.mapResumeTimers.get(key);
     if (timer) {
       clearTimeout(timer);
@@ -4155,12 +3960,12 @@ ${url}`;
         while (frame) {
           listParts.set(frame.currentFrame, frame.hashes);
           listTotal = frame.totalFrame;
-          if (listParts.size >= listTotal) {
-            break;
-          }
           lastAck = frame;
           const ackFrame = frame;
           await send("map-hash-list-ack", (session) => this.buildHashListContent(session, receiver, ackFrame));
+          if (listParts.size >= listTotal) {
+            break;
+          }
           frame = await take(hashFrames, (f) => !listParts.has(f.currentFrame), frameTimeout);
           if (!frame && !ackResent) {
             ackResent = true;
@@ -4216,12 +4021,7 @@ ${url}`;
             continue;
           }
           assembler.add(frame);
-          if (!assembler.complete) {
-            await send(
-              "map-element-ack",
-              (session) => this.buildElementContent(session, receiver, hash, frame)
-            );
-          }
+          await send("map-element-ack", (session) => this.buildElementContent(session, receiver, hash, frame));
         }
         if (assembler.complete) {
           loaded.set(hash.toString(), assembler.result());
@@ -4237,6 +4037,7 @@ ${url}`;
       }
       const complete = hashes.every((h) => loaded.has(h.toString()));
       await this.writeMapGeoJson(ctx, [...loaded.values()], complete);
+      await this.updateZonesFromMap(ctx, [...loaded.values()], complete);
       if (complete) {
         this.mapProgress.delete(key);
         await this.setStateChangedAsync(`devices.${key}.map.progressJson`, "", true);
@@ -4249,6 +4050,7 @@ ${url}`;
     } catch (err) {
       if (loaded.size) {
         await this.writeMapGeoJson(ctx, [...loaded.values()], false);
+        await this.updateZonesFromMap(ctx, [...loaded.values()], false);
       }
       const status = rateLimitHit && hashes.length ? `paused: ${loaded.size}/${hashes.length} elements loaded (cloud rate limit), continues later` : `failed: ${this.extractAxiosError(err)}`;
       await this.setStateChangedAsync(statusId, status, true);
@@ -4394,6 +4196,56 @@ ${url}`;
       await this.setStateChangedAsync(`${base}.map.loadedMapHash`, mapHash, true);
     }
   }
+  // NavMapNameMsg (nav 58, rw = 0): one message that makes the mower send all zone names
+  // (AppGetAllAreaHashName, nav 61), as the app asks for them.
+  buildZoneNamesContent(session, context) {
+    return this.buildNavContent(
+      session,
+      this.getReceiverDevice(context),
+      58,
+      this.encodeMessage([this.encodeFieldString(5, context.iotId)])
+    );
+  }
+  // Zones = mowing areas of the map. Asks once for the zone names and starts the map loader,
+  // which acknowledges every frame; the zone states are filled from its result.
+  async discoverZones(ctx) {
+    await this.executeEncodedContentCommand(ctx, "zone-names", (session) => this.buildZoneNamesContent(session, ctx));
+    if (!this.mapFrameListeners.has(ctx.key) && !this.mapResumeTimers.has(ctx.key)) {
+      void this.fetchMap(ctx).catch(
+        (err) => this.log.debug(`[ZONE] Map load for zones stopped: ${this.extractAxiosError(err)}`)
+      );
+    }
+  }
+  // Fills zones.* from the mowing areas (type 0) of the loaded map. Names: the mower's zone names
+  // (nav 61), else the name in the element, else the existing state name, else "Area N".
+  async updateZonesFromMap(ctx, elements, complete) {
+    var _a;
+    const zoneElements = elements.filter((e) => e.type === 0);
+    if (!zoneElements.length) {
+      return;
+    }
+    const names = new Map((_a = this.pendingAreaNamesByDevice.get(ctx.key)) != null ? _a : []);
+    for (const e of zoneElements) {
+      const key = e.hash.toString();
+      if (e.name && !names.has(key)) {
+        names.set(key, e.name);
+      }
+    }
+    const existing = await this.getKnownAreas(ctx.key);
+    const existingNames = new Map(existing.map((a) => [a.hash.toString(), a.name]));
+    const hashes = /* @__PURE__ */ new Map();
+    if (!complete) {
+      for (const a of existing) {
+        hashes.set(a.hash.toString(), a.hash);
+      }
+    }
+    for (const e of zoneElements) {
+      hashes.set(e.hash.toString(), e.hash);
+    }
+    const areas = this.buildAreaListWithUniqueNames([...hashes.values()], names, existingNames);
+    await this.updateZoneStates(ctx.key, areas);
+    this.log.info(`[ZONE] ${ctx.deviceName || ctx.iotId}: ${areas.length} zone(s) from the map.`);
+  }
   async handleRequestAreaNames(deviceKey, localId) {
     const ctx = this.deviceContexts.get(deviceKey);
     if (!ctx) {
@@ -4402,8 +4254,7 @@ ${url}`;
       return;
     }
     try {
-      await this.sendAreaNameListRequest(ctx);
-      this.startAreaNameRetry(deviceKey);
+      await this.discoverZones(ctx);
       await this.setStateChangedAsync(localId, false, true);
       this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
     } catch (err) {
@@ -4732,7 +4583,7 @@ ${url}`;
     const attempt = (_a = this.areaNameRetryAttempts.get(deviceKey)) != null ? _a : 0;
     this.log.debug(`[AREA-REQ] retry ${attempt}/${AREA_NAME_RETRY_DELAYS_MS.length} for ${ctx.deviceName || ctx.iotId}`);
     try {
-      await this.sendAreaNameListRequest(ctx);
+      await this.discoverZones(ctx);
     } catch (err) {
       this.log.debug(`[AREA-REQ] retry failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
     }

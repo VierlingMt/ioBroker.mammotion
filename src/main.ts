@@ -164,14 +164,11 @@ const REPORT_REFRESH_IDLE_MS = 10 * 60_000;
 const REPORT_ACTIVE_STATES = new Set([13, 14, 19, 20]);
 /** Map loading: per-frame wait, sync refresh and overall limits. */
 const MAP_FRAME_TIMEOUT_MS = 8_000;
-const MAP_SYNC_REFRESH_MS = 10_000;
 const MAP_FETCH_MAX_MS = 15 * 60_000;
 const MAP_MAX_ELEMENTS = 300;
 /** Minimum time between two automatic map loads of one device. */
 const MAP_AUTO_FETCH_MIN_INTERVAL_MS = 30 * 60_000;
 const MAP_AUTO_FETCH_DELAY_MS = 20_000;
-/** After a 429 during map loading: one message every 10 s (the cloud reports iotMsgHz 10000). */
-const MAP_SLOW_GAP_MS = 10_000;
 /** Longest 429 back-off map loading waits out before it pauses and continues on the next attempt. */
 const MAP_MAX_BACKOFF_WAIT_MS = 5 * 60_000;
 /** Write the partial map after this many new elements. */
@@ -179,10 +176,15 @@ const MAP_PARTIAL_WRITE_EVERY = 5;
 /** Aliyun answers arrive slower; and the mower resends a frame until it is acknowledged. */
 const MAP_FRAME_TIMEOUT_ALIYUN_MS = 25_000;
 /**
- * Aliyun-era mowers: messages per map-loading round. The cloud allowed ~8–25 messages before a
- * 429 (live 03.11.); small rounds leave quota for user commands and avoid 429 altogether.
+ * Map transfers run as a quick burst like the app (live 03.11.: ~7 messages/s, map in ~20 s with the
+ * same account and no 429): the mower keeps its "synchronised" state only a few seconds, so a slow
+ * transfer loses the sync and the next frame never comes.
  */
-const MAP_ALIYUN_SENDS_PER_ROUND = 15;
+const MAP_BURST_GAP_MS = 400;
+/** Re-send the sync before a request when the last one is older than this. */
+const MAP_SYNC_MAX_AGE_MS = 3_000;
+/** Safety cap of messages per map-loading run. */
+const MAP_SENDS_PER_RUN = 400;
 /** Pause between two map-loading rounds. */
 const MAP_ROUND_PAUSE_MS = 30 * 60_000;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 60_000;
@@ -1714,9 +1716,10 @@ class Mammotion extends utils.Adapter {
                 this.log.debug(`[MQTT] Zone names received (raw): ${areas.length} entries cached`);
             }
             const hashIds = this.tryParseNavGetHashListAck(rawBase64, deviceKey);
-            if (hashIds && hashIds.length > 0 && ctx && !this.mapFrameListeners.has(deviceKey)) {
-                this.log.debug(`[MQTT] NavGetHashListAck (raw): ${hashIds.length} Hashes, requesting names`);
-                await this.requestAreaNamesForHashes(ctx, hashIds);
+            if (hashIds && hashIds.length > 0) {
+                // Zones come from the map loader, which acknowledges every frame. The former
+                // per-hash classification never did, so the mower kept repeating its frames.
+                this.log.debug(`[MQTT] NavGetHashListAck (raw): ${hashIds.length} hashes seen`);
             } else if (!areas || areas.length === 0) {
                 this.log.debug(`[MQTT] Raw proto: no zone names / no HashListAck`);
             }
@@ -1907,9 +1910,8 @@ class Mammotion extends utils.Adapter {
                 this.log.debug(`[MQTT] Zone names received: ${areas.length} entries cached`);
             }
             const hashIds = this.tryParseNavGetHashListAck(protoContent, deviceKey);
-            if (hashIds && hashIds.length > 0 && ctx && !this.mapFrameListeners.has(deviceKey)) {
-                this.log.debug(`[MQTT] NavGetHashListAck: ${hashIds.length} Hashes, requesting names`);
-                await this.requestAreaNamesForHashes(ctx, hashIds);
+            if (hashIds && hashIds.length > 0) {
+                this.log.debug(`[MQTT] NavGetHashListAck: ${hashIds.length} hashes seen`);
             } else if (!areas || areas.length === 0) {
                 this.log.debug(`[MQTT] protoContent contains no zone names / no HashListAck`);
             }
@@ -4017,193 +4019,6 @@ class Mammotion extends utils.Adapter {
 
     // ─── Zone / area name support ────────────────────────────────────────────────
 
-    private buildAreaNameListContent(
-        session: AuthSession,
-        context: DeviceContext,
-        subCmd = 0,
-        receiverDeviceOverride?: number,
-    ): string {
-        // NavGetHashList (todev_gethash): requests the device to send its complete zone hash list.
-        // sub_cmd=0: all hashes → device responds with NavGetHashListAck (field 31).
-        // sub_cmd=3: area hash names → device may respond with AppGetAllAreaHashName (field 61).
-        const getHashPayload = this.encodeMessage([
-            this.encodeFieldVarint(1, 1),       // pver = 1
-            this.encodeFieldVarint(2, subCmd),  // sub_cmd
-        ]);
-        // MctlNav field 30 = todev_gethash (NavGetHashList)
-        const navPayload = this.encodeMessage([this.encodeFieldBytes(30, getHashPayload)]);
-        const subtype = Number.parseInt(session.userAccount, 10);
-        const lubaMessage = this.buildLubaMessage({
-            msgType: 240,
-            receiverDevice: receiverDeviceOverride ?? this.getReceiverDevice(context),
-            subtype: Number.isNaN(subtype) ? 0 : subtype,
-            subMessageField: 11,
-            subMessagePayload: navPayload,
-        });
-        return lubaMessage.toString('base64');
-    }
-
-    private async sendAreaNameListRequest(context: DeviceContext): Promise<void> {
-        const primaryReceiver = this.getReceiverDevice(context);
-        const receivers = new Set<number>([primaryReceiver]);
-        // Some Yuka firmware revisions answer NavGetHashList only on receiver 17.
-        if (this.isYukaDevice(context)) {
-            receivers.add(17);
-            receivers.add(1);
-        }
-
-        // First try sub_cmd=3 (AppGetAllAreaHashName / field 61) – gives area hashes + names directly.
-        for (const receiver of receivers) {
-            this.log.debug(
-                `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`,
-            );
-            const result3 = await this.executeEncodedContentCommand(context, 'area-name-list-v3', (_session, ctx) =>
-                this.buildAreaNameListContent(_session, ctx, 3, receiver),
-            );
-            this.log.debug(
-                `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${result3?.length ?? 0}): ${result3?.substring(0, 100)}`,
-            );
-            if (result3 && result3 !== 'ok' && result3.length > 20) {
-                const areas = this.tryParseAreaHashNames(result3);
-                if (areas && areas.length > 0) {
-                    this.rememberAreaNames(context.key, areas);
-                    this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
-                }
-            }
-        }
-
-        // sub_cmd=0: device responds with NavGetHashListAck (field 31) → triggers field-32 classification
-        for (const receiver of receivers) {
-            const result0 = await this.executeEncodedContentCommand(context, 'area-name-list', (_session, ctx) =>
-                this.buildAreaNameListContent(_session, ctx, 0, receiver),
-            );
-            this.log.debug(
-                `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${result0?.length ?? 0}): ${result0?.substring(0, 100)}`,
-            );
-            if (result0 && result0 !== 'ok' && result0.length > 20) {
-                const areas = this.tryParseAreaHashNames(result0);
-                if (areas && areas.length > 0) {
-                    this.rememberAreaNames(context.key, areas);
-                    this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
-                }
-            }
-        }
-    }
-
-
-    private buildNavGetCommDataContent(session: AuthSession, context: DeviceContext, hash: bigint): string {
-        // NavGetCommData (MctlNav field 32): ask device for type+name of a specific hash.
-        // NavGetCommDataAck (field 33) response: type(field 5), Hash(field 6), nameTime(field 15).
-        // type=0 (PathType.AREA) = mowing zone; type=1 = obstacle; type=2 = path, etc.
-        const commDataPayload = this.encodeMessage([
-            this.encodeFieldVarint(1, 1),    // pver = 1
-            this.encodeFieldVarint(2, 1),    // sub_cmd = 1
-            this.encodeFieldVarint(3, 8),    // action = 8 (synchronize hash data)
-            this.encodeFieldVarint(5, hash), // hash (int64 varint)
-        ]);
-        const navPayload = this.encodeMessage([this.encodeFieldBytes(32, commDataPayload)]);
-        const subtype = Number.parseInt(session.userAccount, 10);
-        const lubaMessage = this.buildLubaMessage({
-            msgType: 240,
-            receiverDevice: this.getReceiverDevice(context),
-            subtype: Number.isNaN(subtype) ? 0 : subtype,
-            subMessageField: 11,
-            subMessagePayload: navPayload,
-        });
-        return lubaMessage.toString('base64');
-    }
-
-    private async requestAreaNamesForHashes(context: DeviceContext, hashIds: bigint[]): Promise<void> {
-        if (this.zoneDiscoveryInFlight.has(context.key)) {
-            this.log.debug(`[ZONE] Discovery already running for ${context.deviceName || context.iotId}, skipping duplicate trigger.`);
-            return;
-        }
-        this.zoneDiscoveryInFlight.add(context.key);
-        try {
-            const hashSetKey = hashIds.map(String).join(',');
-            const prevHashSet = this.lastRequestedHashSetByDevice.get(context.key);
-            if (prevHashSet === hashSetKey && (await this.hasKnownAreas(context.key))) {
-                return;
-            }
-            this.lastRequestedHashSetByDevice.set(context.key, hashSetKey);
-
-            this.log.debug(`[ZONE] ${hashIds.length} hashes received, classifying sequentially via field-32/33`);
-
-            // Classify each hash one at a time. The device has a rate limit and only processes
-            // one field-32 request at a time, so we wait for each field-33 response before sending the next.
-            const areaHashes: bigint[] = [];
-            let unknownHashes: bigint[] = [];
-            const typeHistogram = new Map<number, number>();
-            for (const hash of hashIds) {
-                const type = await this.classifyHashType(context, hash);
-                this.log.debug(`[ZONE] hash=${hash} → type=${type}`);
-                typeHistogram.set(type, (typeHistogram.get(type) ?? 0) + 1);
-                if (type === 0) areaHashes.push(hash); // PathType.AREA = 0
-                if (type < 0) unknownHashes.push(hash);
-            }
-
-            // MQTT may flap for a few seconds; retry unknown hashes once before finalizing.
-            if (unknownHashes.length > 0) {
-                this.log.debug(`[ZONE] Retrying ${unknownHashes.length} unknown hash classifications once.`);
-                const retryUnknown: bigint[] = [];
-                for (const hash of unknownHashes) {
-                    await new Promise(resolve => setTimeout(resolve, 200));
-                    const retryType = await this.classifyHashType(context, hash);
-                    this.log.debug(`[ZONE] retry hash=${hash} → type=${retryType}`);
-                    typeHistogram.set(retryType, (typeHistogram.get(retryType) ?? 0) + 1);
-                    if (retryType === 0 && !areaHashes.some(existing => existing === hash)) {
-                        areaHashes.push(hash);
-                        continue;
-                    }
-                    if (retryType < 0) {
-                        retryUnknown.push(hash);
-                    }
-                }
-                unknownHashes = retryUnknown;
-            }
-
-            const histogramText = [...typeHistogram.entries()]
-                .sort((a, b) => a[0] - b[0])
-                .map(([type, count]) => `${type}:${count}`)
-                .join(', ');
-            this.log.info(
-                `[ZONE] ${areaHashes.length} mowing zones (type=0) detected out of ${hashIds.length} hashes (types: ${histogramText})`,
-            );
-
-            const existingAreas = await this.getKnownAreas(context.key);
-            let finalAreaHashes = areaHashes;
-
-            // If classification timed out for some hashes, do not drop already known zones.
-            if (unknownHashes.length > 0 && existingAreas.length > 0) {
-                const merged = new Map<string, bigint>();
-                for (const area of existingAreas) {
-                    merged.set(area.hash.toString(), area.hash);
-                }
-                for (const hash of areaHashes) {
-                    merged.set(hash.toString(), hash);
-                }
-                finalAreaHashes = [...merged.values()];
-                this.log.warn(
-                    `[ZONE] Partial classification (${unknownHashes.length} timeout/unknown). Keeping ${existingAreas.length} existing zones; merged result has ${finalAreaHashes.length} zones.`,
-                );
-            }
-
-            if (!finalAreaHashes.length) {
-                this.log.warn(
-                    `[ZONE] No mowing zones (type=0) detected - skipping zone update to avoid creating paths/NoGo as zones.`,
-                );
-                return;
-            }
-            this.classifiedAreaHashesByDevice.set(context.key, new Set(finalAreaHashes.map(h => h.toString())));
-            const names = this.pendingAreaNamesByDevice.get(context.key);
-            const existingNames = new Map(existingAreas.map(area => [area.hash.toString(), area.name]));
-            const areas = this.buildAreaListWithUniqueNames(finalAreaHashes, names, existingNames);
-            await this.updateZoneStates(context.key, areas);
-        } finally {
-            this.zoneDiscoveryInFlight.delete(context.key);
-        }
-    }
-
     private buildAreaListWithUniqueNames(
         hashes: bigint[],
         pendingNames: Map<string, string> | undefined,
@@ -4286,34 +4101,6 @@ class Mammotion extends utils.Adapter {
      * (NavGetCommDataAck) response, which arrives either in the HTTP sync response or via MQTT.
      * Returns the PathType (0=AREA, 1=OBSTACLE, 2=PATH, …) or -1 on timeout.
      */
-    private classifyHashType(context: DeviceContext, hash: bigint): Promise<number> {
-        return new Promise<number>((resolve) => {
-            const waitKey = `${context.key}:${hash}`;
-            const timer = setTimeout(() => {
-                if (this.classifyWaiters.delete(waitKey)) resolve(-1); // timeout, type unknown
-            }, 8000);
-
-            this.classifyWaiters.set(waitKey, (type: number) => {
-                clearTimeout(timer);
-                resolve(type);
-            });
-
-            // Send field-32 request; aso check sync HTTP response immediately
-            void this.executeEncodedContentCommand(context, 'get-comm-data', (_s, ctx) =>
-                this.buildNavGetCommDataContent(_s, ctx, hash),
-            ).then(result => {
-                if (result && result !== 'ok' && result.length > 20) {
-                    this.resolveCommDataAck(context.key, result);
-                }
-            }).catch(() => {
-                if (this.classifyWaiters.delete(waitKey)) {
-                    clearTimeout(timer);
-                    resolve(-1);
-                }
-            });
-        });
-    }
-
     /** Called when a field-33 (NavGetCommDataAck) proto arrives (sync HTTP or async MQTT). */
     private async parseMctlSysProto(deviceKey: string, protoBase64: string): Promise<void> {
         try {
@@ -4419,8 +4206,7 @@ class Mammotion extends utils.Adapter {
             }
             this.lastAreaNameRequestAt.set(ctx.key, now);
             try {
-                await this.sendAreaNameListRequest(ctx);
-                this.startAreaNameRetry(ctx.key);
+                await this.discoverZones(ctx);
             } catch (err) {
                 this.log.debug(
                     `Area-Name-Re-Request (missing) failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`,
@@ -4780,11 +4566,7 @@ class Mammotion extends utils.Adapter {
                         }
                         throw err;
                     }
-                    // Slow down for the rest of this load, wait out the back-off, then continue.
-                    if (!this.invokeGapOverride.has(ctx.key)) {
-                        this.log.info(`[MAP] ${label}: cloud rate limit, continuing slowly (one message per 10 s).`);
-                    }
-                    this.invokeGapOverride.set(ctx.key, MAP_SLOW_GAP_MS);
+                    // Wait out a short back-off, then continue the burst.
                     this.log.debug(
                         `[MAP] ${label}: rate limited, pausing ${Math.round(waitMs / 1000)}s before ${commandLabel}.`,
                     );
@@ -4796,9 +4578,9 @@ class Mammotion extends utils.Adapter {
         this.mapFrameListeners.set(key, accept);
         const startedAt = Date.now();
         let lastSyncAt = 0;
-        // Aliyun-era mowers pay every message from the cloud quota: sync once at the start and
-        // again only when the mower stops answering; Mammotion-platform mowers as the app does.
-        const syncInterval = this.aliyunOnlyDevices.has(key) ? Number.POSITIVE_INFINITY : MAP_SYNC_REFRESH_MS;
+        // The mower answers map requests only while the app counts as "synchronised"; that state
+        // lasts a few seconds, so the sync goes out again before requests when it has aged.
+        const syncInterval = MAP_SYNC_MAX_AGE_MS;
         const syncIfDue = async (force = false): Promise<void> => {
             if (force || Date.now() - lastSyncAt >= syncInterval) {
                 await send('map-sync', session => this.buildMapSyncContent(session));
@@ -4808,7 +4590,9 @@ class Mammotion extends utils.Adapter {
         const currentMapHash = String((await this.getStateAsync(`devices.${key}.telemetry.mapHash`))?.val ?? '');
         const aliyun = this.aliyunOnlyDevices.has(key);
         const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;
-        const roundBudget = aliyun ? MAP_ALIYUN_SENDS_PER_ROUND : Number.POSITIVE_INFINITY;
+        const roundBudget = MAP_SENDS_PER_RUN;
+        // Burst like the app while the transfer runs; the normal gap applies again afterwards.
+        this.invokeGapOverride.set(key, MAP_BURST_GAP_MS);
         const timer = this.mapResumeTimers.get(key);
         if (timer) {
             clearTimeout(timer);
@@ -4845,12 +4629,14 @@ class Mammotion extends utils.Adapter {
                 while (frame) {
                     listParts.set(frame.currentFrame, frame.hashes);
                     listTotal = frame.totalFrame;
-                    if (listParts.size >= listTotal) {
-                        break; // the last frame needs no acknowledgement: all data is here
-                    }
+                    // Acknowledge every frame, the last one too: unacknowledged frames are repeated
+                    // by the mower about once a second, which floods the cloud.
                     lastAck = frame;
                     const ackFrame: HashListFrame = frame;
                     await send('map-hash-list-ack', session => this.buildHashListContent(session, receiver, ackFrame));
+                    if (listParts.size >= listTotal) {
+                        break;
+                    }
                     frame = await take(hashFrames, f => !listParts.has(f.currentFrame), frameTimeout);
                     if (!frame && !ackResent) {
                         // The acknowledgement may have been lost: repeat it once.
@@ -4911,12 +4697,8 @@ class Mammotion extends utils.Adapter {
                         continue;
                     }
                     assembler.add(frame);
-                    // Acknowledge to get the next frame; the last one needs no acknowledgement.
-                    if (!assembler.complete) {
-                        await send('map-element-ack', session =>
-                            this.buildElementContent(session, receiver, hash, frame),
-                        );
-                    }
+                    // Acknowledge every frame (the last one too, or the mower repeats it).
+                    await send('map-element-ack', session => this.buildElementContent(session, receiver, hash, frame));
                 }
                 if (assembler.complete) {
                     loaded.set(hash.toString(), assembler.result());
@@ -4932,6 +4714,7 @@ class Mammotion extends utils.Adapter {
             }
             const complete = hashes.every(h => loaded.has(h.toString()));
             await this.writeMapGeoJson(ctx, [...loaded.values()], complete);
+            await this.updateZonesFromMap(ctx, [...loaded.values()], complete);
             if (complete) {
                 this.mapProgress.delete(key);
                 await this.setStateChangedAsync(`devices.${key}.map.progressJson`, '', true);
@@ -4946,6 +4729,7 @@ class Mammotion extends utils.Adapter {
         } catch (err) {
             if (loaded.size) {
                 await this.writeMapGeoJson(ctx, [...loaded.values()], false);
+                await this.updateZonesFromMap(ctx, [...loaded.values()], false);
             }
             const status =
                 rateLimitHit && hashes.length
@@ -5107,6 +4891,59 @@ class Mammotion extends utils.Adapter {
         }
     }
 
+    // NavMapNameMsg (nav 58, rw = 0): one message that makes the mower send all zone names
+    // (AppGetAllAreaHashName, nav 61), as the app asks for them.
+    private buildZoneNamesContent(session: AuthSession, context: DeviceContext): string {
+        return this.buildNavContent(
+            session,
+            this.getReceiverDevice(context),
+            58,
+            this.encodeMessage([this.encodeFieldString(5, context.iotId)]),
+        );
+    }
+
+    // Zones = mowing areas of the map. Asks once for the zone names and starts the map loader,
+    // which acknowledges every frame; the zone states are filled from its result.
+    private async discoverZones(ctx: DeviceContext): Promise<void> {
+        await this.executeEncodedContentCommand(ctx, 'zone-names', session => this.buildZoneNamesContent(session, ctx));
+        if (!this.mapFrameListeners.has(ctx.key) && !this.mapResumeTimers.has(ctx.key)) {
+            void this.fetchMap(ctx).catch(err =>
+                this.log.debug(`[ZONE] Map load for zones stopped: ${this.extractAxiosError(err)}`),
+            );
+        }
+    }
+
+    // Fills zones.* from the mowing areas (type 0) of the loaded map. Names: the mower's zone names
+    // (nav 61), else the name in the element, else the existing state name, else "Area N".
+    private async updateZonesFromMap(ctx: DeviceContext, elements: MapElement[], complete: boolean): Promise<void> {
+        const zoneElements = elements.filter(e => e.type === 0);
+        if (!zoneElements.length) {
+            return;
+        }
+        const names = new Map(this.pendingAreaNamesByDevice.get(ctx.key) ?? []);
+        for (const e of zoneElements) {
+            const key = e.hash.toString();
+            if (e.name && !names.has(key)) {
+                names.set(key, e.name);
+            }
+        }
+        const existing = await this.getKnownAreas(ctx.key);
+        const existingNames = new Map(existing.map(a => [a.hash.toString(), a.name]));
+        const hashes = new Map<string, bigint>();
+        if (!complete) {
+            // Partial map: keep the zones already known, add the new ones.
+            for (const a of existing) {
+                hashes.set(a.hash.toString(), a.hash);
+            }
+        }
+        for (const e of zoneElements) {
+            hashes.set(e.hash.toString(), e.hash);
+        }
+        const areas = this.buildAreaListWithUniqueNames([...hashes.values()], names, existingNames);
+        await this.updateZoneStates(ctx.key, areas);
+        this.log.info(`[ZONE] ${ctx.deviceName || ctx.iotId}: ${areas.length} zone(s) from the map.`);
+    }
+
     private async handleRequestAreaNames(deviceKey: string, localId: string): Promise<void> {
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
@@ -5115,8 +4952,7 @@ class Mammotion extends utils.Adapter {
             return;
         }
         try {
-            await this.sendAreaNameListRequest(ctx);
-            this.startAreaNameRetry(deviceKey);
+            await this.discoverZones(ctx);
             await this.setStateChangedAsync(localId, false, true);
             this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
         } catch (err) {
@@ -5486,7 +5322,7 @@ class Mammotion extends utils.Adapter {
         const attempt = this.areaNameRetryAttempts.get(deviceKey) ?? 0;
         this.log.debug(`[AREA-REQ] retry ${attempt}/${AREA_NAME_RETRY_DELAYS_MS.length} for ${ctx.deviceName || ctx.iotId}`);
         try {
-            await this.sendAreaNameListRequest(ctx);
+            await this.discoverZones(ctx);
         } catch (err) {
             this.log.debug(`[AREA-REQ] retry failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
         }

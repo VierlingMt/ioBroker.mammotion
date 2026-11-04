@@ -25,6 +25,20 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   devices keep to an own budget of 400 per 12 hours (PyMammotion uses 600); commands a user triggers are
   not counted. The status report of such devices is refreshed every 5 minutes while working and every
   60 minutes otherwise. Map loading no longer waits out long back-offs.
+- **Map transfers follow the app: quick burst, fresh sync, every frame acknowledged.** Live (03./04.11.,
+  local test session): with the same account the app loaded the map in ~20 s (~7 messages/s, no 429), while
+  the adapter never got past the element list overnight ("element list incomplete (1/2)" every round) and
+  still ran into 429. Two causes:
+  - the mower answers map requests only while the app counts as "synchronised", which lasts a few seconds;
+    sending one message per 10 s lost the sync before the next frame. Map transfers now run as a burst
+    (400 ms gap), re-send the sync before a request when it is older than 3 s, and acknowledge every frame
+    including the last one;
+  - the old zone discovery requested every element without ever acknowledging a frame, so the mower kept
+    repeating its frames about once a second (seen as endless "no zone names / no HashListAck" in the log).
+    It is removed. Zones now come from the map loader (mowing areas of the map), the zone names from one
+    `NavMapNameMsg` (nav 58) request as in the app. `commands.requestAreaNames` starts exactly that.
+  The per-round limit of 15 messages is replaced by a safety cap of 400 per run; on a 429 the load pauses
+  and continues later.
 - **Map loading in small rounds, resumable across restarts.** Live findings of 03.11. (local test
   session): the cloud allows only a handful of messages before a 429, the ban lifts after about 15
   minutes, and an incomplete element list (1 of 2 frames) made the loader work with 20 of 29 elements and
