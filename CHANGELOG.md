@@ -25,6 +25,13 @@ The five most recent entries are also mirrored into `io-package.json#common.news
   devices keep to an own budget of 400 per 12 hours (PyMammotion uses 600); commands a user triggers are
   not counted. The status report of such devices is refreshed every 5 minutes while working and every
   60 minutes otherwise. Map loading no longer waits out long back-offs.
+- **Aliyun-era mowers: no endless report stream, rare REST polling.** Live 04.11.: after a restart only two
+  commands went out, 10 s apart, 23 minutes after the last 429, and the second already got 429. Something
+  continuous had to be the cause. Two candidates the app does not do while it is closed: the adapter
+  ordered the status report with `count = 0`, so the mower reported every 10 s around the clock (each
+  refresh re-arms it), and REST property/status polling every 30 s (about 2500 calls a day). For
+  Aliyun-only devices the report is now ordered with `count = 3`, and REST polling runs every 5 minutes
+  while the Aliyun MQTT push channel is up. The staleness watchdog waits at least 2.5 poll intervals.
 - **Map transfers follow the app: quick burst, fresh sync, every frame acknowledged.** Live (03./04.11.,
   local test session): with the same account the app loaded the map in ~20 s (~7 messages/s, no 429), while
   the adapter never got past the element list overnight ("element list incomplete (1/2)" every round) and

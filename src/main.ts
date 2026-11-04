@@ -222,6 +222,14 @@ const ALIYUN_BACKOFF_MIN_MS = 15 * 60_000;
 const ALIYUN_BACKOFF_MAX_MS = 6 * 60 * 60_000;
 /** Aliyun-era mowers: at most one message every 10 s (the cloud reports iotMsgHz 10000). */
 const ALIYUN_INVOKE_MIN_GAP_MS = 10_000;
+/**
+ * Aliyun-era mowers: order only a few status reports per request instead of an endless stream.
+ * With count 0 the mower reported every 10 s around the clock (each refresh re-arms it), which is
+ * the prime suspect for the 429s that hit even the first command after a long pause (live 04.11.).
+ */
+const ALIYUN_REPORT_COUNT = 3;
+/** Aliyun-era mowers: REST property polling while the Aliyun MQTT push channel is up. */
+const ALIYUN_POLL_WITH_PUSH_SEC = 300;
 /** Status report refresh for Aliyun-only devices (each request costs quota). */
 const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 60_000;
 const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 60_000;
@@ -1230,7 +1238,12 @@ class Mammotion extends utils.Adapter {
             await this.executeEncodedContentCommand(
                 context,
                 stop ? 'request-iot-sync-stop' : 'request-iot-sync',
-                (session, _context) => this.buildRequestIotSyncContent(session, stop),
+                (session, _context) =>
+                    this.buildRequestIotSyncContent(
+                        session,
+                        stop,
+                        this.aliyunOnlyDevices.has(context.key) ? ALIYUN_REPORT_COUNT : 0,
+                    ),
             );
         } catch (err) {
             this.log.debug(
@@ -2840,7 +2853,8 @@ class Mammotion extends utils.Adapter {
         if (this.legacyLastDataAt <= 0) {
             return;
         }
-        const stalenessMs = 5 * 60 * 1000;
+        // At least 2.5 poll intervals: Aliyun-only devices are polled only every 5 minutes.
+        const stalenessMs = Math.max(5 * 60 * 1000, this.getLegacyNextPollDelayMs() * 2.5);
         const age = Date.now() - this.legacyLastDataAt;
         if (age <= stalenessMs) {
             return;
@@ -2910,6 +2924,15 @@ class Mammotion extends utils.Adapter {
         const baseSec = Number.isFinite(configuredInterval)
             ? Math.min(300, Math.max(10, Math.trunc(configuredInterval)))
             : 30;
+        // Aliyun-only devices push their state over Aliyun MQTT; REST polling every 30 s added
+        // thousands of API calls a day on top of the cloud's tight limits. Poll rarely while push is up.
+        const aliyunWithPush =
+            this.aliyunOnlyDevices.size > 0 &&
+            this.aliyunOnlyDevices.size === this.deviceContexts.size &&
+            !!this.aliyunMqttClient?.connected;
+        if (aliyunWithPush) {
+            return Math.max(baseSec, ALIYUN_POLL_WITH_PUSH_SEC) * 1000;
+        }
         const activeSec = Math.min(60, Math.max(10, Math.trunc(baseSec / 2)));
         const boostSec = Math.max(10, Math.min(15, activeSec));
         if (Date.now() < this.legacyFastPollUntil) {
@@ -3662,7 +3685,7 @@ class Mammotion extends utils.Adapter {
         ]).toString('base64');
     }
 
-    private buildRequestIotSyncContent(session: AuthSession, stop = false): string {
+    private buildRequestIotSyncContent(session: AuthSession, stop = false, count = 0): string {
         const subtype = Number.parseInt(session.userAccount, 10);
         const reportTypes = [1, 3, 4, 6, 10, 8];
         const reportCfgFields: Buffer[] = [
@@ -3670,7 +3693,7 @@ class Mammotion extends utils.Adapter {
             this.encodeFieldVarint(2, 10_000),
             this.encodeFieldVarint(3, 3_000),
             this.encodeFieldVarint(4, 4_000),
-            this.encodeFieldVarint(5, 0),
+            this.encodeFieldVarint(5, count),
         ];
         for (const type of reportTypes) {
             reportCfgFields.push(this.encodeFieldVarint(6, type));

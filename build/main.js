@@ -176,6 +176,8 @@ const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 6e4;
 const ALIYUN_BACKOFF_MIN_MS = 15 * 6e4;
 const ALIYUN_BACKOFF_MAX_MS = 6 * 60 * 6e4;
 const ALIYUN_INVOKE_MIN_GAP_MS = 1e4;
+const ALIYUN_REPORT_COUNT = 3;
+const ALIYUN_POLL_WITH_PUSH_SEC = 300;
 const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 6e4;
 const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 6e4;
 const DEVICE_OFFLINE_CODES = ["6205", "6221", "50103", "50104"];
@@ -1062,7 +1064,11 @@ class Mammotion extends utils.Adapter {
       await this.executeEncodedContentCommand(
         context,
         stop ? "request-iot-sync-stop" : "request-iot-sync",
-        (session, _context) => this.buildRequestIotSyncContent(session, stop)
+        (session, _context) => this.buildRequestIotSyncContent(
+          session,
+          stop,
+          this.aliyunOnlyDevices.has(context.key) ? ALIYUN_REPORT_COUNT : 0
+        )
       );
     } catch (err) {
       this.log.debug(
@@ -2390,7 +2396,7 @@ class Mammotion extends utils.Adapter {
     if (this.legacyLastDataAt <= 0) {
       return;
     }
-    const stalenessMs = 5 * 60 * 1e3;
+    const stalenessMs = Math.max(5 * 60 * 1e3, this.getLegacyNextPollDelayMs() * 2.5);
     const age = Date.now() - this.legacyLastDataAt;
     if (age <= stalenessMs) {
       return;
@@ -2444,8 +2450,13 @@ class Mammotion extends utils.Adapter {
     }
   }
   getLegacyNextPollDelayMs() {
+    var _a;
     const configuredInterval = Number(this.config.legacyPollIntervalSec);
     const baseSec = Number.isFinite(configuredInterval) ? Math.min(300, Math.max(10, Math.trunc(configuredInterval))) : 30;
+    const aliyunWithPush = this.aliyunOnlyDevices.size > 0 && this.aliyunOnlyDevices.size === this.deviceContexts.size && !!((_a = this.aliyunMqttClient) == null ? void 0 : _a.connected);
+    if (aliyunWithPush) {
+      return Math.max(baseSec, ALIYUN_POLL_WITH_PUSH_SEC) * 1e3;
+    }
     const activeSec = Math.min(60, Math.max(10, Math.trunc(baseSec / 2)));
     const boostSec = Math.max(10, Math.min(15, activeSec));
     if (Date.now() < this.legacyFastPollUntil) {
@@ -3092,7 +3103,7 @@ ${url}`;
       this.encodeFieldVarint(15, now)
     ]).toString("base64");
   }
-  buildRequestIotSyncContent(session, stop = false) {
+  buildRequestIotSyncContent(session, stop = false, count = 0) {
     const subtype = Number.parseInt(session.userAccount, 10);
     const reportTypes = [1, 3, 4, 6, 10, 8];
     const reportCfgFields = [
@@ -3100,7 +3111,7 @@ ${url}`;
       this.encodeFieldVarint(2, 1e4),
       this.encodeFieldVarint(3, 3e3),
       this.encodeFieldVarint(4, 4e3),
-      this.encodeFieldVarint(5, 0)
+      this.encodeFieldVarint(5, count)
     ];
     for (const type of reportTypes) {
       reportCfgFields.push(this.encodeFieldVarint(6, type));
