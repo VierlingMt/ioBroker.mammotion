@@ -166,6 +166,8 @@ const MAP_SYNC_MAX_AGE_ALIYUN_MS = 2e4;
 const MAP_ACK_GAP_ALIYUN_MS = 2500;
 const MAP_SENDS_PER_RUN = 400;
 const MAP_ROUND_PAUSE_MS = 30 * 6e4;
+const MAP_ROUND_PAUSE_IDLE_ALIYUN_MS = 6 * 60 * 6e4;
+const MAP_ELEMENT_MAX_FAILURES = 2;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 6e4;
 const USER_INTENT_WINDOW_MS = 5 * 6e4;
 const WAKE_MIN_INTERVAL_MS = 6e4;
@@ -3776,7 +3778,7 @@ ${url}`;
       if (!ctx) {
         throw new Error(`Unknown device: ${deviceKey}`);
       }
-      await this.fetchMap(ctx);
+      await this.fetchMap(ctx, true);
     } catch (err) {
       const msg = this.extractAxiosError(err);
       await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
@@ -3788,7 +3790,7 @@ ${url}`;
   // Loads the map once when the map checksum differs from the one last loaded.
   async maybeAutoFetchMap(deviceKey, mapHash) {
     var _a, _b;
-    if (this.mapFrameListeners.has(deviceKey)) {
+    if (this.mapFrameListeners.has(deviceKey) || this.mapResumeTimers.has(deviceKey)) {
       return;
     }
     const loaded = await this.getStateAsync(`devices.${deviceKey}.map.loadedMapHash`);
@@ -3875,8 +3877,8 @@ ${url}`;
   // Loads all map elements (hash list, then the points of every element, each
   // frame acknowledged) and writes them as GeoJSON to `map.geojson`.
   // Messages arrive via MQTT; the invoke result is checked as well.
-  async fetchMap(ctx) {
-    var _a, _b, _c, _d, _e, _f;
+  async fetchMap(ctx, userRequested = false) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     const key = ctx.key;
     const label = ctx.deviceName || ctx.iotId;
     if (this.mapFrameListeners.has(key)) {
@@ -3917,7 +3919,7 @@ ${url}`;
     };
     let rateLimitHit = false;
     let sentThisRound = 0;
-    let resync = null;
+    let ackRefused = false;
     const send = async (commandLabel, build, ack = false) => {
       var _a2;
       for (let attempt = 0; ; attempt++) {
@@ -3942,16 +3944,9 @@ ${url}`;
           const until = (_a2 = this.rateLimitBackoffUntil.get(ctx.key)) != null ? _a2 : 0;
           const waitMs = until - Date.now() + 2e3;
           if (shortGap && rateLimited) {
-            if (attempt >= 1 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
-              this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited again, frame given up.`);
-              return;
-            }
-            this.log.debug(
-              `[MAP] ${label}: ${commandLabel} rate limited, re-sync and repeat in ${Math.round(waitMs / 1e3)}s.`
-            );
-            await new Promise((resolve) => setTimeout(resolve, Math.max(waitMs, 0)));
-            await (resync == null ? void 0 : resync());
-            continue;
+            this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited, element dropped.`);
+            ackRefused = true;
+            return;
           }
           const maxAttempts = this.aliyunOnlyDevices.has(key) ? 1 : 4;
           if (!rateLimited || attempt >= maxAttempts || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
@@ -3981,7 +3976,6 @@ ${url}`;
         lastSyncAt = Date.now();
       }
     };
-    resync = () => syncIfDue(true);
     const currentMapHash = String((_b = (_a = await this.getStateAsync(`devices.${key}.telemetry.mapHash`)) == null ? void 0 : _a.val) != null ? _b : "");
     const aliyun = this.aliyunOnlyDevices.has(key);
     const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;
@@ -4000,10 +3994,13 @@ ${url}`;
     }
     let hashes = (_d = progress == null ? void 0 : progress.hashes) != null ? _d : [];
     const loaded = (_e = progress == null ? void 0 : progress.elements) != null ? _e : /* @__PURE__ */ new Map();
+    const failures = userRequested ? {} : (_f = progress == null ? void 0 : progress.failures) != null ? _f : {};
+    const loadedAtStart = loaded.size;
+    const resumePause = () => this.aliyunOnlyDevices.has(key) && loaded.size === loadedAtStart ? MAP_ROUND_PAUSE_IDLE_ALIYUN_MS : MAP_ROUND_PAUSE_MS;
     try {
       await this.setStateChangedAsync(statusId, "loading element list", true);
       await syncIfDue(true);
-      const primary = (_f = progress == null ? void 0 : progress.receiver) != null ? _f : this.getReceiverDevice(ctx);
+      const primary = (_g = progress == null ? void 0 : progress.receiver) != null ? _g : this.getReceiverDevice(ctx);
       const receivers = [primary, primary === 17 ? 1 : 17];
       let receiver = primary;
       const listParts = /* @__PURE__ */ new Map();
@@ -4055,16 +4052,21 @@ ${url}`;
       if (!hashes.length) {
         throw new Error("The mower did not send its element list (no answer on the map request).");
       }
-      this.mapProgress.set(key, { mapHash: currentMapHash, hashes, receiver, elements: loaded });
+      this.mapProgress.set(key, { mapHash: currentMapHash, hashes, receiver, elements: loaded, failures });
       await this.saveMapProgress(key);
       this.log.info(
         `[MAP] ${label}: ${hashes.length} map elements, ${loaded.size} already loaded, loading geometry (receiver ${receiver}).`
       );
       const failed = [];
+      let skipped = 0;
       let roundPaused = false;
       let newSinceWrite = 0;
       for (const [index, hash] of hashes.entries()) {
         if (loaded.has(hash.toString())) {
+          continue;
+        }
+        if (((_h = failures[hash.toString()]) != null ? _h : 0) >= MAP_ELEMENT_MAX_FAILURES) {
+          skipped++;
           continue;
         }
         if (Date.now() - startedAt > (aliyun ? MAP_FETCH_MAX_ALIYUN_MS : MAP_FETCH_MAX_MS)) {
@@ -4078,6 +4080,7 @@ ${url}`;
         await this.setStateChangedAsync(statusId, `loading element ${index + 1}/${hashes.length}`, true);
         const assembler = new import_mower_protocol.ElementAssembler(hash);
         let attempts = 0;
+        ackRefused = false;
         await syncIfDue();
         await send("map-element", (session) => this.buildElementContent(session, receiver, hash));
         while (!assembler.complete) {
@@ -4096,6 +4099,9 @@ ${url}`;
             (session) => this.buildElementContent(session, receiver, hash, frame),
             true
           );
+          if (ackRefused) {
+            break;
+          }
         }
         if (assembler.complete) {
           loaded.set(hash.toString(), assembler.result());
@@ -4106,19 +4112,28 @@ ${url}`;
           }
         } else {
           failed.push(hash.toString());
+          failures[hash.toString()] = ((_i = failures[hash.toString()]) != null ? _i : 0) + 1;
+          await this.saveMapProgress(key);
         }
         commFrames.length = 0;
       }
       const complete = hashes.every((h) => loaded.has(h.toString()));
-      await this.writeMapGeoJson(ctx, [...loaded.values()], complete);
+      const exhausted = !complete && hashes.every(
+        (h) => {
+          var _a2;
+          return loaded.has(h.toString()) || ((_a2 = failures[h.toString()]) != null ? _a2 : 0) >= MAP_ELEMENT_MAX_FAILURES;
+        }
+      );
+      await this.writeMapGeoJson(ctx, [...loaded.values()], complete || exhausted);
       await this.updateZonesFromMap(ctx, [...loaded.values()], complete);
       if (complete) {
         this.mapProgress.delete(key);
         await this.setStateChangedAsync(`devices.${key}.map.progressJson`, "", true);
-      } else {
-        this.scheduleMapResume(ctx);
+      } else if (!exhausted) {
+        this.scheduleMapResume(ctx, resumePause());
       }
-      const summary = roundPaused ? `paused: ${loaded.size}/${hashes.length} elements loaded (in rounds to protect the cloud quota), continues later` : `${loaded.size}/${hashes.length} elements loaded${failed.length ? `, ${failed.length} without answer` : ""}`;
+      const missing = hashes.length - loaded.size;
+      const summary = roundPaused ? `paused: ${loaded.size}/${hashes.length} elements loaded (in rounds to protect the cloud quota), continues later` : exhausted ? `${loaded.size}/${hashes.length} elements loaded, ${missing} too large for the cloud limit (skipped)` : `${loaded.size}/${hashes.length} elements loaded${failed.length || skipped ? `, ${failed.length + skipped} without answer` : ""}`;
       await this.setStateChangedAsync(statusId, summary, true);
       this.log.info(`[MAP] ${label}: ${summary}.`);
     } catch (err) {
@@ -4129,7 +4144,7 @@ ${url}`;
       const status = rateLimitHit && hashes.length ? `paused: ${loaded.size}/${hashes.length} elements loaded (cloud rate limit), continues later` : `failed: ${this.extractAxiosError(err)}`;
       await this.setStateChangedAsync(statusId, status, true);
       if (rateLimitHit || /incomplete|offline/i.test(this.extractAxiosError(err))) {
-        this.scheduleMapResume(ctx);
+        this.scheduleMapResume(ctx, resumePause());
       }
       throw err;
     } finally {
@@ -4168,7 +4183,7 @@ ${url}`;
     await this.setStateChangedAsync(`${base}.quotaJson`, JSON.stringify(quota), true);
   }
   // Continues an unfinished map load after MAP_ROUND_PAUSE_MS (plus a running 429 back-off).
-  scheduleMapResume(ctx) {
+  scheduleMapResume(ctx, pauseMs = MAP_ROUND_PAUSE_MS) {
     var _a;
     const old = this.mapResumeTimers.get(ctx.key);
     if (old) {
@@ -4180,7 +4195,7 @@ ${url}`;
       void this.fetchMap(ctx).catch(
         (err) => this.log.debug(`[MAP] Resumed map load stopped: ${this.extractAxiosError(err)}`)
       );
-    }, MAP_ROUND_PAUSE_MS + backoff);
+    }, pauseMs + backoff);
     this.mapResumeTimers.set(ctx.key, timer);
   }
   // Map loading progress survives adapter restarts in map.progressJson (local metres, no secrets).
@@ -4198,12 +4213,13 @@ ${url}`;
         type: e.type,
         name: e.name,
         points: e.points.map((pt) => [pt.x, pt.y])
-      }))
+      })),
+      failures: p.failures
     });
     await this.setStateChangedAsync(`devices.${key}.map.progressJson`, json, true);
   }
   async readMapProgress(key) {
-    var _a;
+    var _a, _b;
     const raw = (_a = await this.getStateAsync(`devices.${key}.map.progressJson`)) == null ? void 0 : _a.val;
     if (typeof raw !== "string" || !raw) {
       return void 0;
@@ -4223,7 +4239,8 @@ ${url}`;
         mapHash: o.mapHash,
         receiver: o.receiver,
         hashes: o.hashes.map((h) => BigInt(h)),
-        elements
+        elements,
+        failures: (_b = o.failures) != null ? _b : {}
       };
       this.mapProgress.set(key, restored);
       return restored;

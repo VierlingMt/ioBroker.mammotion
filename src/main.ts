@@ -199,6 +199,15 @@ const MAP_ACK_GAP_ALIYUN_MS = 2_500;
 const MAP_SENDS_PER_RUN = 400;
 /** Pause between two map-loading rounds. */
 const MAP_ROUND_PAUSE_MS = 30 * 60_000;
+/** Aliyun mowers: pause after a round that loaded nothing new; each round uses the shared cloud limit. */
+const MAP_ROUND_PAUSE_IDLE_ALIYUN_MS = 6 * 60 * 60_000;
+/**
+ * Elements that failed this often are skipped until the map changes or the user asks for the map.
+ * On Aliyun mowers large elements cannot load at all: the mower drops an element when a frame is not
+ * acknowledged within ~5 s and ignores late acks, while the cloud refuses more than 2-4 quick calls
+ * in a row (live 05.11.).
+ */
+const MAP_ELEMENT_MAX_FAILURES = 2;
 const MAP_AUTO_FETCH_RETRY_MS = 2 * 60_000;
 /**
  * Sleeping mowers (work mode 48) drop their cloud connection; every invoke then
@@ -264,6 +273,15 @@ const JWT_MQTT_SHORT_LIFETIME_LIMIT = 3;
 const JWT_MQTT_BACKOFF_WINDOW_MS = 3 * 60 * 1000;
 const JWT_MQTT_DISABLE_DURATION_MS = 30 * 60 * 1000;
 
+interface MapProgress {
+    mapHash: string;
+    hashes: bigint[];
+    receiver: number;
+    elements: Map<string, MapElement>;
+    /** Failed loading attempts per element hash. */
+    failures: Record<string, number>;
+}
+
 class Mammotion extends utils.Adapter {
     private mqttClient: any = null;
     private session: AuthSession | null = null;
@@ -299,10 +317,7 @@ class Mammotion extends utils.Adapter {
     /** Map loading progress per device key, so an interrupted load continues instead of restarting. */
     /** Timer that continues an unfinished map load after a pause, per device key. */
     private readonly mapResumeTimers = new Map<string, NodeJS.Timeout>();
-    private readonly mapProgress = new Map<
-        string,
-        { mapHash: string; hashes: bigint[]; receiver: number; elements: Map<string, MapElement> }
-    >();
+    private readonly mapProgress = new Map<string, MapProgress>();
     /** Consecutive 429 answers per device key; resets on the next successful invoke. */
     private readonly rateLimitStrikes = new Map<string, number>();
     // Report pacing the cloud hands out with every invoke answer (iotMsgHz / iotSameMsgHz, in ms).
@@ -4463,7 +4478,7 @@ class Mammotion extends utils.Adapter {
             if (!ctx) {
                 throw new Error(`Unknown device: ${deviceKey}`);
             }
-            await this.fetchMap(ctx);
+            await this.fetchMap(ctx, true);
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
@@ -4475,7 +4490,8 @@ class Mammotion extends utils.Adapter {
 
     // Loads the map once when the map checksum differs from the one last loaded.
     private async maybeAutoFetchMap(deviceKey: string, mapHash: string): Promise<void> {
-        if (this.mapFrameListeners.has(deviceKey)) {
+        // A pending resume timer owns the next attempt (it may wait hours on Aliyun mowers).
+        if (this.mapFrameListeners.has(deviceKey) || this.mapResumeTimers.has(deviceKey)) {
             return;
         }
         const loaded = await this.getStateAsync(`devices.${deviceKey}.map.loadedMapHash`);
@@ -4572,7 +4588,7 @@ class Mammotion extends utils.Adapter {
     // Loads all map elements (hash list, then the points of every element, each
     // frame acknowledged) and writes them as GeoJSON to `map.geojson`.
     // Messages arrive via MQTT; the invoke result is checked as well.
-    private async fetchMap(ctx: DeviceContext): Promise<void> {
+    private async fetchMap(ctx: DeviceContext, userRequested = false): Promise<void> {
         const key = ctx.key;
         const label = ctx.deviceName || ctx.iotId;
         if (this.mapFrameListeners.has(key)) {
@@ -4613,7 +4629,7 @@ class Mammotion extends utils.Adapter {
         };
         let rateLimitHit = false;
         let sentThisRound = 0;
-        let resync: (() => Promise<void>) | null = null;
+        let ackRefused = false;
         const send = async (
             commandLabel: string,
             build: (session: AuthSession) => string,
@@ -4639,18 +4655,11 @@ class Mammotion extends utils.Adapter {
                     const until = this.rateLimitBackoffUntil.get(ctx.key) ?? 0;
                     const waitMs = until - Date.now() + 2_000;
                     if (shortGap && rateLimited) {
-                        if (attempt >= 1 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
-                            this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited again, frame given up.`);
-                            return;
-                        }
-                        // The mower has stopped repeating the frame by then. Test whether a fresh sync
-                        // plus the same ack makes it continue with the next frame instead of starting over.
-                        this.log.debug(
-                            `[MAP] ${label}: ${commandLabel} rate limited, re-sync and repeat in ${Math.round(waitMs / 1000)}s.`,
-                        );
-                        await new Promise(resolve => setTimeout(resolve, Math.max(waitMs, 0)));
-                        await resync?.();
-                        continue;
+                        // A late ack is ignored by the mower (live 05.11., also after a fresh sync):
+                        // the element is lost, move on.
+                        this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited, element dropped.`);
+                        ackRefused = true;
+                        return;
                     }
                     // Aliyun: one retry only; repeated 429s only prolong the throttle (live 05.11.).
                     const maxAttempts = this.aliyunOnlyDevices.has(key) ? 1 : 4;
@@ -4685,7 +4694,6 @@ class Mammotion extends utils.Adapter {
                 lastSyncAt = Date.now();
             }
         };
-        resync = () => syncIfDue(true);
         const currentMapHash = String((await this.getStateAsync(`devices.${key}.telemetry.mapHash`))?.val ?? '');
         const aliyun = this.aliyunOnlyDevices.has(key);
         const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;
@@ -4705,6 +4713,13 @@ class Mammotion extends utils.Adapter {
         }
         let hashes: bigint[] = progress?.hashes ?? [];
         const loaded = progress?.elements ?? new Map<string, MapElement>();
+        // A user request gives elements that failed before another chance.
+        const failures: Record<string, number> = userRequested ? {} : (progress?.failures ?? {});
+        const loadedAtStart = loaded.size;
+        const resumePause = (): number =>
+            this.aliyunOnlyDevices.has(key) && loaded.size === loadedAtStart
+                ? MAP_ROUND_PAUSE_IDLE_ALIYUN_MS
+                : MAP_ROUND_PAUSE_MS;
         try {
             await this.setStateChangedAsync(statusId, 'loading element list', true);
             await syncIfDue(true);
@@ -4767,7 +4782,7 @@ class Mammotion extends utils.Adapter {
             if (!hashes.length) {
                 throw new Error('The mower did not send its element list (no answer on the map request).');
             }
-            this.mapProgress.set(key, { mapHash: currentMapHash, hashes, receiver, elements: loaded });
+            this.mapProgress.set(key, { mapHash: currentMapHash, hashes, receiver, elements: loaded, failures });
             await this.saveMapProgress(key);
             this.log.info(
                 `[MAP] ${label}: ${hashes.length} map elements, ${loaded.size} already loaded, loading geometry (receiver ${receiver}).`,
@@ -4775,10 +4790,15 @@ class Mammotion extends utils.Adapter {
 
             // 2) Geometry of every element, one at a time; elements of an earlier attempt are kept.
             const failed: string[] = [];
+            let skipped = 0;
             let roundPaused = false;
             let newSinceWrite = 0;
             for (const [index, hash] of hashes.entries()) {
                 if (loaded.has(hash.toString())) {
+                    continue;
+                }
+                if ((failures[hash.toString()] ?? 0) >= MAP_ELEMENT_MAX_FAILURES) {
+                    skipped++;
                     continue;
                 }
                 if (Date.now() - startedAt > (aliyun ? MAP_FETCH_MAX_ALIYUN_MS : MAP_FETCH_MAX_MS)) {
@@ -4792,6 +4812,7 @@ class Mammotion extends utils.Adapter {
                 await this.setStateChangedAsync(statusId, `loading element ${index + 1}/${hashes.length}`, true);
                 const assembler = new ElementAssembler(hash);
                 let attempts = 0;
+                ackRefused = false;
                 await syncIfDue();
                 await send('map-element', session => this.buildElementContent(session, receiver, hash));
                 while (!assembler.complete) {
@@ -4812,6 +4833,9 @@ class Mammotion extends utils.Adapter {
                         session => this.buildElementContent(session, receiver, hash, frame),
                         true,
                     );
+                    if (ackRefused) {
+                        break;
+                    }
                 }
                 if (assembler.complete) {
                     loaded.set(hash.toString(), assembler.result());
@@ -4822,21 +4846,33 @@ class Mammotion extends utils.Adapter {
                     }
                 } else {
                     failed.push(hash.toString());
+                    failures[hash.toString()] = (failures[hash.toString()] ?? 0) + 1;
+                    await this.saveMapProgress(key);
                 }
                 commFrames.length = 0;
             }
             const complete = hashes.every(h => loaded.has(h.toString()));
-            await this.writeMapGeoJson(ctx, [...loaded.values()], complete);
+            // Everything that can be loaded is loaded: the rest keeps failing (too large for the cloud
+            // limit). Counts as done for this map until it changes or the user asks again.
+            const exhausted =
+                !complete &&
+                hashes.every(
+                    h => loaded.has(h.toString()) || (failures[h.toString()] ?? 0) >= MAP_ELEMENT_MAX_FAILURES,
+                );
+            await this.writeMapGeoJson(ctx, [...loaded.values()], complete || exhausted);
             await this.updateZonesFromMap(ctx, [...loaded.values()], complete);
             if (complete) {
                 this.mapProgress.delete(key);
                 await this.setStateChangedAsync(`devices.${key}.map.progressJson`, '', true);
-            } else {
-                this.scheduleMapResume(ctx);
+            } else if (!exhausted) {
+                this.scheduleMapResume(ctx, resumePause());
             }
+            const missing = hashes.length - loaded.size;
             const summary = roundPaused
                 ? `paused: ${loaded.size}/${hashes.length} elements loaded (in rounds to protect the cloud quota), continues later`
-                : `${loaded.size}/${hashes.length} elements loaded${failed.length ? `, ${failed.length} without answer` : ''}`;
+                : exhausted
+                  ? `${loaded.size}/${hashes.length} elements loaded, ${missing} too large for the cloud limit (skipped)`
+                  : `${loaded.size}/${hashes.length} elements loaded${failed.length || skipped ? `, ${failed.length + skipped} without answer` : ''}`;
             await this.setStateChangedAsync(statusId, summary, true);
             this.log.info(`[MAP] ${label}: ${summary}.`);
         } catch (err) {
@@ -4850,7 +4886,7 @@ class Mammotion extends utils.Adapter {
                     : `failed: ${this.extractAxiosError(err)}`;
             await this.setStateChangedAsync(statusId, status, true);
             if (rateLimitHit || /incomplete|offline/i.test(this.extractAxiosError(err))) {
-                this.scheduleMapResume(ctx);
+                this.scheduleMapResume(ctx, resumePause());
             }
             throw err;
         } finally {
@@ -4891,7 +4927,7 @@ class Mammotion extends utils.Adapter {
     }
 
     // Continues an unfinished map load after MAP_ROUND_PAUSE_MS (plus a running 429 back-off).
-    private scheduleMapResume(ctx: DeviceContext): void {
+    private scheduleMapResume(ctx: DeviceContext, pauseMs = MAP_ROUND_PAUSE_MS): void {
         const old = this.mapResumeTimers.get(ctx.key);
         if (old) {
             clearTimeout(old);
@@ -4902,7 +4938,7 @@ class Mammotion extends utils.Adapter {
             void this.fetchMap(ctx).catch(err =>
                 this.log.debug(`[MAP] Resumed map load stopped: ${this.extractAxiosError(err)}`),
             );
-        }, MAP_ROUND_PAUSE_MS + backoff);
+        }, pauseMs + backoff);
         this.mapResumeTimers.set(ctx.key, timer);
     }
 
@@ -4922,13 +4958,12 @@ class Mammotion extends utils.Adapter {
                 name: e.name,
                 points: e.points.map(pt => [pt.x, pt.y]),
             })),
+            failures: p.failures,
         });
         await this.setStateChangedAsync(`devices.${key}.map.progressJson`, json, true);
     }
 
-    private async readMapProgress(
-        key: string,
-    ): Promise<{ mapHash: string; hashes: bigint[]; receiver: number; elements: Map<string, MapElement> } | undefined> {
+    private async readMapProgress(key: string): Promise<MapProgress | undefined> {
         const raw = (await this.getStateAsync(`devices.${key}.map.progressJson`))?.val;
         if (typeof raw !== 'string' || !raw) {
             return undefined;
@@ -4939,6 +4974,7 @@ class Mammotion extends utils.Adapter {
                 receiver: number;
                 hashes: string[];
                 elements: Array<{ hash: string; type: number; name: string; points: Array<[number, number]> }>;
+                failures?: Record<string, number>;
             };
             const elements = new Map<string, MapElement>();
             for (const e of o.elements) {
@@ -4954,6 +4990,7 @@ class Mammotion extends utils.Adapter {
                 receiver: o.receiver,
                 hashes: o.hashes.map(h => BigInt(h)),
                 elements,
+                failures: o.failures ?? {},
             };
             this.mapProgress.set(key, restored);
             return restored;
