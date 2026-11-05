@@ -9,6 +9,15 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 
 ## [Unreleased]
 
+### Changed
+- **Quiet mode for Aliyun-only mowers.** Live, even a single command after minutes or hours of silence got
+  429 `Throttled by PLUGIN Flow Control`, and other projects report that Mammotion deactivated accounts for
+  "abnormal activity". The scarce allowance is now kept for commands a user triggers: in the background
+  only a status report while the mower works (at most every 30 min, was 5 min active / 60 min idle), no
+  automatic map loading or resume rounds, no automatic zone-name requests and no report request after a
+  command. The background budget drops from 400 to 24 invokes per 12 h as a safety net. A map round
+  started with `commands.requestMap` stays user-driven for its whole duration.
+
 ### Added
 - **Reason of a cloud 429.** The Aliyun API gateway names the throttle that answered 429 in its response
   headers (`X-Ca-Error-Message`, for example app-key flow control versus user flow control). The adapter

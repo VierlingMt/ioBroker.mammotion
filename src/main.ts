@@ -227,11 +227,12 @@ const WAKE_REQUEST_TIMEOUT_MS = 60_000;
 const INVOKE_MIN_GAP_MS = 1_500;
 /**
  * Aliyun-era firmware (< 1.30.25.1) has a cloud send quota; exceeding it gets 429 and a long
- * ban. Background requests of Aliyun-only devices keep to an own budget per 12 hours, as
- * PyMammotion does (600). Commands a user triggers are not counted against it.
+ * ban. Background requests of Aliyun-only devices keep to an own budget per 12 hours; in quiet mode
+ * (see REPORT_REFRESH_ACTIVE_ALIYUN_MS) only status reports while mowing use it, so the budget is a
+ * safety net. Commands a user triggers are not counted against it.
  */
 const ALIYUN_SEND_WINDOW_MS = 12 * 60 * 60_000;
-const ALIYUN_BACKGROUND_SEND_LIMIT = 400;
+const ALIYUN_BACKGROUND_SEND_LIMIT = 24;
 /** 429 back-off: starts at 1 minute and doubles per consecutive 429, up to 1 hour. */
 const RATE_LIMIT_BACKOFF_MIN_MS = 60_000;
 const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 60_000;
@@ -260,8 +261,15 @@ const ALIYUN_REPORT_COUNT = 3;
 /** Aliyun-era mowers: REST property polling while the Aliyun MQTT push channel is up. */
 const ALIYUN_POLL_WITH_PUSH_SEC = 300;
 /** Status report refresh for Aliyun-only devices (each request costs quota). */
-const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 60_000;
-const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 60_000;
+/**
+ * Quiet mode of Aliyun mowers: the cloud lets only very few invokes through per account (429
+ * "Throttled by PLUGIN Flow Control" even after hours of silence) and Mammotion has deactivated
+ * accounts for "abnormal activity". The scarce allowance is kept for commands a user triggers.
+ * In the background only a status report while the mower works, at most every 30 minutes; no
+ * automatic map loading, zone discovery or post-command report. Status comes from REST polling
+ * (/thing/properties/get) and what the mower pushes on its own.
+ */
+const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 30 * 60_000;
 /** Aliyun / Mammotion codes for "device offline". */
 const DEVICE_OFFLINE_CODES = ['6205', '6221', '50103', '50104'];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
@@ -1268,7 +1276,10 @@ class Mammotion extends utils.Adapter {
         }
     }
 
-    private async requestIotSync(context: DeviceContext, stop = false): Promise<void> {
+    private async requestIotSync(context: DeviceContext, stop = false, quietAllowed = false): Promise<void> {
+        if (this.aliyunOnlyDevices.has(context.key) && !quietAllowed) {
+            return; // quiet mode, see REPORT_REFRESH_ACTIVE_ALIYUN_MS
+        }
         if (!stop) {
             this.reportRequestedAt.set(context.key, Date.now());
         }
@@ -3083,10 +3094,11 @@ class Mammotion extends utils.Adapter {
         }
         const stateVal = (await this.getStateAsync(`devices.${ctx.key}.telemetry.deviceState`))?.val;
         const active = REPORT_ACTIVE_STATES.has(Number(stateVal));
+        if (this.aliyunOnlyDevices.has(ctx.key) && !active) {
+            return; // quiet mode: no report request while the mower rests
+        }
         const interval = this.aliyunOnlyDevices.has(ctx.key)
-            ? active
-                ? REPORT_REFRESH_ACTIVE_ALIYUN_MS
-                : REPORT_REFRESH_IDLE_ALIYUN_MS
+            ? REPORT_REFRESH_ACTIVE_ALIYUN_MS
             : active
               ? REPORT_REFRESH_ACTIVE_MS
               : REPORT_REFRESH_IDLE_MS;
@@ -3094,7 +3106,7 @@ class Mammotion extends utils.Adapter {
         if (now - (this.reportRequestedAt.get(ctx.key) ?? 0) < interval) {
             return;
         }
-        await this.requestIotSync(ctx);
+        await this.requestIotSync(ctx, false, true);
     }
 
     /**
@@ -4275,6 +4287,9 @@ class Mammotion extends utils.Adapter {
     private async requestAreaNamesForMissingDevices(): Promise<void> {
         const now = Date.now();
         for (const ctx of this.deviceContexts.values()) {
+            if (this.aliyunOnlyDevices.has(ctx.key)) {
+                continue; // quiet mode: zones only on request (commands.requestAreaNames / requestMap)
+            }
             if (await this.hasKnownAreas(ctx.key)) {
                 this.clearAreaNameRetry(ctx.key);
                 continue;
@@ -4490,8 +4505,12 @@ class Mammotion extends utils.Adapter {
 
     // Loads the map once when the map checksum differs from the one last loaded.
     private async maybeAutoFetchMap(deviceKey: string, mapHash: string): Promise<void> {
-        // A pending resume timer owns the next attempt (it may wait hours on Aliyun mowers).
-        if (this.mapFrameListeners.has(deviceKey) || this.mapResumeTimers.has(deviceKey)) {
+        // A pending resume timer owns the next attempt. Aliyun mowers load the map only on request.
+        if (
+            this.mapFrameListeners.has(deviceKey) ||
+            this.mapResumeTimers.has(deviceKey) ||
+            this.aliyunOnlyDevices.has(deviceKey)
+        ) {
             return;
         }
         const loaded = await this.getStateAsync(`devices.${deviceKey}.map.loadedMapHash`);
@@ -4637,6 +4656,10 @@ class Mammotion extends utils.Adapter {
         ): Promise<void> => {
             for (let attempt = 0; ; attempt++) {
                 const shortGap = ack && this.aliyunOnlyDevices.has(key);
+                if (userRequested) {
+                    // A requested map round may outlast USER_INTENT_WINDOW_MS; it is still user-driven.
+                    this.userIntentAt.set(key, Date.now());
+                }
                 try {
                     sentThisRound++;
                     if (shortGap) {
@@ -4928,6 +4951,9 @@ class Mammotion extends utils.Adapter {
 
     // Continues an unfinished map load after MAP_ROUND_PAUSE_MS (plus a running 429 back-off).
     private scheduleMapResume(ctx: DeviceContext, pauseMs = MAP_ROUND_PAUSE_MS): void {
+        if (this.aliyunOnlyDevices.has(ctx.key)) {
+            return; // quiet mode: the user asks again with commands.requestMap
+        }
         const old = this.mapResumeTimers.get(ctx.key);
         if (old) {
             clearTimeout(old);

@@ -101,6 +101,8 @@ The adapter detects shared devices automatically. No extra configuration is need
 
 > Shared devices use the legacy/Aliyun channel because the modern API only authorises owner sessions for them. This is fully functional – control commands (start, stop, zones, route, …) all work via the fallback path.
 
+> **Quiet mode for Aliyun-only mowers.** The Aliyun cloud lets only very few commands through per account (HTTP 429 `Throttled by PLUGIN Flow Control`, also after hours of silence), and Mammotion has deactivated accounts for "abnormal activity". For devices that only the Aliyun bindings list, the adapter therefore sends almost nothing on its own: a status report only while the mower works (at most every 30 minutes), no automatic map loading or zone discovery. Status comes from REST polling and what the mower pushes. Load the map with `commands.requestMap` and zones with `commands.requestAreaNames` when needed. Large map elements cannot be loaded through the cloud at all and are skipped. Never use the owner account in the adapter; use a shared account.
+
 ### ⚠️ Option B – direct login (not recommended)
 
 If you only own one account and never use the mobile app you can enter your main credentials directly. Be aware that the adapter and the mobile app **will fight over the session** whenever both are active.

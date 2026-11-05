@@ -175,7 +175,7 @@ const WAKE_RETRY_DELAYS_MS = [5e3, 5e3, 1e4, 1e4, 15e3, 15e3, 15e3, 15e3];
 const WAKE_REQUEST_TIMEOUT_MS = 6e4;
 const INVOKE_MIN_GAP_MS = 1500;
 const ALIYUN_SEND_WINDOW_MS = 12 * 60 * 6e4;
-const ALIYUN_BACKGROUND_SEND_LIMIT = 400;
+const ALIYUN_BACKGROUND_SEND_LIMIT = 24;
 const RATE_LIMIT_BACKOFF_MIN_MS = 6e4;
 const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 6e4;
 const ALIYUN_BACKOFF_MIN_MS = 15 * 6e4;
@@ -186,8 +186,7 @@ const PLUGIN_THROTTLE_BACKOFF_MIN_MS = 3e4;
 const PLUGIN_THROTTLE_BACKOFF_MAX_MS = 30 * 6e4;
 const ALIYUN_REPORT_COUNT = 3;
 const ALIYUN_POLL_WITH_PUSH_SEC = 300;
-const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 5 * 6e4;
-const REPORT_REFRESH_IDLE_ALIYUN_MS = 60 * 6e4;
+const REPORT_REFRESH_ACTIVE_ALIYUN_MS = 30 * 6e4;
 const DEVICE_OFFLINE_CODES = ["6205", "6221", "50103", "50104"];
 const DEFAULT_HEALTH_STALE_THRESHOLD_MIN = 60;
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
@@ -1067,7 +1066,10 @@ class Mammotion extends utils.Adapter {
       }
     }
   }
-  async requestIotSync(context, stop = false) {
+  async requestIotSync(context, stop = false, quietAllowed = false) {
+    if (this.aliyunOnlyDevices.has(context.key) && !quietAllowed) {
+      return;
+    }
     if (!stop) {
       this.reportRequestedAt.set(context.key, Date.now());
     }
@@ -2571,12 +2573,15 @@ class Mammotion extends utils.Adapter {
     }
     const stateVal = (_a = await this.getStateAsync(`devices.${ctx.key}.telemetry.deviceState`)) == null ? void 0 : _a.val;
     const active = REPORT_ACTIVE_STATES.has(Number(stateVal));
-    const interval = this.aliyunOnlyDevices.has(ctx.key) ? active ? REPORT_REFRESH_ACTIVE_ALIYUN_MS : REPORT_REFRESH_IDLE_ALIYUN_MS : active ? REPORT_REFRESH_ACTIVE_MS : REPORT_REFRESH_IDLE_MS;
+    if (this.aliyunOnlyDevices.has(ctx.key) && !active) {
+      return;
+    }
+    const interval = this.aliyunOnlyDevices.has(ctx.key) ? REPORT_REFRESH_ACTIVE_ALIYUN_MS : active ? REPORT_REFRESH_ACTIVE_MS : REPORT_REFRESH_IDLE_MS;
     const now = Date.now();
     if (now - ((_b = this.reportRequestedAt.get(ctx.key)) != null ? _b : 0) < interval) {
       return;
     }
-    await this.requestIotSync(ctx);
+    await this.requestIotSync(ctx, false, true);
   }
   /**
    * Robust problem detection that does NOT rely on telemetry.connected / telemetry.lastUpdate,
@@ -3600,6 +3605,9 @@ ${url}`;
   async requestAreaNamesForMissingDevices() {
     const now = Date.now();
     for (const ctx of this.deviceContexts.values()) {
+      if (this.aliyunOnlyDevices.has(ctx.key)) {
+        continue;
+      }
       if (await this.hasKnownAreas(ctx.key)) {
         this.clearAreaNameRetry(ctx.key);
         continue;
@@ -3790,7 +3798,7 @@ ${url}`;
   // Loads the map once when the map checksum differs from the one last loaded.
   async maybeAutoFetchMap(deviceKey, mapHash) {
     var _a, _b;
-    if (this.mapFrameListeners.has(deviceKey) || this.mapResumeTimers.has(deviceKey)) {
+    if (this.mapFrameListeners.has(deviceKey) || this.mapResumeTimers.has(deviceKey) || this.aliyunOnlyDevices.has(deviceKey)) {
       return;
     }
     const loaded = await this.getStateAsync(`devices.${deviceKey}.map.loadedMapHash`);
@@ -3924,6 +3932,9 @@ ${url}`;
       var _a2;
       for (let attempt = 0; ; attempt++) {
         const shortGap = ack && this.aliyunOnlyDevices.has(key);
+        if (userRequested) {
+          this.userIntentAt.set(key, Date.now());
+        }
         try {
           sentThisRound++;
           if (shortGap) {
@@ -4185,6 +4196,9 @@ ${url}`;
   // Continues an unfinished map load after MAP_ROUND_PAUSE_MS (plus a running 429 back-off).
   scheduleMapResume(ctx, pauseMs = MAP_ROUND_PAUSE_MS) {
     var _a;
+    if (this.aliyunOnlyDevices.has(ctx.key)) {
+      return;
+    }
     const old = this.mapResumeTimers.get(ctx.key);
     if (old) {
       clearTimeout(old);
