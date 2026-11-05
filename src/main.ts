@@ -4613,6 +4613,7 @@ class Mammotion extends utils.Adapter {
         };
         let rateLimitHit = false;
         let sentThisRound = 0;
+        let resync: (() => Promise<void>) | null = null;
         const send = async (
             commandLabel: string,
             build: (session: AuthSession) => string,
@@ -4638,12 +4639,22 @@ class Mammotion extends utils.Adapter {
                     const until = this.rateLimitBackoffUntil.get(ctx.key) ?? 0;
                     const waitMs = until - Date.now() + 2_000;
                     if (shortGap && rateLimited) {
-                        // A late ack is useless (the mower has given up by then): let the frame wait
-                        // time out and ask for the element again after the back-off.
-                        this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited, not repeated.`);
-                        return;
+                        if (attempt >= 1 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
+                            this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited again, frame given up.`);
+                            return;
+                        }
+                        // The mower has stopped repeating the frame by then. Test whether a fresh sync
+                        // plus the same ack makes it continue with the next frame instead of starting over.
+                        this.log.debug(
+                            `[MAP] ${label}: ${commandLabel} rate limited, re-sync and repeat in ${Math.round(waitMs / 1000)}s.`,
+                        );
+                        await new Promise(resolve => setTimeout(resolve, Math.max(waitMs, 0)));
+                        await resync?.();
+                        continue;
                     }
-                    if (!rateLimited || attempt >= 4 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
+                    // Aliyun: one retry only; repeated 429s only prolong the throttle (live 05.11.).
+                    const maxAttempts = this.aliyunOnlyDevices.has(key) ? 1 : 4;
+                    if (!rateLimited || attempt >= maxAttempts || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
                         if (rateLimited) {
                             rateLimitHit = true;
                         }
@@ -4674,6 +4685,7 @@ class Mammotion extends utils.Adapter {
                 lastSyncAt = Date.now();
             }
         };
+        resync = () => syncIfDue(true);
         const currentMapHash = String((await this.getStateAsync(`devices.${key}.telemetry.mapHash`))?.val ?? '');
         const aliyun = this.aliyunOnlyDevices.has(key);
         const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;

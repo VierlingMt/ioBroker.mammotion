@@ -33,8 +33,10 @@ The five most recent entries are also mirrored into `io-package.json#common.news
 - **Map frames of Aliyun mowers are acknowledged in time.** The mower repeats an unacknowledged frame
   five times, once a second, and then gives up; the 10 s gap made every acknowledgement late, so the
   element list stayed at 1 of 2 frames. Frame acknowledgements now go out 2.5 s after the previous
-  invoke, like the app (which acknowledges at once). A rate-limited acknowledgement is not repeated,
-  since the mower has given up by then; the element is requested again instead.
+  invoke, like the app (which acknowledges at once). A rate-limited acknowledgement is repeated after the back-off
+  after a fresh sync, once, to find out whether the mower then continues a large element instead of
+  starting over. Other map requests of Aliyun mowers retry a 429 only once and then pause the round:
+  live, every further retry (after 32, 62, 122 and 242 s) was refused as well.
 - **Commands for shared Aliyun devices work again.** Live diagnosis on a shared Luba 2 AWD (Aliyun product
   key, firmware 1.11): the Mammotion platform lists the device in neither the device list nor the device
   page for the shared account, only the Aliyun bindings do. The Mammotion invoke now answers

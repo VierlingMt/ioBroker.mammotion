@@ -3917,6 +3917,7 @@ ${url}`;
     };
     let rateLimitHit = false;
     let sentThisRound = 0;
+    let resync = null;
     const send = async (commandLabel, build, ack = false) => {
       var _a2;
       for (let attempt = 0; ; attempt++) {
@@ -3941,10 +3942,19 @@ ${url}`;
           const until = (_a2 = this.rateLimitBackoffUntil.get(ctx.key)) != null ? _a2 : 0;
           const waitMs = until - Date.now() + 2e3;
           if (shortGap && rateLimited) {
-            this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited, not repeated.`);
-            return;
+            if (attempt >= 1 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
+              this.log.debug(`[MAP] ${label}: ${commandLabel} rate limited again, frame given up.`);
+              return;
+            }
+            this.log.debug(
+              `[MAP] ${label}: ${commandLabel} rate limited, re-sync and repeat in ${Math.round(waitMs / 1e3)}s.`
+            );
+            await new Promise((resolve) => setTimeout(resolve, Math.max(waitMs, 0)));
+            await (resync == null ? void 0 : resync());
+            continue;
           }
-          if (!rateLimited || attempt >= 4 || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
+          const maxAttempts = this.aliyunOnlyDevices.has(key) ? 1 : 4;
+          if (!rateLimited || attempt >= maxAttempts || waitMs > MAP_MAX_BACKOFF_WAIT_MS) {
             if (rateLimited) {
               rateLimitHit = true;
             }
@@ -3971,6 +3981,7 @@ ${url}`;
         lastSyncAt = Date.now();
       }
     };
+    resync = () => syncIfDue(true);
     const currentMapHash = String((_b = (_a = await this.getStateAsync(`devices.${key}.telemetry.mapHash`)) == null ? void 0 : _a.val) != null ? _b : "");
     const aliyun = this.aliyunOnlyDevices.has(key);
     const frameTimeout = aliyun ? MAP_FRAME_TIMEOUT_ALIYUN_MS : MAP_FRAME_TIMEOUT_MS;
